@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-08-11-fix-email-wellinton';
+const APP_VERSION = '2026-08-11-nfe-auto-match';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -435,6 +435,24 @@ const DataLayer = {
     if (OFFLINE_MODE) return new Set(Object.keys(localDB_read().notasFiscaisSalvas || {}));
     const snap = await db.collection('notasFiscais').get();
     return new Set(snap.docs.map(d => d.id));
+  },
+  // Busca só as NF-es específicas que interessam (pelas chaves que os CT-es do lote atual
+  // referenciam) — usado pra casar automaticamente com o que já foi salvo antes, sem
+  // precisar buscar a coleção inteira nem depender do usuário reimportar o mesmo .zip de NF-e.
+  async listNfesPorChaves(chaves) {
+    const unicas = Array.from(new Set(chaves.filter(Boolean)));
+    if (!unicas.length) return [];
+    if (OFFLINE_MODE) {
+      const salvas = localDB_read().notasFiscaisSalvas || {};
+      return unicas.map(c => salvas[c]).filter(Boolean);
+    }
+    const resultados = [];
+    for (let i = 0; i < unicas.length; i += 30) {
+      const chunk = unicas.slice(i, i + 30);
+      const snap = await db.collection('notasFiscais').where(firebase.firestore.FieldPath.documentId(), 'in', chunk).get();
+      snap.docs.forEach(d => resultados.push(d.data()));
+    }
+    return resultados;
   },
   async salvarNfesEmLote(lista) {
     if (!lista.length) return;
@@ -1197,10 +1215,16 @@ function parseOrigemParceiro(origemTexto) {
 // custa 100% do valor da mesma tabela de saída, só que consultado pelo REMETENTE (quem
 // está devolvendo), já que o "destino" do CT-e nesse caso é sempre a origem do parceiro.
 function identificarTipoOperacao(cte, parceiro) {
+  // reentrega: identificada pela observação do próprio CT-e (não tem tabela pra isso,
+  // então não é calculada de jeito nenhum — só listada pra controle, como devolução era
+  // antes de ganhar o cálculo pelo remetente)
+  const norm = normalizaNomeParceiro;
+  const textoObs = norm((cte.xObs || '') + ' ' + (cte.obsContTextos || ''));
+  if (textoObs.includes('REENTREGA')) return 'reentrega';
+
   const origem = parseOrigemParceiro(parceiro.origem);
   if (!origem.municipio) return 'saida'; // parceiro sem origem cadastrada -> não classifica, trata como normal
 
-  const norm = normalizaNomeParceiro;
   const iniMatch = norm(cte.xMunIni) === norm(origem.municipio) && (!origem.uf || cte.UFIni === origem.uf);
   const fimMatch = norm(cte.xMunFim) === norm(origem.municipio) && (!origem.uf || cte.UFFim === origem.uf);
 
@@ -1217,12 +1241,14 @@ function validarLoteCtes(ctes, parceiros) {
   const resultados = [];
   const semParceiro = [];
   const outrosFluxos = [];
+  const reentregas = [];
 
   for (const cte of ctes) {
     const parceiro = encontrarParceiroPorCTe(cte, parceiros);
     if (!parceiro) { semParceiro.push(cte); continue; }
 
     const tipoOperacao = identificarTipoOperacao(cte, parceiro);
+    if (tipoOperacao === 'reentrega') { reentregas.push({ cte, parceiro }); continue; }
     if (tipoOperacao === 'outro') { outrosFluxos.push({ cte, parceiro }); continue; }
 
     // devolução: consulta a tarifa pelo REMETENTE (quem devolveu), não pelo destinatário
@@ -1240,7 +1266,7 @@ function validarLoteCtes(ctes, parceiros) {
       tipoOperacao,
     });
   }
-  return { resultados, semParceiro, outrosFluxos };
+  return { resultados, semParceiro, outrosFluxos, reentregas };
 }
 
 // ---------------------------------------------------------------------
@@ -1284,7 +1310,7 @@ function extrairLinhasMapeadas(grid, headerRowIdx, mapeamento) {
   return linhas;
 }
 
-function exportResultadosParaXlsx(resultados, semParceiro, parceirosEnvolvidos, outrosFluxos = []) {
+function exportResultadosParaXlsx(resultados, semParceiro, parceirosEnvolvidos, outrosFluxos = [], reentregas = []) {
   const wb = XLSX.utils.book_new();
 
   const headerDetalhe = ['Tipo','Parceiro','Nº CTe','Nº NF-e','Emissão','Origem','UF Origem','Destino','UF Destino','Região (tabela)','Peso Base Cálc (kg)','Valor Carga (R$)'];
@@ -1323,6 +1349,14 @@ function exportResultadosParaXlsx(resultados, semParceiro, parceirosEnvolvidos, 
     semParceiro.forEach(c => linhasSemParceiro.push([c.nCT, c.dhEmi, fmtCNPJ(c.emitCNPJ), c.emitNome, c.destMun, c.destUF, c.vTPrest]));
     const wsSem = XLSX.utils.aoa_to_sheet(linhasSemParceiro);
     XLSX.utils.book_append_sheet(wb, wsSem, 'Sem parceiro cadastrado');
+  }
+
+  if (reentregas.length) {
+    const headerReentrega = ['Nº CTe','Parceiro','Emissão','Destino','UF','Valor Cobrado (R$)'];
+    const linhasReentrega = [headerReentrega];
+    reentregas.forEach(x => linhasReentrega.push([x.cte.nCT, x.parceiro.nome, x.cte.dhEmi, x.cte.destMun, x.cte.destUF, x.cte.vTPrest]));
+    const wsReentrega = XLSX.utils.aoa_to_sheet(linhasReentrega);
+    XLSX.utils.book_append_sheet(wb, wsReentrega, 'Reentregas');
   }
 
   if (outrosFluxos.length) {
@@ -1693,11 +1727,27 @@ async function processarZip(file) {
     $('#progressLabel').textContent = 'Comparando com as tabelas negociadas…';
     await new Promise(r => setTimeout(r, 50)); // deixa o navegador pintar o texto
 
-    const { resultados, semParceiro, outrosFluxos } = validarLoteCtes(ctes, STATE.parceiros);
+    const { resultados, semParceiro, outrosFluxos, reentregas } = validarLoteCtes(ctes, STATE.parceiros);
+
+    // casa automaticamente com notas fiscais que já foram importadas antes (por qualquer
+    // pessoa da equipe) — só precisa subir o .zip de NF-e manualmente pra notas que ainda
+    // nunca passaram pelo site
+    $('#progressLabel').textContent = 'Casando com notas fiscais já salvas…';
+    const chavesNfeReferenciadas = resultados.flatMap(r => (r.cte.notasFiscais || []).map(n => n.chave));
+    const nfesJaSalvas = await DataLayer.listNfesPorChaves(chavesNfeReferenciadas).catch(() => []);
+    let resumoMatchAutomatico = null;
+    if (nfesJaSalvas.length > 0) {
+      resumoMatchAutomatico = enriquecerComNotasFiscais(resultados, nfesJaSalvas);
+      const produtosMapAuto = await carregarMapaProdutosAtivo().catch(() => null);
+      if (produtosMapAuto) recalcularComCubagem(resultados, produtosMapAuto);
+    }
     $('#progressBox').classList.add('hidden');
 
-    STATE.ultimaValidacao = { nomeArquivo: file.name, resultados, semParceiro, outrosFluxos, duplicadosIgnorados: ctesDuplicados.length };
+    STATE.ultimaValidacao = { nomeArquivo: file.name, resultados, semParceiro, outrosFluxos, reentregas, duplicadosIgnorados: ctesDuplicados.length };
     renderResultadosValidacao();
+    if (resumoMatchAutomatico && resumoMatchAutomatico.casados > 0) {
+      toast(`${resumoMatchAutomatico.casados} CT-e(s) já casado(s) automaticamente com notas fiscais salvas anteriormente.`, 'success');
+    }
 
     // persiste globalmente (por chave, dedupicado) — é isso que permite bloquear
     // reimportação em qualquer upload futuro, não só dentro desse mesmo lote
@@ -1706,6 +1756,7 @@ async function processarZip(file) {
       ...resultados.filter(r => r.cte.chave).map(r => ({ chave: r.cte.chave, ...trimResultadoParaHistorico(r), categoria: 'validado' })),
       ...semParceiro.filter(c => c.chave).map(c => ({ chave: c.chave, nCT: c.nCT, dhEmi: c.dhEmi, emitNome: c.emitNome, emitCNPJ: c.emitCNPJ, destMun: c.destMun, destUF: c.destUF, vTPrest: c.vTPrest, categoria: 'sem_parceiro' })),
       ...outrosFluxos.filter(x => x.cte.chave).map(x => ({ chave: x.cte.chave, nCT: x.cte.nCT, dhEmi: x.cte.dhEmi, parceiroNome: x.parceiro.nome, xMunIni: x.cte.xMunIni, UFIni: x.cte.UFIni, xMunFim: x.cte.xMunFim, UFFim: x.cte.UFFim, vTPrest: x.cte.vTPrest, categoria: 'trajeto_atipico' })),
+      ...reentregas.filter(x => x.cte.chave).map(x => ({ chave: x.cte.chave, nCT: x.cte.nCT, dhEmi: x.cte.dhEmi, parceiroNome: x.parceiro.nome, destMun: x.cte.destMun, destUF: x.cte.destUF, vTPrest: x.cte.vTPrest, categoria: 'reentrega' })),
     ].map(o => ({ ...o, arquivoOrigem: file.name, importadoEm: agora }));
     await DataLayer.salvarCtesEmLote(paraSalvarGlobal).catch(e => console.error('[CT-e global] falha ao salvar:', e));
 
@@ -1715,7 +1766,7 @@ async function processarZip(file) {
     const menor = resultados.filter(r => r.divergencia !== null && r.divergencia < -tol);
     const devolucoesResultados = resultados.filter(r => r.tipoOperacao === 'devolucao');
     const resumo = {
-      total: resultados.length + semParceiro.length + outrosFluxos.length,
+      total: resultados.length + semParceiro.length + outrosFluxos.length + reentregas.length,
       qtdDivergenciaMaior: maior.length,
       qtdDivergenciaMenor: menor.length,
       valorDivergenteMaior: clamp2(maior.reduce((a,r) => a + r.divergencia, 0)),
@@ -1724,6 +1775,7 @@ async function processarZip(file) {
       semParceiro: semParceiro.length,
       devolucoes: devolucoesResultados.length,
       outrosFluxos: outrosFluxos.length,
+      reentregas: reentregas.length,
       duplicadosIgnorados: ctesDuplicados.length,
     };
 
@@ -1804,7 +1856,7 @@ async function processarNotasFiscais(file) {
 }
 
 function renderResultadosValidacao() {
-  const { resultados, semParceiro, nomeArquivo, outrosFluxos = [], duplicadosIgnorados = 0 } = STATE.ultimaValidacao;
+  const { resultados, semParceiro, nomeArquivo, outrosFluxos = [], reentregas = [], duplicadosIgnorados = 0 } = STATE.ultimaValidacao;
   const tol = 0.05;
   const maior = resultados.filter(r => r.divergencia !== null && r.divergencia > tol);
   const menor = resultados.filter(r => r.divergencia !== null && r.divergencia < -tol);
@@ -1822,7 +1874,7 @@ function renderResultadosValidacao() {
     <div class="flex items-center justify-between mb-4">
       <div class="text-sm text-ink-500">
         <span class="font-medium text-ink-800">${escapeHtml(nomeArquivo)}</span> ·
-        ${resultados.length} CT-e(s) validado(s)${devolucoes.length ? ` (${devolucoes.length} devolução)` : ''}${semParceiro.length ? ` · ${semParceiro.length} sem parceiro cadastrado` : ''}${outrosFluxos.length ? ` · ${outrosFluxos.length} trajeto atípico` : ''}${nfeImportada ? ` · ${comNfe.length} com nota fiscal casada` : ''}${duplicadosIgnorados ? ` · <span class="text-amber-600">${duplicadosIgnorados} duplicado(s) ignorado(s)</span>` : ''}
+        ${resultados.length} CT-e(s) validado(s)${devolucoes.length ? ` (${devolucoes.length} devolução)` : ''}${semParceiro.length ? ` · ${semParceiro.length} sem parceiro cadastrado` : ''}${outrosFluxos.length ? ` · ${outrosFluxos.length} trajeto atípico` : ''}${reentregas.length ? ` · ${reentregas.length} reentrega` : ''}${nfeImportada ? ` · ${comNfe.length} com nota fiscal casada` : ''}${duplicadosIgnorados ? ` · <span class="text-amber-600">${duplicadosIgnorados} duplicado(s) ignorado(s)</span>` : ''}
       </div>
       <div class="flex items-center gap-4">
         <button id="btnImportarNFe" class="text-sm font-medium text-ink-600 hover:text-ink-800 flex items-center gap-1.5">
@@ -1849,6 +1901,16 @@ function renderResultadosValidacao() {
 
     <div id="tabelaResultados"></div>
 
+    ${reentregas.length ? `
+      <div class="mt-6 bg-purple-50 border border-purple-200 rounded-2xl p-5">
+        <div class="text-sm font-semibold text-purple-800 mb-1">${reentregas.length} CT-e(s) de reentrega — fora da validação</div>
+        <p class="text-xs text-purple-700 mb-3">Identificados pela observação do CT-e. Não existe tabela pra reentrega, então não calculamos valor esperado — fica só o valor cobrado listado, pra controle e conferência manual.</p>
+        <div class="text-xs space-y-0.5 max-h-40 overflow-y-auto text-purple-900/80">
+          ${reentregas.map(x => `<div>• CT-e ${escapeHtml(x.cte.nCT)} — ${escapeHtml(x.parceiro.nome)} — ${escapeHtml(x.cte.destMun)}/${escapeHtml(x.cte.destUF)} — cobrado ${fmtBRL(x.cte.vTPrest)}</div>`).join('')}
+        </div>
+      </div>
+    ` : ''}
+
     ${outrosFluxos.length ? `
       <div class="mt-6 bg-blue-50 border border-blue-200 rounded-2xl p-5">
         <div class="text-sm font-semibold text-blue-800 mb-1">${outrosFluxos.length} CT-e(s) com trajeto atípico — fora da validação</div>
@@ -1869,7 +1931,7 @@ function renderResultadosValidacao() {
   `;
 
   $('#btnExportar').addEventListener('click', () => {
-    const blob = exportResultadosParaXlsx(resultados, semParceiro, STATE.parceiros, outrosFluxos);
+    const blob = exportResultadosParaXlsx(resultados, semParceiro, STATE.parceiros, outrosFluxos, reentregas);
     downloadBlob(blob, `Validacao_Fretes_${nomeArquivo.replace(/\.zip$/i,'')}.xlsx`);
   });
 
@@ -3887,17 +3949,19 @@ async function renderTratativas() {
   atualizarTextoExportar();
 
   // resumo de devolução (agora validada normalmente, entra nas divergências) e trajetos
-  // atípicos (esses sim ficam fora, sem tabela pra comparar) — somado em todos os lotes
+  // atípicos/reentregas (esses sim ficam fora, sem tabela pra comparar) — somado em todos os lotes
   const historico = await DataLayer.listHistorico().catch(() => []);
   const totalDevolucoes = historico.reduce((a, h) => a + (h.resumo?.devolucoes || 0), 0);
   const totalOutros = historico.reduce((a, h) => a + (h.resumo?.outrosFluxos || 0), 0);
+  const totalReentregas = historico.reduce((a, h) => a + (h.resumo?.reentregas || 0), 0);
   const boxForaFluxo = $('#resumoForaFluxoAnalises');
-  if (totalDevolucoes > 0 || totalOutros > 0) {
+  if (totalDevolucoes > 0 || totalOutros > 0 || totalReentregas > 0) {
     boxForaFluxo.innerHTML = `
       <div class="bg-blue-50 border border-blue-200 rounded-2xl p-4">
         <div class="text-sm font-semibold text-blue-800 mb-2">Acumulado de todos os lotes já processados</div>
-        <div class="grid grid-cols-2 gap-3 text-xs">
+        <div class="grid grid-cols-3 gap-3 text-xs">
           <div><span class="text-brand-700 font-bold text-base">${totalDevolucoes}</span> <span class="text-brand-600">devolução(ões) — validadas normalmente (100% da tabela de saída, pelo remetente)</span></div>
+          <div><span class="text-purple-700 font-bold text-base">${totalReentregas}</span> <span class="text-purple-600">reentrega(s) — sem tabela pra comparar, fora da validação</span></div>
           <div><span class="text-ink-600 font-bold text-base">${totalOutros}</span> <span class="text-ink-500">trajeto(s) atípico(s) — sem tabela pra comparar, fora da validação</span></div>
         </div>
       </div>`;
