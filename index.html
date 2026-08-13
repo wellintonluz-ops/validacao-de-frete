@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-08-11-reentrega-prejuizo';
+const APP_VERSION = '2026-08-11-sem-duplicar-devolucao';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -1784,8 +1784,9 @@ async function processarZip(file) {
 
     // salva resumo no histórico
     const tol = 0.05;
-    const maior = resultados.filter(r => r.divergencia !== null && r.divergencia > tol);
-    const menor = resultados.filter(r => r.divergencia !== null && r.divergencia < -tol);
+    // devolução/reentrega ficam só na aba própria delas — não contam aqui, pra não duplicar
+    const maior = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia > tol);
+    const menor = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia < -tol);
     const devolucoesResultados = resultados.filter(r => r.tipoOperacao === 'devolucao');
     const resumo = {
       total: resultados.length + semParceiro.length + outrosFluxos.length + reentregas.length,
@@ -1882,13 +1883,16 @@ async function processarNotasFiscais(file, progressBoxId = 'progressNFeBox') {
 function renderResultadosValidacao() {
   const { resultados, semParceiro, nomeArquivo, outrosFluxos = [], reentregas = [], duplicadosIgnorados = 0 } = STATE.ultimaValidacao;
   const tol = 0.05;
-  const maior = resultados.filter(r => r.divergencia !== null && r.divergencia > tol);
-  const menor = resultados.filter(r => r.divergencia !== null && r.divergencia < -tol);
-  const revisao = resultados.filter(r => r.calc.status === 'REVISAO_MANUAL' || r.calc.status === 'SEM_TARIFA' || r.calc.status === 'SEM_ABRANGENCIA');
-  const ok = resultados.filter(r => r.divergencia !== null && Math.abs(r.divergencia) <= tol && r.calc.status === 'OK');
+  // devolução/reversa tem aba própria (prejuízo total) — não conta em nenhuma outra, pra
+  // não aparecer duplicada em "cobrado a maior/menor" etc. (reentrega já nem entra em
+  // "resultados", então nunca aparecia nessas abas mesmo)
+  const maior = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia > tol);
+  const menor = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia < -tol);
+  const revisao = resultados.filter(r => r.tipoOperacao !== 'devolucao' && (r.calc.status === 'REVISAO_MANUAL' || r.calc.status === 'SEM_TARIFA' || r.calc.status === 'SEM_ABRANGENCIA'));
+  const ok = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && Math.abs(r.divergencia) <= tol && r.calc.status === 'OK');
   const devolucoes = resultados.filter(r => r.tipoOperacao === 'devolucao');
   const nfeImportada = resultados.some(r => r.valorFreteCliente !== undefined);
-  const margemNegativa = resultados.filter(r => r.divergenciaCliente !== null && r.divergenciaCliente !== undefined && r.divergenciaCliente < -tol);
+  const margemNegativa = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined && r.divergenciaCliente < -tol);
   const comNfe = resultados.filter(r => r.valorFreteCliente !== null && r.valorFreteCliente !== undefined);
 
   STATE._filtroAtual = STATE._filtroAtual || 'maior';
