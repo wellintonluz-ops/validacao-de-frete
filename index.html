@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-08-11-resumo-faturado';
+const APP_VERSION = '2026-08-11-historico-so-faturado';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -3819,7 +3819,6 @@ async function renderHistorico() {
             <th class="text-left font-semibold px-5 py-3">Parceiros</th>
             <th class="text-right font-semibold px-5 py-3">CT-es</th>
             <th class="text-right font-semibold px-5 py-3">Divergências (+)</th>
-            <th class="text-right font-semibold px-5 py-3">Valor a maior</th>
             <th class="text-right font-semibold px-5 py-3" title="Cliente pagou − Cobrado da transportadora (todo o lote)">Faturado</th>
             <th class="text-left font-semibold px-5 py-3">Por</th>
             <th class="px-5 py-3"></th>
@@ -3837,7 +3836,6 @@ async function renderHistorico() {
               <td class="px-5 py-3 text-ink-600 text-xs">${escapeHtml((h.resumo?.parceiros||[]).join(', '))}</td>
               <td class="px-5 py-3 text-right num">${h.resumo?.total ?? 0}</td>
               <td class="px-5 py-3 text-right num ${h.resumo?.qtdDivergenciaMaior ? 'text-red-600 font-semibold' : 'text-emerald-600'}">${h.resumo?.qtdDivergenciaMaior ?? 0}</td>
-              <td class="px-5 py-3 text-right num ${h.resumo?.valorDivergenteMaior ? 'text-red-600 font-semibold' : ''}">${fmtBRL(h.resumo?.valorDivergenteMaior || 0)}</td>
               <td class="px-5 py-3 text-right num font-semibold ${temFaturado ? (faturadoPositivo ? 'text-emerald-600' : 'text-red-600') : 'text-ink-300'}">${temFaturado ? (faturadoPositivo ? '' : '-') + fmtBRL(Math.abs(h.resumo.faturado)) : '—'}</td>
               <td class="px-5 py-3 text-ink-400 text-xs">${escapeHtml(h.criadoPor||'—')}</td>
               <td class="px-5 py-3 text-right text-xs ${temDetalhe ? 'text-brand-600 font-medium' : 'text-ink-300'}">${temDetalhe ? 'Ver comparação →' : 'sem detalhe'}</td>
