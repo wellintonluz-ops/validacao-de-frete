@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-08-11-fix-total-cobrado';
+const APP_VERSION = '2026-08-11-fix-historico-reentrega';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -1751,6 +1751,14 @@ function trimResultadoParaHistorico(r) {
 function trimSemParceiroParaHistorico(c) {
   return { nCT: c.nCT, dhEmi: c.dhEmi, emitCNPJ: c.emitCNPJ, emitNome: c.emitNome, destMun: c.destMun, destUF: c.destUF, vTPrest: c.vTPrest };
 }
+// reentregas e trajetos atípicos têm o mesmo formato { cte, parceiro } — trim enxuto,
+// só o que as telas realmente usam pra exibir
+function trimForaFluxoParaHistorico(x) {
+  return {
+    cte: { nCT: x.cte.nCT, dhEmi: x.cte.dhEmi, destMun: x.cte.destMun, destUF: x.cte.destUF, xMunIni: x.cte.xMunIni, UFIni: x.cte.UFIni, xMunFim: x.cte.xMunFim, UFFim: x.cte.UFFim, vTPrest: x.cte.vTPrest },
+    parceiro: { id: x.parceiro.id, nome: x.parceiro.nome },
+  };
+}
 
 async function processarZip(file) {
   if (STATE.parceiros.length === 0) {
@@ -1855,7 +1863,9 @@ async function processarZip(file) {
     // se ficar grande demais pro banco, guarda só o resumo mesmo (Firestore tem limite de 1MB por documento)
     const resultadosTrim = resultados.map(trimResultadoParaHistorico);
     const semParceiroTrim = semParceiro.map(trimSemParceiroParaHistorico);
-    let registro = { nomeArquivo: file.name, resumo, resultados: resultadosTrim, semParceiro: semParceiroTrim, detalheDisponivel: true };
+    const outrosFluxosTrim = outrosFluxos.map(trimForaFluxoParaHistorico);
+    const reentregasTrim = reentregas.map(trimForaFluxoParaHistorico);
+    let registro = { nomeArquivo: file.name, resumo, resultados: resultadosTrim, semParceiro: semParceiroTrim, outrosFluxos: outrosFluxosTrim, reentregas: reentregasTrim, detalheDisponivel: true };
     if (!OFFLINE_MODE && JSON.stringify(registro).length > 900000) {
       registro = { nomeArquivo: file.name, resumo, detalheDisponivel: false };
       toast('Lote salvo no histórico, mas ficou grande demais pra guardar o detalhe linha a linha — exporte o Excel se precisar revisitar.', 'warn');
@@ -3794,6 +3804,8 @@ function abrirHistoricoDetalhe(indice) {
     nomeArquivo: h.nomeArquivo,
     resultados: h.resultados,
     semParceiro: h.semParceiro || [],
+    outrosFluxos: h.outrosFluxos || [],
+    reentregas: h.reentregas || [],
   };
   STATE._filtroAtual = 'maior';
   goToView('validar');
