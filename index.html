@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-08-11-historico-so-faturado';
+const APP_VERSION = '2026-08-11-fix-total-cobrado';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -811,7 +811,9 @@ async function readNFesFromZip(file, onProgress) {
 // Resumo financeiro do lote inteiro: quanto a transportadora cobrou no total vs. quanto
 // o cliente pagou de frete no total. Devolução/reversa e reentrega NUNCA entram no "cliente
 // pagou" (o cliente não paga nada nesses casos) — só entram no "cobrado", virando prejuízo puro.
-function calcularResumoFinanceiro(resultados, reentregas) {
+// "Sem parceiro" e "trajeto atípico" também entram no cobrado: a transportadora cobrou de
+// verdade por eles, só não conseguimos validar contra uma tabela — mas o dinheiro saiu.
+function calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFluxos) {
   let totalCobrado = 0;
   let totalClientePagou = 0;
   let temAlgumaNfe = false;
@@ -823,6 +825,8 @@ function calcularResumoFinanceiro(resultados, reentregas) {
     }
   });
   (reentregas || []).forEach(x => { totalCobrado += x.cte.vTPrest || 0; });
+  (semParceiro || []).forEach(c => { totalCobrado += c.vTPrest || 0; });
+  (outrosFluxos || []).forEach(x => { totalCobrado += x.cte.vTPrest || 0; });
   return {
     totalCobrado: clamp2(totalCobrado),
     totalClientePagou: clamp2(totalClientePagou),
@@ -1827,7 +1831,7 @@ async function processarZip(file) {
     const maior = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia > tol);
     const menor = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia < -tol);
     const devolucoesResultados = resultados.filter(r => r.tipoOperacao === 'devolucao');
-    const resumoFinInicial = calcularResumoFinanceiro(resultados, reentregas);
+    const resumoFinInicial = calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFluxos);
     const resumo = {
       total: resultados.length + semParceiro.length + outrosFluxos.length + reentregas.length,
       qtdDivergenciaMaior: maior.length,
@@ -1914,7 +1918,7 @@ async function processarNotasFiscais(file, progressBoxId = 'progressNFeBox') {
       else if (resumoCubagem && resumoCubagem.semFator > 0) msg += ` ${resumoCubagem.semFator} CT-e(s) sem fator de cubagem cadastrado no parceiro.`;
       renderResultadosValidacao();
       // atualiza o resumo financeiro do lote já salvo no histórico, se houver
-      const resumoFinAtualizado = calcularResumoFinanceiro(STATE.ultimaValidacao.resultados, STATE.ultimaValidacao.reentregas || []);
+      const resumoFinAtualizado = calcularResumoFinanceiro(STATE.ultimaValidacao.resultados, STATE.ultimaValidacao.reentregas || [], STATE.ultimaValidacao.semParceiro || [], STATE.ultimaValidacao.outrosFluxos || []);
       if (STATE.ultimaValidacao.historicoId) {
         DataLayer.atualizarResumoHistorico(STATE.ultimaValidacao.historicoId, {
           totalCobrado: resumoFinAtualizado.totalCobrado,
@@ -1945,7 +1949,7 @@ function renderResumoFinanceiro(r) {
             <div class="text-[11px] text-ink-400 font-medium uppercase tracking-wide">Cobrado (transportadora)</div>
             <div class="text-xl font-bold num text-ink-800">${fmtBRL(r.totalCobrado)}</div>
           </div>
-          <div class="text-ink-300 text-xl">×</div>
+          <div class="text-ink-300 text-xl">vs.</div>
           <div>
             <div class="text-[11px] text-ink-400 font-medium uppercase tracking-wide">Cliente pagou (frete na NF-e)</div>
             <div class="text-xl font-bold num text-ink-800">${fmtBRL(r.totalClientePagou)}</div>
@@ -1956,8 +1960,9 @@ function renderResumoFinanceiro(r) {
             <div class="text-xl font-bold num ${positivo ? 'text-emerald-600' : 'text-red-600'}">${positivo ? '' : '-'}${fmtBRL(Math.abs(r.faturado))}</div>
           </div>
         </div>
-        <div class="text-[11px] text-ink-300 max-w-xs">
-          Devolução, reversa e reentrega entram só no "Cobrado" — o cliente não paga nada nesses casos, então é prejuízo puro pro Faturado.
+        <div class="text-[11px] text-ink-300 max-w-sm">
+          Faturado = Cliente pagou − Cobrado, sobre o lote inteiro. Devolução, reversa e reentrega entram só no "Cobrado" (o cliente não paga nada nesses casos).
+          <strong class="text-ink-400">Esse card já inclui tudo</strong> — não some com os números dos cards de "Cobrado a maior", "Devolução" etc. abaixo, eles são comparações diferentes (contra a tabela negociada, não contra o que o cliente pagou) e ficariam contados duas vezes.
           ${!r.temAlgumaNfe ? '<br><span class="text-amber-600">Ainda sem nenhuma nota fiscal casada — importe as NF-es pra esse número ficar completo.</span>' : ''}
         </div>
       </div>
@@ -1978,7 +1983,7 @@ function renderResultadosValidacao() {
   const nfeImportada = resultados.some(r => r.valorFreteCliente !== undefined);
   const margemNegativa = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined && r.divergenciaCliente < -tol);
   const comNfe = resultados.filter(r => r.valorFreteCliente !== null && r.valorFreteCliente !== undefined);
-  const resumoFin = calcularResumoFinanceiro(resultados, reentregas);
+  const resumoFin = calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFluxos);
 
   STATE._filtroAtual = STATE._filtroAtual || 'maior';
 
