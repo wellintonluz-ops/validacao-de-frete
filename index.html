@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-08-11-nfe-auto-match';
+const APP_VERSION = '2026-08-11-upload-nfe-independente';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -1623,11 +1623,23 @@ function renderValidar() {
     <h1 class="text-2xl font-bold text-ink-900">Validar Fretes</h1>
     <p class="text-sm text-ink-400 mt-0.5 mb-6">Envie o .zip com os XMLs dos CT-es recebidos na fatura do parceiro.</p>
 
-    <div id="uploadZone" class="bg-white rounded-2xl shadow-panel border-2 border-dashed border-ink-200 p-10 text-center cursor-pointer hover:border-brand-400 hover:bg-brand-50/30 transition-colors">
-      <input type="file" id="fileZip" accept=".zip" class="hidden">
-      <svg class="w-10 h-10 mx-auto text-ink-300 mb-3" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M12 12v9m0-9l-3 3m3-3l3 3"/></svg>
-      <div class="text-sm font-medium text-ink-700">Clique para escolher o arquivo .zip da fatura</div>
-      <div class="text-xs text-ink-400 mt-1">ou arraste e solte aqui</div>
+    <div class="grid grid-cols-2 gap-4">
+      <div>
+        <div id="uploadZone" class="bg-white rounded-2xl shadow-panel border-2 border-dashed border-ink-200 p-8 text-center cursor-pointer hover:border-brand-400 hover:bg-brand-50/30 transition-colors h-full">
+          <input type="file" id="fileZip" accept=".zip" class="hidden">
+          <svg class="w-9 h-9 mx-auto text-ink-300 mb-2" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M12 12v9m0-9l-3 3m3-3l3 3"/></svg>
+          <div class="text-sm font-medium text-ink-700">CT-es (fatura do parceiro)</div>
+          <div class="text-xs text-ink-400 mt-1">Clique ou arraste o .zip aqui</div>
+        </div>
+      </div>
+      <div>
+        <div id="uploadZoneNFe" class="bg-white rounded-2xl shadow-panel border-2 border-dashed border-ink-200 p-8 text-center cursor-pointer hover:border-purple-400 hover:bg-purple-50/30 transition-colors h-full">
+          <input type="file" id="fileZipNFe" accept=".zip" class="hidden">
+          <svg class="w-9 h-9 mx-auto text-ink-300 mb-2" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+          <div class="text-sm font-medium text-ink-700">Notas Fiscais (frete do cliente)</div>
+          <div class="text-xs text-ink-400 mt-1">Clique ou arraste o .zip aqui — pode subir a qualquer momento, mesmo antes de validar CT-es. Fica salvo e casa sozinho depois.</div>
+        </div>
+      </div>
     </div>
 
     <div id="progressBox" class="hidden mt-4 bg-white rounded-xl border border-ink-100 p-4">
@@ -1637,6 +1649,7 @@ function renderValidar() {
       </div>
       <div class="h-1.5 bg-ink-100 rounded-full overflow-hidden"><div id="progressBar" class="h-full bg-brand-600 transition-all" style="width:0%"></div></div>
     </div>
+    <div id="progressNFeBoxInicial" class="hidden mt-4 bg-white rounded-xl border border-ink-100 p-4 text-sm text-ink-500"></div>
 
     <div id="resultadosBox" class="mt-6"></div>
   `;
@@ -1649,6 +1662,15 @@ function renderValidar() {
   zone.addEventListener('dragleave', () => zone.classList.remove('border-brand-400','bg-brand-50/30'));
   zone.addEventListener('drop', (e) => { const f = e.dataTransfer.files[0]; if (f) processarZip(f); });
   input.addEventListener('change', (e) => { const f = e.target.files[0]; if (f) processarZip(f); });
+
+  const zoneNFe = $('#uploadZoneNFe');
+  const inputNFe = $('#fileZipNFe');
+  zoneNFe.addEventListener('click', () => inputNFe.click());
+  ;['dragover','dragleave','drop'].forEach(evt => zoneNFe.addEventListener(evt, (e) => e.preventDefault()));
+  zoneNFe.addEventListener('dragover', () => zoneNFe.classList.add('border-purple-400','bg-purple-50/30'));
+  zoneNFe.addEventListener('dragleave', () => zoneNFe.classList.remove('border-purple-400','bg-purple-50/30'));
+  zoneNFe.addEventListener('drop', (e) => { const f = e.dataTransfer.files[0]; if (f) processarNotasFiscais(f, 'progressNFeBoxInicial'); });
+  inputNFe.addEventListener('change', (e) => { const f = e.target.files[0]; if (f) processarNotasFiscais(f, 'progressNFeBoxInicial'); });
 }
 
 // Guarda só o necessário pra reabrir a tela de comparação depois (sem duplicar a
@@ -1800,12 +1822,9 @@ async function processarZip(file) {
   }
 }
 
-async function processarNotasFiscais(file) {
-  if (!STATE.ultimaValidacao || !STATE.ultimaValidacao.resultados?.length) {
-    toast('Valide um lote de CT-es primeiro, antes de importar as notas fiscais.', 'warn');
-    return;
-  }
-  const progressBox = $('#progressNFeBox');
+async function processarNotasFiscais(file, progressBoxId = 'progressNFeBox') {
+  const temValidacaoAtiva = STATE.ultimaValidacao && STATE.ultimaValidacao.resultados?.length > 0;
+  const progressBox = $('#' + progressBoxId);
   progressBox.classList.remove('hidden');
   progressBox.textContent = 'Lendo XMLs de NF-e…';
 
@@ -1816,10 +1835,11 @@ async function processarNotasFiscais(file) {
     if (falhas.length) toast(`${falhas.length} arquivo(s) não puderam ser lidos como NF-e.`, 'warn');
     if (nfes.length === 0) { toast('Nenhuma NF-e válida encontrada no .zip.', 'error'); progressBox.classList.add('hidden'); return; }
 
-    // usa TODAS as NF-es lidas pra casar com os CT-es dessa sessão (mesmo as já vistas
-    // antes — isso é só leitura); só a gravação global no banco é que ignora duplicata
+    // usa TODAS as NF-es lidas pra casar com os CT-es dessa sessão, se tiver alguma
+    // validação carregada agora (mesmo as já vistas antes — isso é só leitura); só a
+    // gravação global no banco é que ignora duplicata
     const semFrete = nfes.filter(n => n.vFrete === null || n.vFrete === undefined).length;
-    const resumoMatch = enriquecerComNotasFiscais(STATE.ultimaValidacao.resultados, nfes);
+    const resumoMatch = temValidacaoAtiva ? enriquecerComNotasFiscais(STATE.ultimaValidacao.resultados, nfes) : null;
 
     progressBox.textContent = 'Guardando notas fiscais novas…';
     const chavesExistentesNfe = await DataLayer.listChavesNfes().catch(() => new Set());
@@ -1828,26 +1848,28 @@ async function processarNotasFiscais(file) {
     const agoraNfe = new Date().toISOString();
     await DataLayer.salvarNfesEmLote(nfesNovas.map(n => ({ ...n, arquivoOrigem: file.name, importadoEm: agoraNfe }))).catch(e => console.error('[NF-e global] falha ao salvar:', e));
 
-    // se houver planilha de produtos configurada, já recalcula o peso cubado e o valor
-    // esperado de cada CT-e que tiver parceiro com fator de cubagem cadastrado
-    progressBox.textContent = 'Verificando cubagem dos produtos…';
-    const produtosMap = await carregarMapaProdutosAtivo();
     let resumoCubagem = null;
-    if (produtosMap) {
-      resumoCubagem = recalcularComCubagem(STATE.ultimaValidacao.resultados, produtosMap);
+    if (temValidacaoAtiva) {
+      // se houver planilha de produtos configurada, já recalcula o peso cubado e o valor
+      // esperado de cada CT-e que tiver parceiro com fator de cubagem cadastrado
+      progressBox.textContent = 'Verificando cubagem dos produtos…';
+      const produtosMap = await carregarMapaProdutosAtivo();
+      if (produtosMap) resumoCubagem = recalcularComCubagem(STATE.ultimaValidacao.resultados, produtosMap);
     }
     progressBox.classList.add('hidden');
 
-    let msg = `${resumoMatch.casados} de ${resumoMatch.total} CT-es casados com nota fiscal (${nfes.length} NF-e lida(s)${semFrete ? `, ${semFrete} sem vFrete preenchido` : ''}${nfesDuplicadas ? `, ${nfesDuplicadas} já importada(s) antes` : ''}).`;
-    if (resumoCubagem && resumoCubagem.recalculados > 0) {
-      msg += ` ${resumoCubagem.recalculados} recalculado(s) com peso cubado próprio.`;
-    } else if (!produtosMap) {
-      msg += ' (Cadastre a planilha de produtos em "Produtos" pra recalcular a cubagem.)';
-    } else if (resumoCubagem && resumoCubagem.semFator > 0) {
-      msg += ` ${resumoCubagem.semFator} CT-e(s) sem fator de cubagem cadastrado no parceiro.`;
+    let msg;
+    if (temValidacaoAtiva) {
+      msg = `${resumoMatch.casados} de ${resumoMatch.total} CT-es casados com nota fiscal (${nfes.length} NF-e lida(s)${semFrete ? `, ${semFrete} sem vFrete preenchido` : ''}${nfesDuplicadas ? `, ${nfesDuplicadas} já importada(s) antes` : ''}).`;
+      if (resumoCubagem && resumoCubagem.recalculados > 0) msg += ` ${resumoCubagem.recalculados} recalculado(s) com peso cubado próprio.`;
+      else if (resumoCubagem && resumoCubagem.semFator > 0) msg += ` ${resumoCubagem.semFator} CT-e(s) sem fator de cubagem cadastrado no parceiro.`;
+      renderResultadosValidacao();
+    } else {
+      // sem validação carregada agora — só guarda pra casar automaticamente depois,
+      // quando algum CT-e referenciando essas NF-es for validado
+      msg = `${nfesNovas.length} nota(s) fiscal(is) nova(s) salva(s) (${nfes.length} lida(s)${semFrete ? `, ${semFrete} sem vFrete preenchido` : ''}${nfesDuplicadas ? `, ${nfesDuplicadas} já importada(s) antes` : ''}). Vão casar sozinhas quando você validar os CT-es correspondentes.`;
     }
-    toast(msg, resumoMatch.casados > 0 ? 'success' : 'warn');
-    renderResultadosValidacao();
+    toast(msg, (temValidacaoAtiva ? resumoMatch.casados > 0 : nfesNovas.length > 0) ? 'success' : 'warn');
   } catch (e) {
     console.error(e);
     progressBox.classList.add('hidden');
