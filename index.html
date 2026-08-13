@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-08-11-sem-duplicar-devolucao';
+const APP_VERSION = '2026-08-11-resumo-faturado';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -366,6 +366,22 @@ const DataLayer = {
     }
     const ref = await db.collection('validacoes').add(registro);
     return { id: ref.id, ...registro };
+  },
+  // Atualiza só o resumo (ex: totais financeiros) de um lote já salvo — usado quando a
+  // pessoa importa as notas fiscais DEPOIS de já ter validado e salvo o lote de CT-es,
+  // pra o Histórico não ficar com o "Faturado" desatualizado.
+  async atualizarResumoHistorico(id, patchResumo) {
+    if (!id) return;
+    if (OFFLINE_MODE) {
+      const data = localDB_read();
+      const item = (data.historico || []).find(h => h.id === id);
+      if (item) { item.resumo = { ...item.resumo, ...patchResumo }; localDB_write(data); }
+      return;
+    }
+    const doc = await db.collection('validacoes').doc(id).get();
+    if (doc.exists) {
+      await db.collection('validacoes').doc(id).update({ resumo: { ...doc.data().resumo, ...patchResumo } });
+    }
   },
 
   // ----- Revisões de divergência (análise + tratativa com transportadora) -----
@@ -792,6 +808,29 @@ async function readNFesFromZip(file, onProgress) {
 // Cruza os resultados já validados com as notas fiscais importadas, pela CHAVE da NF-e
 // (44 dígitos) que o próprio CT-e já declara vinculada. Preenche valorFreteCliente e a
 // divergência entre o que o cliente pagou de frete e o que a transportadora cobrou.
+// Resumo financeiro do lote inteiro: quanto a transportadora cobrou no total vs. quanto
+// o cliente pagou de frete no total. Devolução/reversa e reentrega NUNCA entram no "cliente
+// pagou" (o cliente não paga nada nesses casos) — só entram no "cobrado", virando prejuízo puro.
+function calcularResumoFinanceiro(resultados, reentregas) {
+  let totalCobrado = 0;
+  let totalClientePagou = 0;
+  let temAlgumaNfe = false;
+  resultados.forEach(r => {
+    totalCobrado += r.cobrado || 0;
+    if (r.tipoOperacao !== 'devolucao' && r.valorFreteCliente != null) {
+      totalClientePagou += r.valorFreteCliente;
+      temAlgumaNfe = true;
+    }
+  });
+  (reentregas || []).forEach(x => { totalCobrado += x.cte.vTPrest || 0; });
+  return {
+    totalCobrado: clamp2(totalCobrado),
+    totalClientePagou: clamp2(totalClientePagou),
+    faturado: clamp2(totalClientePagou - totalCobrado),
+    temAlgumaNfe,
+  };
+}
+
 function enriquecerComNotasFiscais(resultados, nfes) {
   const porChave = {};
   nfes.forEach(n => { if (n.chave) porChave[n.chave] = n; });
@@ -1788,6 +1827,7 @@ async function processarZip(file) {
     const maior = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia > tol);
     const menor = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia < -tol);
     const devolucoesResultados = resultados.filter(r => r.tipoOperacao === 'devolucao');
+    const resumoFinInicial = calcularResumoFinanceiro(resultados, reentregas);
     const resumo = {
       total: resultados.length + semParceiro.length + outrosFluxos.length + reentregas.length,
       qtdDivergenciaMaior: maior.length,
@@ -1802,6 +1842,9 @@ async function processarZip(file) {
       reentregas: reentregas.length,
       valorReentregas: clamp2(reentregas.reduce((a,x) => a + (x.cte.vTPrest||0), 0)),
       duplicadosIgnorados: ctesDuplicados.length,
+      totalCobrado: resumoFinInicial.totalCobrado,
+      totalClientePagou: resumoFinInicial.totalClientePagou,
+      faturado: resumoFinInicial.faturado,
     };
 
     // tenta guardar o detalhe linha a linha (pra reabrir a tela de comparação depois);
@@ -1813,11 +1856,14 @@ async function processarZip(file) {
       registro = { nomeArquivo: file.name, resumo, detalheDisponivel: false };
       toast('Lote salvo no histórico, mas ficou grande demais pra guardar o detalhe linha a linha — exporte o Excel se precisar revisitar.', 'warn');
     }
-    await DataLayer.saveValidacao(registro).catch(async (e) => {
+    const salvo = await DataLayer.saveValidacao(registro).catch(async (e) => {
       console.error(e);
       // se falhar por tamanho, tenta de novo só com o resumo
-      await DataLayer.saveValidacao({ nomeArquivo: file.name, resumo, detalheDisponivel: false }).catch(e2 => console.error(e2));
+      return DataLayer.saveValidacao({ nomeArquivo: file.name, resumo, detalheDisponivel: false }).catch(e2 => console.error(e2));
     });
+    // guarda o id desse lote — se importar NF-e depois, atualiza o resumo financeiro
+    // desse mesmo registro no histórico em vez de deixar desatualizado
+    STATE.ultimaValidacao.historicoId = salvo?.id || null;
   } catch (e) {
     console.error(e);
     $('#progressBox').classList.add('hidden');
@@ -1867,6 +1913,15 @@ async function processarNotasFiscais(file, progressBoxId = 'progressNFeBox') {
       if (resumoCubagem && resumoCubagem.recalculados > 0) msg += ` ${resumoCubagem.recalculados} recalculado(s) com peso cubado próprio.`;
       else if (resumoCubagem && resumoCubagem.semFator > 0) msg += ` ${resumoCubagem.semFator} CT-e(s) sem fator de cubagem cadastrado no parceiro.`;
       renderResultadosValidacao();
+      // atualiza o resumo financeiro do lote já salvo no histórico, se houver
+      const resumoFinAtualizado = calcularResumoFinanceiro(STATE.ultimaValidacao.resultados, STATE.ultimaValidacao.reentregas || []);
+      if (STATE.ultimaValidacao.historicoId) {
+        DataLayer.atualizarResumoHistorico(STATE.ultimaValidacao.historicoId, {
+          totalCobrado: resumoFinAtualizado.totalCobrado,
+          totalClientePagou: resumoFinAtualizado.totalClientePagou,
+          faturado: resumoFinAtualizado.faturado,
+        }).catch(e => console.error('[Histórico] falha ao atualizar resumo financeiro:', e));
+      }
     } else {
       // sem validação carregada agora — só guarda pra casar automaticamente depois,
       // quando algum CT-e referenciando essas NF-es for validado
@@ -1878,6 +1933,35 @@ async function processarNotasFiscais(file, progressBoxId = 'progressNFeBox') {
     progressBox.classList.add('hidden');
     toast('Erro ao processar o arquivo de notas fiscais. Confira se é um .zip válido de NF-e.', 'error');
   }
+}
+
+function renderResumoFinanceiro(r) {
+  const positivo = r.faturado >= 0;
+  return `
+    <div class="mb-5 bg-white rounded-2xl shadow-panel border border-ink-100 p-5">
+      <div class="flex items-center justify-between flex-wrap gap-4">
+        <div class="flex items-center gap-6">
+          <div>
+            <div class="text-[11px] text-ink-400 font-medium uppercase tracking-wide">Cobrado (transportadora)</div>
+            <div class="text-xl font-bold num text-ink-800">${fmtBRL(r.totalCobrado)}</div>
+          </div>
+          <div class="text-ink-300 text-xl">×</div>
+          <div>
+            <div class="text-[11px] text-ink-400 font-medium uppercase tracking-wide">Cliente pagou (frete na NF-e)</div>
+            <div class="text-xl font-bold num text-ink-800">${fmtBRL(r.totalClientePagou)}</div>
+          </div>
+          <div class="text-ink-300 text-xl">=</div>
+          <div>
+            <div class="text-[11px] text-ink-400 font-medium uppercase tracking-wide">Faturado</div>
+            <div class="text-xl font-bold num ${positivo ? 'text-emerald-600' : 'text-red-600'}">${positivo ? '' : '-'}${fmtBRL(Math.abs(r.faturado))}</div>
+          </div>
+        </div>
+        <div class="text-[11px] text-ink-300 max-w-xs">
+          Devolução, reversa e reentrega entram só no "Cobrado" — o cliente não paga nada nesses casos, então é prejuízo puro pro Faturado.
+          ${!r.temAlgumaNfe ? '<br><span class="text-amber-600">Ainda sem nenhuma nota fiscal casada — importe as NF-es pra esse número ficar completo.</span>' : ''}
+        </div>
+      </div>
+    </div>`;
 }
 
 function renderResultadosValidacao() {
@@ -1894,6 +1978,7 @@ function renderResultadosValidacao() {
   const nfeImportada = resultados.some(r => r.valorFreteCliente !== undefined);
   const margemNegativa = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined && r.divergenciaCliente < -tol);
   const comNfe = resultados.filter(r => r.valorFreteCliente !== null && r.valorFreteCliente !== undefined);
+  const resumoFin = calcularResumoFinanceiro(resultados, reentregas);
 
   STATE._filtroAtual = STATE._filtroAtual || 'maior';
 
@@ -1917,6 +2002,8 @@ function renderResultadosValidacao() {
       </div>
     </div>
     <div id="progressNFeBox" class="hidden mb-4 bg-white rounded-xl border border-ink-100 p-3 text-xs text-ink-500"></div>
+
+    ${renderResumoFinanceiro(resumoFin)}
 
     <div class="grid ${nfeImportada ? 'grid-cols-4' : 'grid-cols-4'} gap-3 mb-3">
       ${filtroCard('maior', 'Cobrado a maior', maior.length, fmtBRL(maior.reduce((a,r)=>a+r.divergencia,0)), 'red')}
@@ -3733,6 +3820,7 @@ async function renderHistorico() {
             <th class="text-right font-semibold px-5 py-3">CT-es</th>
             <th class="text-right font-semibold px-5 py-3">Divergências (+)</th>
             <th class="text-right font-semibold px-5 py-3">Valor a maior</th>
+            <th class="text-right font-semibold px-5 py-3" title="Cliente pagou − Cobrado da transportadora (todo o lote)">Faturado</th>
             <th class="text-left font-semibold px-5 py-3">Por</th>
             <th class="px-5 py-3"></th>
           </tr>
@@ -3740,6 +3828,8 @@ async function renderHistorico() {
         <tbody class="divide-y divide-ink-100">
           ${historico.map((h, i) => {
             const temDetalhe = h.detalheDisponivel && Array.isArray(h.resultados);
+            const temFaturado = h.resumo?.faturado !== undefined && h.resumo?.faturado !== null;
+            const faturadoPositivo = temFaturado && h.resumo.faturado >= 0;
             return `
             <tr class="${temDetalhe ? 'hover:bg-brand-50/60 cursor-pointer' : 'opacity-60'}" ${temDetalhe ? `onclick="abrirHistoricoDetalhe(${i})"` : `title="Detalhe linha a linha não disponível pra este lote — exporte o Excel na época ou rode a validação de novo com o mesmo .zip"`}>
               <td class="px-5 py-3 text-ink-500 text-xs">${fmtDate(h.criadoEm)}</td>
@@ -3748,6 +3838,7 @@ async function renderHistorico() {
               <td class="px-5 py-3 text-right num">${h.resumo?.total ?? 0}</td>
               <td class="px-5 py-3 text-right num ${h.resumo?.qtdDivergenciaMaior ? 'text-red-600 font-semibold' : 'text-emerald-600'}">${h.resumo?.qtdDivergenciaMaior ?? 0}</td>
               <td class="px-5 py-3 text-right num ${h.resumo?.valorDivergenteMaior ? 'text-red-600 font-semibold' : ''}">${fmtBRL(h.resumo?.valorDivergenteMaior || 0)}</td>
+              <td class="px-5 py-3 text-right num font-semibold ${temFaturado ? (faturadoPositivo ? 'text-emerald-600' : 'text-red-600') : 'text-ink-300'}">${temFaturado ? (faturadoPositivo ? '' : '-') + fmtBRL(Math.abs(h.resumo.faturado)) : '—'}</td>
               <td class="px-5 py-3 text-ink-400 text-xs">${escapeHtml(h.criadoPor||'—')}</td>
               <td class="px-5 py-3 text-right text-xs ${temDetalhe ? 'text-brand-600 font-medium' : 'text-ink-300'}">${temDetalhe ? 'Ver comparação →' : 'sem detalhe'}</td>
             </tr>
