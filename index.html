@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-08-11-upload-nfe-independente';
+const APP_VERSION = '2026-08-11-reentrega-prejuizo';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -1796,8 +1796,10 @@ async function processarZip(file) {
       parceiros: Array.from(new Set(resultados.map(r => r.parceiro.nome))),
       semParceiro: semParceiro.length,
       devolucoes: devolucoesResultados.length,
+      valorDevolucoes: clamp2(devolucoesResultados.reduce((a,r) => a + (r.cobrado||0), 0)),
       outrosFluxos: outrosFluxos.length,
       reentregas: reentregas.length,
+      valorReentregas: clamp2(reentregas.reduce((a,x) => a + (x.cte.vTPrest||0), 0)),
       duplicadosIgnorados: ctesDuplicados.length,
     };
 
@@ -1912,26 +1914,19 @@ function renderResultadosValidacao() {
     </div>
     <div id="progressNFeBox" class="hidden mb-4 bg-white rounded-xl border border-ink-100 p-3 text-xs text-ink-500"></div>
 
-    <div class="grid ${nfeImportada ? 'grid-cols-6' : 'grid-cols-5'} gap-3 mb-5">
+    <div class="grid ${nfeImportada ? 'grid-cols-4' : 'grid-cols-4'} gap-3 mb-3">
       ${filtroCard('maior', 'Cobrado a maior', maior.length, fmtBRL(maior.reduce((a,r)=>a+r.divergencia,0)), 'red')}
       ${filtroCard('menor', 'Cobrado a menor', menor.length, fmtBRL(menor.reduce((a,r)=>a+r.divergencia,0)), 'amber')}
       ${filtroCard('ok', 'Conferem com a tabela', ok.length, '', 'emerald')}
       ${filtroCard('revisao', 'Revisão manual / sem cobertura', revisao.length, '', 'ink')}
-      ${filtroCard('devolucao', 'Devolução', devolucoes.length, '', 'brand')}
+    </div>
+    <div class="grid ${nfeImportada ? 'grid-cols-3' : 'grid-cols-2'} gap-3 mb-5">
+      ${filtroCard('devolucao', 'Devolução (prejuízo total)', devolucoes.length, fmtBRL(devolucoes.reduce((a,r)=>a+(r.cobrado||0),0)), 'brand')}
+      ${filtroCard('reentrega', 'Reentrega (prejuízo total)', reentregas.length, fmtBRL(reentregas.reduce((a,x)=>a+(x.cte.vTPrest||0),0)), 'purple')}
       ${nfeImportada ? filtroCard('margem_negativa', 'Cliente pagou menos que o frete', margemNegativa.length, fmtBRL(margemNegativa.reduce((a,r)=>a+r.divergenciaCliente,0)), 'red') : ''}
     </div>
 
     <div id="tabelaResultados"></div>
-
-    ${reentregas.length ? `
-      <div class="mt-6 bg-purple-50 border border-purple-200 rounded-2xl p-5">
-        <div class="text-sm font-semibold text-purple-800 mb-1">${reentregas.length} CT-e(s) de reentrega — fora da validação</div>
-        <p class="text-xs text-purple-700 mb-3">Identificados pela observação do CT-e. Não existe tabela pra reentrega, então não calculamos valor esperado — fica só o valor cobrado listado, pra controle e conferência manual.</p>
-        <div class="text-xs space-y-0.5 max-h-40 overflow-y-auto text-purple-900/80">
-          ${reentregas.map(x => `<div>• CT-e ${escapeHtml(x.cte.nCT)} — ${escapeHtml(x.parceiro.nome)} — ${escapeHtml(x.cte.destMun)}/${escapeHtml(x.cte.destUF)} — cobrado ${fmtBRL(x.cte.vTPrest)}</div>`).join('')}
-        </div>
-      </div>
-    ` : ''}
 
     ${outrosFluxos.length ? `
       <div class="mt-6 bg-blue-50 border border-blue-200 rounded-2xl p-5">
@@ -1969,7 +1964,51 @@ function renderResultadosValidacao() {
   }));
 
   const grupos = { maior, menor, ok, revisao, devolucao: devolucoes, margem_negativa: margemNegativa };
-  renderTabelaResultados(grupos[STATE._filtroAtual] || maior, STATE._filtroAtual);
+  if (STATE._filtroAtual === 'reentrega') {
+    renderTabelaInformativa(reentregas, 'reentrega');
+  } else {
+    renderTabelaResultados(grupos[STATE._filtroAtual] || maior, STATE._filtroAtual);
+  }
+}
+
+// Tabela pra categorias sem cálculo (hoje só reentrega) — mostra só o cobrado, com um
+// aviso explicando por que não tem coluna de calculado/divergência.
+function renderTabelaInformativa(lista, tipo) {
+  const el = $('#tabelaResultados');
+  if (lista.length === 0) {
+    el.innerHTML = emptyState('Nada por aqui', 'Nenhum CT-e nesta categoria.');
+    return;
+  }
+  const total = lista.reduce((a, x) => a + (x.cte.vTPrest || 0), 0);
+  el.innerHTML = `
+    <div class="mb-4 text-xs px-3 py-2.5 rounded-lg bg-purple-50 text-purple-800 border border-purple-200">
+      <strong>Reentrega é prejuízo direto, igual devolução</strong> — o Grupo TBX paga essa tentativa extra de entrega do próprio bolso, sem repasse pro cliente. Não existe tabela pra reentrega, então não calculamos valor esperado — o que importa aqui é o <strong>valor total cobrado</strong>, que já é o prejuízo em si. Total: <strong>${fmtBRL(total)}</strong>.
+    </div>
+    <div class="bg-white rounded-2xl shadow-panel border border-ink-100 overflow-hidden">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="bg-ink-50 text-ink-500 text-[11px] uppercase tracking-wide">
+            <th class="text-left font-semibold px-4 py-3">CT-e</th>
+            <th class="text-left font-semibold px-4 py-3">Parceiro</th>
+            <th class="text-left font-semibold px-4 py-3">Destino</th>
+            <th class="text-right font-semibold px-4 py-3">Cobrado</th>
+            <th class="text-right font-semibold px-4 py-3">Prejuízo (total cobrado)</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-ink-100">
+          ${lista.slice(0, 300).map(x => `
+            <tr class="hover:bg-ink-50/60">
+              <td class="px-4 py-3 num text-ink-700">${escapeHtml(x.cte.nCT || '—')}</td>
+              <td class="px-4 py-3 text-ink-700">${escapeHtml(x.parceiro.nome)}</td>
+              <td class="px-4 py-3 text-ink-600">${escapeHtml(x.cte.destMun)} <span class="text-ink-300">/</span> ${escapeHtml(x.cte.destUF)}</td>
+              <td class="px-4 py-3 text-right num text-ink-700">${fmtBRL(x.cte.vTPrest)}</td>
+              <td class="px-4 py-3 text-right num font-semibold text-purple-700">${fmtBRL(x.cte.vTPrest)}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
 }
 
 function renderGrupoForaFluxo(titulo, lista, cor) {
@@ -1985,9 +2024,10 @@ function renderGrupoForaFluxo(titulo, lista, cor) {
 
 function filtroCard(key, label, count, sub, color) {
   const active = STATE._filtroAtual === key;
-  const colorMap = { red:'text-red-600 bg-red-50 border-red-200', amber:'text-amber-700 bg-amber-50 border-amber-200', emerald:'text-emerald-700 bg-emerald-50 border-emerald-200', ink:'text-ink-600 bg-ink-50 border-ink-200' };
+  const colorMap = { red:'text-red-600 bg-red-50 border-red-200', amber:'text-amber-700 bg-amber-50 border-amber-200', emerald:'text-emerald-700 bg-emerald-50 border-emerald-200', ink:'text-ink-600 bg-ink-50 border-ink-200', brand:'text-brand-700 bg-brand-50 border-brand-200', purple:'text-purple-700 bg-purple-50 border-purple-200' };
+  const ringMap = { red:'red-300', amber:'amber-300', emerald:'emerald-300', ink:'ink-300', brand:'brand-300', purple:'purple-300' };
   return `
-    <button data-filtro="${key}" class="filtro-card text-left rounded-2xl border p-4 transition-all ${active ? colorMap[color] + ' ring-2 ring-offset-1 ring-' + (color==='red'?'red-300':color==='amber'?'amber-300':color==='emerald'?'emerald-300':'ink-300') : 'bg-white border-ink-100 hover:border-ink-200'}">
+    <button data-filtro="${key}" class="filtro-card text-left rounded-2xl border p-4 transition-all ${active ? colorMap[color] + ' ring-2 ring-offset-1 ring-' + (ringMap[color] || 'ink-300') : 'bg-white border-ink-100 hover:border-ink-200'}">
       <div class="text-xs text-ink-400 font-medium mb-1">${label}</div>
       <div class="text-xl font-bold num ${active ? '' : 'text-ink-800'}">${count}</div>
       ${sub ? `<div class="text-[11px] mt-0.5 num opacity-80">${sub}</div>` : ''}
@@ -2027,10 +2067,16 @@ function renderTabelaResultados(lista, filtro) {
     el.innerHTML = emptyState('Nada por aqui', 'Nenhum CT-e nesta categoria.');
     return;
   }
-  const mostrarDivergencia = filtro === 'maior' || filtro === 'menor' || filtro === 'devolucao';
+  const ehDevolucao = filtro === 'devolucao';
+  const mostrarDivergencia = filtro === 'maior' || filtro === 'menor' || ehDevolucao;
   const mostrarMargem = filtro === 'margem_negativa' || lista.some(r => r.valorFreteCliente !== null && r.valorFreteCliente !== undefined);
   const nfsTxt = (r) => (r.cte.notasFiscais || []).map(n => n.numero).join(', ') || '—';
+  const bannerDevolucao = ehDevolucao ? `
+    <div class="mb-4 text-xs px-3 py-2.5 rounded-lg bg-brand-50 text-brand-800 border border-brand-200">
+      <strong>Devolução/reversa é prejuízo direto</strong> — o Grupo TBX paga esse frete do próprio bolso, sem repasse pro cliente. Por isso, a coluna "Prejuízo" abaixo mostra o <strong>valor total cobrado</strong> pela transportadora, não a diferença contra a tabela. O "Calculado" continua útil só pra conferir se a transportadora está cobrando certo (e não a mais) — não é o valor do prejuízo em si.
+    </div>` : '';
   el.innerHTML = `
+    ${bannerDevolucao}
     <div class="bg-white rounded-2xl shadow-panel border border-ink-100 overflow-hidden">
       <table class="w-full text-sm">
         <thead>
@@ -2041,7 +2087,7 @@ function renderTabelaResultados(lista, filtro) {
             <th class="text-left font-semibold px-4 py-3">Destino</th>
             <th class="text-right font-semibold px-4 py-3">Cobrado</th>
             <th class="text-right font-semibold px-4 py-3">Calculado</th>
-            ${mostrarDivergencia ? '<th class="text-right font-semibold px-4 py-3">Divergência</th>' : ''}
+            ${mostrarDivergencia ? `<th class="text-right font-semibold px-4 py-3">${ehDevolucao ? 'Prejuízo (total cobrado)' : 'Divergência'}</th>` : ''}
             ${mostrarMargem ? '<th class="text-right font-semibold px-4 py-3">Frete Cliente</th><th class="text-right font-semibold px-4 py-3" title="Frete cliente − Cobrado da transportadora">Margem</th>' : ''}
             <th class="text-left font-semibold px-4 py-3">Status</th>
             <th class="px-4 py-3"></th>
@@ -2059,7 +2105,10 @@ function renderTabelaResultados(lista, filtro) {
               }</td>
               <td class="px-4 py-3 text-right num text-ink-700">${fmtBRL(r.cobrado)}</td>
               <td class="px-4 py-3 text-right num text-ink-700">${r.calculado !== null ? fmtBRL(r.calculado) : '—'}</td>
-              ${mostrarDivergencia ? `<td class="px-4 py-3 text-right num font-semibold ${r.divergencia>0?'text-red-600':'text-amber-700'}">${r.divergencia>0?'+':''}${fmtBRL(r.divergencia)}</td>` : ''}
+              ${mostrarDivergencia ? (ehDevolucao
+                ? `<td class="px-4 py-3 text-right num font-semibold text-brand-700">${fmtBRL(r.cobrado)}</td>`
+                : `<td class="px-4 py-3 text-right num font-semibold ${r.divergencia>0?'text-red-600':'text-amber-700'}">${r.divergencia>0?'+':''}${fmtBRL(r.divergencia)}</td>`
+              ) : ''}
               ${mostrarMargem ? `
                 <td class="px-4 py-3 text-right num text-ink-700">${r.valorFreteCliente != null ? fmtBRL(r.valorFreteCliente) : '<span class="text-ink-300">sem NF-e</span>'}</td>
                 <td class="px-4 py-3 text-right num font-semibold ${r.divergenciaCliente == null ? 'text-ink-300' : r.divergenciaCliente < 0 ? 'text-red-600' : 'text-emerald-600'}">${r.divergenciaCliente != null ? (r.divergenciaCliente>0?'+':'') + fmtBRL(r.divergenciaCliente) : '—'}</td>
@@ -3970,20 +4019,22 @@ async function renderTratativas() {
   $('#btnExportarTratativas').addEventListener('click', exportarTratativasXlsx);
   atualizarTextoExportar();
 
-  // resumo de devolução (agora validada normalmente, entra nas divergências) e trajetos
-  // atípicos/reentregas (esses sim ficam fora, sem tabela pra comparar) — somado em todos os lotes
+  // resumo de devolução/reentrega (prejuízo direto — valor total cobrado) e trajetos
+  // atípicos (sem tabela pra comparar) — somado em todos os lotes
   const historico = await DataLayer.listHistorico().catch(() => []);
   const totalDevolucoes = historico.reduce((a, h) => a + (h.resumo?.devolucoes || 0), 0);
+  const valorDevolucoes = historico.reduce((a, h) => a + (h.resumo?.valorDevolucoes || 0), 0);
   const totalOutros = historico.reduce((a, h) => a + (h.resumo?.outrosFluxos || 0), 0);
   const totalReentregas = historico.reduce((a, h) => a + (h.resumo?.reentregas || 0), 0);
+  const valorReentregas = historico.reduce((a, h) => a + (h.resumo?.valorReentregas || 0), 0);
   const boxForaFluxo = $('#resumoForaFluxoAnalises');
   if (totalDevolucoes > 0 || totalOutros > 0 || totalReentregas > 0) {
     boxForaFluxo.innerHTML = `
       <div class="bg-blue-50 border border-blue-200 rounded-2xl p-4">
-        <div class="text-sm font-semibold text-blue-800 mb-2">Acumulado de todos os lotes já processados</div>
+        <div class="text-sm font-semibold text-blue-800 mb-2">Acumulado de todos os lotes já processados — prejuízo direto (pago do próprio bolso)</div>
         <div class="grid grid-cols-3 gap-3 text-xs">
-          <div><span class="text-brand-700 font-bold text-base">${totalDevolucoes}</span> <span class="text-brand-600">devolução(ões) — validadas normalmente (100% da tabela de saída, pelo remetente)</span></div>
-          <div><span class="text-purple-700 font-bold text-base">${totalReentregas}</span> <span class="text-purple-600">reentrega(s) — sem tabela pra comparar, fora da validação</span></div>
+          <div><span class="text-brand-700 font-bold text-base">${totalDevolucoes}</span> <span class="text-brand-600">devolução(ões) — ${fmtBRL(valorDevolucoes)} de prejuízo total</span></div>
+          <div><span class="text-purple-700 font-bold text-base">${totalReentregas}</span> <span class="text-purple-600">reentrega(s) — ${fmtBRL(valorReentregas)} de prejuízo total</span></div>
           <div><span class="text-ink-600 font-bold text-base">${totalOutros}</span> <span class="text-ink-500">trajeto(s) atípico(s) — sem tabela pra comparar, fora da validação</span></div>
         </div>
       </div>`;
