@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-09-29-fix-salvar-historico';
+const APP_VERSION = '2026-09-29-tda-e-recalcular';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -411,6 +411,31 @@ const DataLayer = {
     }
     return { id: ref.id, ...principal };
   },
+  async substituirValidacao(id, registro) {
+    registro.recalculadoEm = new Date().toISOString();
+    registro.recalculadoPor = currentUser ? currentUser.email : 'offline';
+    if (OFFLINE_MODE) {
+      const data = localDB_read();
+      const item = (data.historico || []).find(h => h.id === id);
+      if (item) { Object.assign(item, registro); localDB_write(data); }
+      return;
+    }
+    const limpo = limparParaFirestore(registro);
+    const ref = db.collection('validacoes').doc(id);
+    const antigas = await ref.collection('partes').get();
+    for (const d of antigas.docs) await d.ref.delete();
+    const del = firebase.firestore.FieldValue.delete();
+    if (JSON.stringify(limpo).length <= 900000) {
+      await ref.update({ ...limpo, detalheEmPartes: del });
+      return;
+    }
+    const partes = dividirDetalheEmPartes(limpo);
+    const { resultados, semParceiro, outrosFluxos, reentregas, ...principal } = limpo;
+    await ref.update({ ...principal, detalheDisponivel: true, detalheEmPartes: partes.length, resultados: del, semParceiro: del, outrosFluxos: del, reentregas: del });
+    for (let i = 0; i < partes.length; i++) {
+      await ref.collection('partes').doc(String(i).padStart(3, '0')).set({ indice: i, ...partes[i] });
+    }
+  },
   async carregarDetalheHistorico(h) {
     if (!h.detalheEmPartes || OFFLINE_MODE) return h;
     const snap = await db.collection('validacoes').doc(h.id).collection('partes').get();
@@ -496,6 +521,22 @@ const DataLayer = {
       const chunk = lista.slice(i, i + 400);
       const batch = db.batch();
       chunk.forEach(c => batch.set(db.collection('ctes').doc(c.chave), limparParaFirestore(c)));
+      await batch.commit();
+    }
+  },
+  // atualiza (merge) os CT-es já gravados — mantém arquivoOrigem/importadoEm originais
+  async atualizarCtesEmLote(lista) {
+    if (!lista.length) return;
+    if (OFFLINE_MODE) {
+      const data = localDB_read();
+      data.ctes = data.ctes || {};
+      lista.forEach(c => { data.ctes[c.chave] = { ...(data.ctes[c.chave] || {}), ...c }; });
+      localDB_write(data);
+      return;
+    }
+    for (let i = 0; i < lista.length; i += 400) {
+      const batch = db.batch();
+      lista.slice(i, i + 400).forEach(c => batch.set(db.collection('ctes').doc(c.chave), limparParaFirestore(c), { merge: true }));
       await batch.commit();
     }
   },
@@ -1354,6 +1395,26 @@ function calcularParceiro(cte, parceiro, abrangenciaIndex, enderecoConsulta = nu
     if (r.aplicavel && typeof r.valor === 'number') ctx.subtotalAtual += r.valor;
   }
 
+  // TDA automática: a abrangência do parceiro já traz o valor da TDA por faixa de CEP. Se
+  // o parceiro não tem uma regra de TDA cadastrada em "Taxas e regras adicionais", usa o
+  // valor da própria abrangência em vez de deixar a TDA cobrada como "não encontrado no
+  // cadastro". Quando a faixa NÃO tem TDA mas a transportadora cobrou, entra como R$ 0,00
+  // pra divergência aparecer na linha certa.
+  const temRegraTda = (parceiro.regrasAdicionais || []).some(rg => {
+    const n = normalizaNomeComponente(rg.nome);
+    return rg.tipo === 'lista_abrangencia' || /^TDA\b/.test(n) || n.includes('DIFICIL ACESSO');
+  });
+  if (!temRegraTda && abrRow) {
+    const valorTda = Number(abrRow.tda) || 0;
+    const onde = `CEP ${cepConsulta || '—'} na faixa ${abrRow.cidade ? abrRow.cidade + ' ' : ''}(${abrRow.cepIni}–${abrRow.cepFim})`;
+    if (valorTda > 0) {
+      componentes.push({ nome: 'TDA', valor: clamp2(valorTda), aplicavel: true, manual: false, tipo: 'lista_abrangencia', explicacao: `TDA da abrangência: ${onde} tem TDA de ${fmtBRL(valorTda)} → valor esperado ${fmtBRL(valorTda)} por CT-e (parceiro sem regra de TDA própria, usado o valor da abrangência).` });
+      ctx.subtotalAtual += clamp2(valorTda);
+    } else if (encontrarComponenteCobrado(cte, 'TDA').valor !== undefined) {
+      componentes.push({ nome: 'TDA', valor: 0, aplicavel: true, manual: false, tipo: 'lista_abrangencia', explicacao: `TDA da abrangência: ${onde} NÃO tem TDA na tabela → o esperado é R$ 0,00.` });
+    }
+  }
+
   const manualPendente = componentes.some(c => c.manual);
   const subtotalCalculado = componentes.reduce((acc, c) => acc + (c.aplicavel && typeof c.valor === 'number' ? c.valor : 0), 0);
 
@@ -1966,6 +2027,102 @@ function trimForaFluxoParaHistorico(x) {
   };
 }
 
+// Resumo + detalhe enxuto de um lote, no formato gravado em 'validacoes' (Histórico).
+// Usado ao validar um lote novo e ao recalcular um lote já importado.
+function montarRegistroHistorico(nomeLote, v) {
+  const { resultados, semParceiro = [], outrosFluxos = [], reentregas = [], duplicadosIgnorados = 0 } = v;
+  const tol = 0.05;
+  // devolução/reentrega ficam só na aba própria delas — não contam aqui, pra não duplicar
+  const maior = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia > tol);
+  const menor = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia < -tol);
+  const devolucoesResultados = resultados.filter(r => r.tipoOperacao === 'devolucao');
+  const resumoFin = calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFluxos);
+  const resumo = {
+    total: resultados.length + semParceiro.length + outrosFluxos.length + reentregas.length,
+    qtdDivergenciaMaior: maior.length,
+    qtdDivergenciaMenor: menor.length,
+    valorDivergenteMaior: clamp2(maior.reduce((a,r) => a + r.divergencia, 0)),
+    valorDivergenteMenor: clamp2(menor.reduce((a,r) => a + r.divergencia, 0)),
+    parceiros: Array.from(new Set(resultados.map(r => r.parceiro.nome))),
+    semParceiro: semParceiro.length,
+    devolucoes: devolucoesResultados.length,
+    valorDevolucoes: clamp2(devolucoesResultados.reduce((a,r) => a + (r.cobrado||0), 0)),
+    outrosFluxos: outrosFluxos.length,
+    reentregas: reentregas.length,
+    valorReentregas: clamp2(reentregas.reduce((a,x) => a + (x.cte.vTPrest||0), 0)),
+    duplicadosIgnorados,
+    totalCobrado: resumoFin.totalCobrado,
+    totalClientePagou: resumoFin.totalClientePagou,
+    faturado: resumoFin.faturado,
+  };
+  return {
+    nomeArquivo: nomeLote, resumo,
+    resultados: resultados.map(trimResultadoParaHistorico),
+    semParceiro: semParceiro.map(trimSemParceiroParaHistorico),
+    outrosFluxos: outrosFluxos.map(trimForaFluxoParaHistorico),
+    reentregas: reentregas.map(trimForaFluxoParaHistorico),
+    detalheDisponivel: true,
+  };
+}
+
+// Recalcula o lote que está aberto na tela (recém-validado ou reaberto pelo Histórico)
+// com o cadastro ATUAL dos parceiros — sem precisar subir os XMLs de novo (que agora
+// seriam bloqueados como duplicados). Atualiza a tela, o Histórico e os CT-es salvos.
+async function recalcularLoteAtual() {
+  const v = STATE.ultimaValidacao;
+  if (!v || !v.resultados?.length) { toast('Nenhum lote aberto pra recalcular.', 'warn'); return; }
+  const btn = $('#btnRecalcular');
+  if (btn) { btn.disabled = true; btn.textContent = 'Recalculando…'; }
+  try {
+    const parceiros = await DataLayer.listParceiros().catch(() => STATE.parceiros);
+    if (parceiros?.length) STATE.parceiros = parceiros;
+    const indices = {};
+    let recalculados = 0, semCadastro = 0;
+    v.resultados.forEach(r => {
+      const p = STATE.parceiros.find(x => x.id === r.parceiro.id)
+        || STATE.parceiros.find(x => normalizaNomeComponente(x.nome) === normalizaNomeComponente(r.parceiro.nome));
+      if (!p) { semCadastro++; return; }
+      if (!indices[p.id]) indices[p.id] = buildAbrangenciaIndex(p.abrangencia || []);
+      const enderecoConsulta = r.tipoOperacao === 'devolucao' ? { uf: r.cte.remUF, cep: r.cte.remCEP } : null;
+      r.parceiro = p;
+      r.calc = calcularParceiro(r.cte, p, indices[p.id], enderecoConsulta);
+      r.calculado = r.calc.totalCalculado;
+      r.divergencia = (r.calculado !== null) ? clamp2(r.cobrado - r.calculado) : null;
+      delete r.pesoCubadoInfo;
+      recalculados++;
+    });
+
+    // casa de novo com as NF-es salvas (inclusive as importadas depois) e refaz a cubagem
+    const chaves = v.resultados.flatMap(r => (r.cte.notasFiscais || []).map(n => n.chave));
+    const nfes = await DataLayer.listNfesPorChaves(chaves).catch(() => []);
+    if (nfes.length) {
+      enriquecerComNotasFiscais(v.resultados, nfes);
+      const produtosMap = await carregarMapaProdutosAtivo().catch(() => null);
+      if (produtosMap) recalcularComCubagem(v.resultados, produtosMap);
+    }
+
+    renderResultadosValidacao();
+
+    const registro = montarRegistroHistorico(v.nomeArquivo, v);
+    if (v.historicoId) {
+      await DataLayer.substituirValidacao(v.historicoId, registro).catch(e => { console.error(e); toast('Recalculado na tela, mas não consegui atualizar o Histórico. Detalhe no console (F12).', 'error'); });
+    } else {
+      const salvo = await DataLayer.saveValidacao(registro).catch(e => { console.error(e); return null; });
+      v.historicoId = salvo?.id || null;
+    }
+    const atualizacoesCtes = v.resultados.filter(r => r.cte.chave).map(r => ({ chave: r.cte.chave, ...trimResultadoParaHistorico(r), recalculadoEm: new Date().toISOString() }));
+    await DataLayer.atualizarCtesEmLote(atualizacoesCtes).catch(e => console.error('[CT-e global] falha ao atualizar:', e));
+
+    toast(`${recalculados} CT-e(s) recalculado(s) com o cadastro atual${semCadastro ? ` · ${semCadastro} sem parceiro cadastrado (mantidos como estavam)` : ''}.`, 'success');
+  } catch (e) {
+    console.error(e);
+    toast('Erro ao recalcular o lote. Detalhe no console (F12).', 'error');
+  } finally {
+    const b = $('#btnRecalcular');
+    if (b) { b.disabled = false; b.textContent = 'Recalcular com cadastro atual'; }
+  }
+}
+
 async function processarZip(entrada) {
   const nomeLote = nomeDoLote(entrada);
   if (STATE.parceiros.length === 0) {
@@ -2044,43 +2201,12 @@ async function processarZip(entrada) {
     });
 
     // salva resumo no histórico
-    const tol = 0.05;
-    // devolução/reentrega ficam só na aba própria delas — não contam aqui, pra não duplicar
-    const maior = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia > tol);
-    const menor = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia < -tol);
-    const devolucoesResultados = resultados.filter(r => r.tipoOperacao === 'devolucao');
-    const resumoFinInicial = calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFluxos);
-    const resumo = {
-      total: resultados.length + semParceiro.length + outrosFluxos.length + reentregas.length,
-      qtdDivergenciaMaior: maior.length,
-      qtdDivergenciaMenor: menor.length,
-      valorDivergenteMaior: clamp2(maior.reduce((a,r) => a + r.divergencia, 0)),
-      valorDivergenteMenor: clamp2(menor.reduce((a,r) => a + r.divergencia, 0)),
-      parceiros: Array.from(new Set(resultados.map(r => r.parceiro.nome))),
-      semParceiro: semParceiro.length,
-      devolucoes: devolucoesResultados.length,
-      valorDevolucoes: clamp2(devolucoesResultados.reduce((a,r) => a + (r.cobrado||0), 0)),
-      outrosFluxos: outrosFluxos.length,
-      reentregas: reentregas.length,
-      valorReentregas: clamp2(reentregas.reduce((a,x) => a + (x.cte.vTPrest||0), 0)),
-      duplicadosIgnorados: ctesDuplicados.length,
-      totalCobrado: resumoFinInicial.totalCobrado,
-      totalClientePagou: resumoFinInicial.totalClientePagou,
-      faturado: resumoFinInicial.faturado,
-    };
-
-    // tenta guardar o detalhe linha a linha (pra reabrir a tela de comparação depois);
-    // se ficar grande demais pro banco, guarda só o resumo mesmo (Firestore tem limite de 1MB por documento)
-    const resultadosTrim = resultados.map(trimResultadoParaHistorico);
-    const semParceiroTrim = semParceiro.map(trimSemParceiroParaHistorico);
-    const outrosFluxosTrim = outrosFluxos.map(trimForaFluxoParaHistorico);
-    const reentregasTrim = reentregas.map(trimForaFluxoParaHistorico);
-    let registro = { nomeArquivo: nomeLote, resumo, resultados: resultadosTrim, semParceiro: semParceiroTrim, outrosFluxos: outrosFluxosTrim, reentregas: reentregasTrim, detalheDisponivel: true };
+    const registro = montarRegistroHistorico(nomeLote, { resultados, semParceiro, outrosFluxos, reentregas, duplicadosIgnorados: ctesDuplicados.length });
     const salvo = await DataLayer.saveValidacao(registro).catch(async (e) => {
       console.error(e);
       toast('Não foi possível salvar o detalhe do lote no histórico — salvando só o resumo. Detalhe do erro no console (F12).', 'warn');
       // se falhar por tamanho, tenta de novo só com o resumo
-      return DataLayer.saveValidacao({ nomeArquivo: nomeLote, resumo, detalheDisponivel: false }).catch(e2 => console.error(e2));
+      return DataLayer.saveValidacao({ nomeArquivo: nomeLote, resumo: registro.resumo, detalheDisponivel: false }).catch(e2 => console.error(e2));
     });
     // guarda o id desse lote — se importar NF-e depois, atualiza o resumo financeiro
     // desse mesmo registro no histórico em vez de deixar desatualizado
@@ -2220,6 +2346,7 @@ function renderResultadosValidacao() {
         <input type="file" id="fileNFe" accept=".zip,.xml" multiple class="hidden">
         <input type="file" id="folderNFeRes" webkitdirectory directory multiple class="hidden">
         <button id="btnImportarNFePasta" class="text-sm font-medium text-ink-600 hover:text-ink-800">(pasta)</button>
+        <button id="btnRecalcular" title="Refaz o cálculo deste lote com o cadastro atual dos parceiros (tabelas, taxas, abrangência) e atualiza o Histórico — sem precisar subir os XMLs de novo" class="text-sm font-medium text-ink-600 hover:text-ink-800">Recalcular com cadastro atual</button>
         <button id="btnExportar" class="text-sm font-medium text-brand-600 hover:text-brand-700 flex items-center gap-1.5">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H8a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
           Exportar Excel
@@ -2263,6 +2390,7 @@ function renderResultadosValidacao() {
     ` : ''}
   `;
 
+  $('#btnRecalcular').addEventListener('click', recalcularLoteAtual);
   $('#btnExportar').addEventListener('click', () => {
     const blob = exportResultadosParaXlsx(resultados, semParceiro, STATE.parceiros, outrosFluxos, reentregas);
     downloadBlob(blob, `Validacao_Fretes_${String(nomeArquivo).replace(/\.zip$/i,'').replace(/[\\/:*?"<>|]+/g,'_')}.xlsx`);
@@ -4036,7 +4164,9 @@ async function abrirHistoricoDetalhe(indice) {
   }
   if (!h || !h.resultados) { toast('Detalhe não disponível para este lote.', 'warn'); return; }
   STATE.ultimaValidacao = {
+    historicoId: h.id || null,
     nomeArquivo: h.nomeArquivo,
+    duplicadosIgnorados: h.resumo?.duplicadosIgnorados || 0,
     resultados: h.resultados,
     semParceiro: h.semParceiro || [],
     outrosFluxos: h.outrosFluxos || [],
