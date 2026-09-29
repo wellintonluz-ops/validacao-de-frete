@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-08-11-fix-historico-reentrega';
+const APP_VERSION = '2026-09-29-importar-pasta-xml';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -721,24 +721,111 @@ function parseCteXml(xmlString, fileName) {
 // ---------------------------------------------------------------------
 // 7. LEITURA DO .ZIP DE CT-es
 // ---------------------------------------------------------------------
-async function readCtesFromZip(file, onProgress) {
-  const zip = await JSZip.loadAsync(file);
-  const entries = Object.values(zip.files).filter(f => !f.dir && /\.xml$/i.test(f.name));
-  const ctes = [];
+// Aceita qualquer combinação de: .zip (com XMLs dentro, inclusive em subpastas), XMLs
+// soltos e pastas inteiras (via seletor de pasta ou arrastando). Tudo vira uma lista
+// única de "fontes" { nome, lerTexto } — o resto do fluxo não precisa saber de onde veio.
+function listaDeArquivos(entrada) {
+  if (!entrada) return [];
+  if (entrada instanceof File || entrada instanceof Blob) return [entrada];
+  return Array.from(entrada);
+}
+
+async function coletarFontesXml(entrada) {
+  const arquivos = listaDeArquivos(entrada);
+  const fontes = [];
   const falhas = [];
+  for (const f of arquivos) {
+    const nome = f.webkitRelativePath || f._caminho || f.name;
+    if (/\.zip$/i.test(f.name)) {
+      try {
+        const zip = await JSZip.loadAsync(f);
+        Object.values(zip.files)
+          .filter(e => !e.dir && /\.xml$/i.test(e.name) && !/(^|\/)__MACOSX\//.test(e.name))
+          .forEach(e => fontes.push({ nome: e.name.split('/').pop(), origem: `${f.name}/${e.name}`, lerTexto: () => e.async('text') }));
+      } catch (e) {
+        falhas.push(nome);
+      }
+    } else if (/\.xml$/i.test(f.name)) {
+      fontes.push({ nome: f.name, origem: nome, lerTexto: () => f.text() });
+    }
+    // outros tipos (pdf, txt, desktop.ini…) dentro da pasta são simplesmente ignorados
+  }
+  return { fontes, falhas };
+}
+
+async function lerXmlsGenerico(entrada, parser, onProgress) {
+  const { fontes, falhas } = await coletarFontesXml(entrada);
+  const itens = [];
+  const chavesVistas = new Set();
+  let duplicadosNoLote = 0;
   let done = 0;
-  for (const entry of entries) {
+  for (const fonte of fontes) {
     try {
-      const text = await entry.async('text');
-      const cte = parseCteXml(text, entry.name.split('/').pop());
-      if (cte) ctes.push(cte); else falhas.push(entry.name);
+      const text = await fonte.lerTexto();
+      const doc = parser(text, fonte.nome);
+      if (!doc) falhas.push(fonte.origem);
+      else if (doc.chave && chavesVistas.has(doc.chave)) duplicadosNoLote++; // mesmo XML 2x na pasta/zip: fica só o primeiro
+      else { if (doc.chave) chavesVistas.add(doc.chave); itens.push(doc); }
     } catch (e) {
-      falhas.push(entry.name);
+      falhas.push(fonte.origem);
     }
     done++;
-    if (onProgress) onProgress(done, entries.length);
+    if (onProgress) onProgress(done, fontes.length);
   }
-  return { ctes, falhas };
+  return { itens, falhas, duplicadosNoLote, totalArquivos: fontes.length };
+}
+
+async function readCtesFromZip(entrada, onProgress) {
+  const r = await lerXmlsGenerico(entrada, parseCteXml, onProgress);
+  return { ctes: r.itens, falhas: r.falhas, duplicadosNoLote: r.duplicadosNoLote, totalArquivos: r.totalArquivos };
+}
+
+// Nome amigável do lote pro histórico/Excel: nome do .zip, nome da pasta, ou "N arquivos XML"
+function nomeDoLote(entrada) {
+  const arquivos = listaDeArquivos(entrada);
+  if (arquivos.length === 0) return 'lote';
+  const caminhos = arquivos.map(f => f.webkitRelativePath || f._caminho || '').filter(Boolean);
+  if (caminhos.length === arquivos.length) {
+    const pastas = Array.from(new Set(caminhos.map(c => c.split('/')[0])));
+    if (pastas.length === 1 && caminhos.some(c => c.includes('/'))) return pastas[0];
+  }
+  if (arquivos.length === 1) return arquivos[0].name;
+  const zips = arquivos.filter(f => /\.zip$/i.test(f.name));
+  if (zips.length === arquivos.length) return zips.map(z => z.name).join(' + ');
+  const xmls = arquivos.filter(f => /\.xml$/i.test(f.name)).length;
+  return `${xmls} arquivos XML${zips.length ? ` + ${zips.length} zip` : ''}`;
+}
+
+// Arrastar e soltar: pega arquivos soltos E pastas inteiras (lendo subpastas também).
+// Sem suporte a webkitGetAsEntry (navegador antigo), cai no dataTransfer.files normal.
+async function arquivosDoDrop(dataTransfer) {
+  const items = Array.from(dataTransfer.items || []);
+  const entries = items.map(it => it.webkitGetAsEntry ? it.webkitGetAsEntry() : null).filter(Boolean);
+  if (entries.length === 0) return Array.from(dataTransfer.files || []);
+  const arquivos = [];
+  const lerArquivo = (entry) => new Promise((res, rej) => entry.file(res, rej));
+  const lerDiretorio = (dirEntry) => new Promise((res, rej) => {
+    const reader = dirEntry.createReader();
+    const todos = [];
+    const lote = () => reader.readEntries(batch => {
+      if (batch.length === 0) res(todos);
+      else { todos.push(...batch); lote(); } // readEntries devolve no máx. ~100 por vez
+    }, rej);
+    lote();
+  });
+  async function percorrer(entry, caminho) {
+    if (entry.isFile) {
+      if (!/\.(xml|zip)$/i.test(entry.name)) return;
+      const f = await lerArquivo(entry);
+      if (caminho) { try { Object.defineProperty(f, '_caminho', { value: caminho + entry.name }); } catch (e) {} }
+      arquivos.push(f);
+    } else if (entry.isDirectory) {
+      const filhos = await lerDiretorio(entry);
+      for (const filho of filhos) await percorrer(filho, (caminho || '') + entry.name + '/');
+    }
+  }
+  for (const e of entries) await percorrer(e, '');
+  return arquivos;
 }
 
 // ---------------------------------------------------------------------
@@ -785,24 +872,9 @@ function parseNFeXml(xmlString, fileName) {
   };
 }
 
-async function readNFesFromZip(file, onProgress) {
-  const zip = await JSZip.loadAsync(file);
-  const entries = Object.values(zip.files).filter(f => !f.dir && /\.xml$/i.test(f.name));
-  const nfes = [];
-  const falhas = [];
-  let done = 0;
-  for (const entry of entries) {
-    try {
-      const text = await entry.async('text');
-      const nfe = parseNFeXml(text, entry.name.split('/').pop());
-      if (nfe) nfes.push(nfe); else falhas.push(entry.name);
-    } catch (e) {
-      falhas.push(entry.name);
-    }
-    done++;
-    if (onProgress) onProgress(done, entries.length);
-  }
-  return { nfes, falhas };
+async function readNFesFromZip(entrada, onProgress) {
+  const r = await lerXmlsGenerico(entrada, parseNFeXml, onProgress);
+  return { nfes: r.itens, falhas: r.falhas, duplicadosNoLote: r.duplicadosNoLote, totalArquivos: r.totalArquivos };
 }
 
 // Cruza os resultados já validados com as notas fiscais importadas, pela CHAVE da NF-e
@@ -1664,23 +1736,33 @@ function renderValidar() {
   const el = $('#validarContent');
   el.innerHTML = `
     <h1 class="text-2xl font-bold text-ink-900">Validar Fretes</h1>
-    <p class="text-sm text-ink-400 mt-0.5 mb-6">Envie o .zip com os XMLs dos CT-es recebidos na fatura do parceiro.</p>
+    <p class="text-sm text-ink-400 mt-0.5 mb-6">Envie os XMLs dos CT-es recebidos na fatura do parceiro — pode ser o .zip, os XMLs soltos ou a pasta inteira.</p>
 
     <div class="grid grid-cols-2 gap-4">
       <div>
         <div id="uploadZone" class="bg-white rounded-2xl shadow-panel border-2 border-dashed border-ink-200 p-8 text-center cursor-pointer hover:border-brand-400 hover:bg-brand-50/30 transition-colors h-full">
-          <input type="file" id="fileZip" accept=".zip" class="hidden">
+          <input type="file" id="fileZip" accept=".zip,.xml" multiple class="hidden">
+          <input type="file" id="folderCte" webkitdirectory directory multiple class="hidden">
           <svg class="w-9 h-9 mx-auto text-ink-300 mb-2" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M12 12v9m0-9l-3 3m3-3l3 3"/></svg>
           <div class="text-sm font-medium text-ink-700">CT-es (fatura do parceiro)</div>
-          <div class="text-xs text-ink-400 mt-1">Clique ou arraste o .zip aqui</div>
+          <div class="text-xs text-ink-400 mt-1">Arraste aqui o .zip, os XMLs ou a pasta inteira (subpastas também são lidas)</div>
+          <div class="flex items-center justify-center gap-2 mt-4">
+            <button type="button" data-acao="arquivos" data-alvo="cte" class="btn-upload px-3 py-1.5 rounded-lg border border-ink-200 bg-white text-xs font-medium text-ink-700 hover:border-brand-400 hover:text-brand-700">Selecionar arquivos (.zip ou .xml)</button>
+            <button type="button" data-acao="pasta" data-alvo="cte" class="btn-upload px-3 py-1.5 rounded-lg border border-ink-200 bg-white text-xs font-medium text-ink-700 hover:border-brand-400 hover:text-brand-700">Selecionar pasta</button>
+          </div>
         </div>
       </div>
       <div>
         <div id="uploadZoneNFe" class="bg-white rounded-2xl shadow-panel border-2 border-dashed border-ink-200 p-8 text-center cursor-pointer hover:border-purple-400 hover:bg-purple-50/30 transition-colors h-full">
-          <input type="file" id="fileZipNFe" accept=".zip" class="hidden">
+          <input type="file" id="fileZipNFe" accept=".zip,.xml" multiple class="hidden">
+          <input type="file" id="folderNFe" webkitdirectory directory multiple class="hidden">
           <svg class="w-9 h-9 mx-auto text-ink-300 mb-2" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
           <div class="text-sm font-medium text-ink-700">Notas Fiscais (frete do cliente)</div>
-          <div class="text-xs text-ink-400 mt-1">Clique ou arraste o .zip aqui — pode subir a qualquer momento, mesmo antes de validar CT-es. Fica salvo e casa sozinho depois.</div>
+          <div class="text-xs text-ink-400 mt-1">Arraste aqui o .zip, os XMLs ou a pasta inteira — pode subir a qualquer momento, mesmo antes de validar CT-es. Fica salvo e casa sozinho depois.</div>
+          <div class="flex items-center justify-center gap-2 mt-4">
+            <button type="button" data-acao="arquivos" data-alvo="nfe" class="btn-upload px-3 py-1.5 rounded-lg border border-ink-200 bg-white text-xs font-medium text-ink-700 hover:border-purple-400 hover:text-purple-700">Selecionar arquivos (.zip ou .xml)</button>
+            <button type="button" data-acao="pasta" data-alvo="nfe" class="btn-upload px-3 py-1.5 rounded-lg border border-ink-200 bg-white text-xs font-medium text-ink-700 hover:border-purple-400 hover:text-purple-700">Selecionar pasta</button>
+          </div>
         </div>
       </div>
     </div>
@@ -1697,23 +1779,32 @@ function renderValidar() {
     <div id="resultadosBox" class="mt-6"></div>
   `;
 
-  const zone = $('#uploadZone');
-  const input = $('#fileZip');
-  zone.addEventListener('click', () => input.click());
-  ;['dragover','dragleave','drop'].forEach(evt => zone.addEventListener(evt, (e) => e.preventDefault()));
-  zone.addEventListener('dragover', () => zone.classList.add('border-brand-400','bg-brand-50/30'));
-  zone.addEventListener('dragleave', () => zone.classList.remove('border-brand-400','bg-brand-50/30'));
-  zone.addEventListener('drop', (e) => { const f = e.dataTransfer.files[0]; if (f) processarZip(f); });
-  input.addEventListener('change', (e) => { const f = e.target.files[0]; if (f) processarZip(f); });
+  // Uma zona de upload = clique abre o seletor de arquivos; os dois botões escolhem entre
+  // arquivos (.zip/.xml, vários de uma vez) ou pasta inteira; arrastar aceita tudo junto.
+  function ligarZonaUpload(zone, inputArquivos, inputPasta, corClasses, processar) {
+    zone.addEventListener('click', (e) => { if (!e.target.closest('.btn-upload')) inputArquivos.click(); });
+    zone.querySelectorAll('.btn-upload').forEach(b => b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      (b.dataset.acao === 'pasta' ? inputPasta : inputArquivos).click();
+    }));
+    ;['dragover','dragleave','drop'].forEach(evt => zone.addEventListener(evt, (e) => e.preventDefault()));
+    zone.addEventListener('dragover', () => zone.classList.add(...corClasses));
+    zone.addEventListener('dragleave', () => zone.classList.remove(...corClasses));
+    zone.addEventListener('drop', async (e) => {
+      zone.classList.remove(...corClasses);
+      const arquivos = await arquivosDoDrop(e.dataTransfer);
+      if (arquivos.length) processar(arquivos);
+      else toast('Nenhum .xml ou .zip encontrado no que foi solto.', 'warn');
+    });
+    [inputArquivos, inputPasta].forEach(inp => inp.addEventListener('change', (e) => {
+      const arquivos = Array.from(e.target.files || []);
+      e.target.value = ''; // permite escolher a mesma pasta/arquivo de novo
+      if (arquivos.length) processar(arquivos);
+    }));
+  }
 
-  const zoneNFe = $('#uploadZoneNFe');
-  const inputNFe = $('#fileZipNFe');
-  zoneNFe.addEventListener('click', () => inputNFe.click());
-  ;['dragover','dragleave','drop'].forEach(evt => zoneNFe.addEventListener(evt, (e) => e.preventDefault()));
-  zoneNFe.addEventListener('dragover', () => zoneNFe.classList.add('border-purple-400','bg-purple-50/30'));
-  zoneNFe.addEventListener('dragleave', () => zoneNFe.classList.remove('border-purple-400','bg-purple-50/30'));
-  zoneNFe.addEventListener('drop', (e) => { const f = e.dataTransfer.files[0]; if (f) processarNotasFiscais(f, 'progressNFeBoxInicial'); });
-  inputNFe.addEventListener('change', (e) => { const f = e.target.files[0]; if (f) processarNotasFiscais(f, 'progressNFeBoxInicial'); });
+  ligarZonaUpload($('#uploadZone'), $('#fileZip'), $('#folderCte'), ['border-brand-400','bg-brand-50/30'], (arqs) => processarZip(arqs));
+  ligarZonaUpload($('#uploadZoneNFe'), $('#fileZipNFe'), $('#folderNFe'), ['border-purple-400','bg-purple-50/30'], (arqs) => processarNotasFiscais(arqs, 'progressNFeBoxInicial'));
 }
 
 // Guarda só o necessário pra reabrir a tela de comparação depois (sem duplicar a
@@ -1760,17 +1851,18 @@ function trimForaFluxoParaHistorico(x) {
   };
 }
 
-async function processarZip(file) {
+async function processarZip(entrada) {
+  const nomeLote = nomeDoLote(entrada);
   if (STATE.parceiros.length === 0) {
     toast('Cadastre pelo menos um parceiro antes de validar.', 'warn');
     return;
   }
   $('#progressBox').classList.remove('hidden');
   $('#resultadosBox').innerHTML = '';
-  $('#progressLabel').textContent = 'Lendo XMLs do .zip…';
+  $('#progressLabel').textContent = 'Lendo XMLs…';
 
   try {
-    const { ctes: todosCtes, falhas } = await readCtesFromZip(file, (done, total) => {
+    const { ctes: todosCtes, falhas, totalArquivos } = await readCtesFromZip(entrada, (done, total) => {
       const pct = Math.round((done/total)*100);
       $('#progressBar').style.width = pct + '%';
       $('#progressPct').textContent = pct + '%';
@@ -1778,7 +1870,7 @@ async function processarZip(file) {
     });
 
     if (falhas.length) toast(`${falhas.length} arquivo(s) não puderam ser lidos como CT-e.`, 'warn');
-    if (todosCtes.length === 0) { toast('Nenhum CT-e válido encontrado no .zip.', 'error'); $('#progressBox').classList.add('hidden'); return; }
+    if (todosCtes.length === 0) { toast(totalArquivos === 0 ? 'Nenhum arquivo .xml encontrado (nem solto, nem dentro de .zip).' : 'Nenhum CT-e válido encontrado nos arquivos enviados.', 'error'); $('#progressBox').classList.add('hidden'); return; }
 
     // bloqueia CT-es cuja chave de acesso já foi importada antes — mantém só o primeiro
     // registro, não deixa duplicar mesmo que o mesmo .zip (ou lotes sobrepostos) seja
@@ -1816,7 +1908,7 @@ async function processarZip(file) {
     }
     $('#progressBox').classList.add('hidden');
 
-    STATE.ultimaValidacao = { nomeArquivo: file.name, resultados, semParceiro, outrosFluxos, reentregas, duplicadosIgnorados: ctesDuplicados.length };
+    STATE.ultimaValidacao = { nomeArquivo: nomeLote, resultados, semParceiro, outrosFluxos, reentregas, duplicadosIgnorados: ctesDuplicados.length };
     renderResultadosValidacao();
     if (resumoMatchAutomatico && resumoMatchAutomatico.casados > 0) {
       toast(`${resumoMatchAutomatico.casados} CT-e(s) já casado(s) automaticamente com notas fiscais salvas anteriormente.`, 'success');
@@ -1830,7 +1922,7 @@ async function processarZip(file) {
       ...semParceiro.filter(c => c.chave).map(c => ({ chave: c.chave, nCT: c.nCT, dhEmi: c.dhEmi, emitNome: c.emitNome, emitCNPJ: c.emitCNPJ, destMun: c.destMun, destUF: c.destUF, vTPrest: c.vTPrest, categoria: 'sem_parceiro' })),
       ...outrosFluxos.filter(x => x.cte.chave).map(x => ({ chave: x.cte.chave, nCT: x.cte.nCT, dhEmi: x.cte.dhEmi, parceiroNome: x.parceiro.nome, xMunIni: x.cte.xMunIni, UFIni: x.cte.UFIni, xMunFim: x.cte.xMunFim, UFFim: x.cte.UFFim, vTPrest: x.cte.vTPrest, categoria: 'trajeto_atipico' })),
       ...reentregas.filter(x => x.cte.chave).map(x => ({ chave: x.cte.chave, nCT: x.cte.nCT, dhEmi: x.cte.dhEmi, parceiroNome: x.parceiro.nome, destMun: x.cte.destMun, destUF: x.cte.destUF, vTPrest: x.cte.vTPrest, categoria: 'reentrega' })),
-    ].map(o => ({ ...o, arquivoOrigem: file.name, importadoEm: agora }));
+    ].map(o => ({ ...o, arquivoOrigem: nomeLote, importadoEm: agora }));
     await DataLayer.salvarCtesEmLote(paraSalvarGlobal).catch(e => console.error('[CT-e global] falha ao salvar:', e));
 
     // salva resumo no histórico
@@ -1865,15 +1957,15 @@ async function processarZip(file) {
     const semParceiroTrim = semParceiro.map(trimSemParceiroParaHistorico);
     const outrosFluxosTrim = outrosFluxos.map(trimForaFluxoParaHistorico);
     const reentregasTrim = reentregas.map(trimForaFluxoParaHistorico);
-    let registro = { nomeArquivo: file.name, resumo, resultados: resultadosTrim, semParceiro: semParceiroTrim, outrosFluxos: outrosFluxosTrim, reentregas: reentregasTrim, detalheDisponivel: true };
+    let registro = { nomeArquivo: nomeLote, resumo, resultados: resultadosTrim, semParceiro: semParceiroTrim, outrosFluxos: outrosFluxosTrim, reentregas: reentregasTrim, detalheDisponivel: true };
     if (!OFFLINE_MODE && JSON.stringify(registro).length > 900000) {
-      registro = { nomeArquivo: file.name, resumo, detalheDisponivel: false };
+      registro = { nomeArquivo: nomeLote, resumo, detalheDisponivel: false };
       toast('Lote salvo no histórico, mas ficou grande demais pra guardar o detalhe linha a linha — exporte o Excel se precisar revisitar.', 'warn');
     }
     const salvo = await DataLayer.saveValidacao(registro).catch(async (e) => {
       console.error(e);
       // se falhar por tamanho, tenta de novo só com o resumo
-      return DataLayer.saveValidacao({ nomeArquivo: file.name, resumo, detalheDisponivel: false }).catch(e2 => console.error(e2));
+      return DataLayer.saveValidacao({ nomeArquivo: nomeLote, resumo, detalheDisponivel: false }).catch(e2 => console.error(e2));
     });
     // guarda o id desse lote — se importar NF-e depois, atualiza o resumo financeiro
     // desse mesmo registro no histórico em vez de deixar desatualizado
@@ -1881,22 +1973,23 @@ async function processarZip(file) {
   } catch (e) {
     console.error(e);
     $('#progressBox').classList.add('hidden');
-    toast('Erro ao processar o arquivo. Confira se é um .zip válido de CT-es.', 'error');
+    toast('Erro ao processar os arquivos. Confira se são XMLs (ou .zip) válidos de CT-e.', 'error');
   }
 }
 
-async function processarNotasFiscais(file, progressBoxId = 'progressNFeBox') {
+async function processarNotasFiscais(entrada, progressBoxId = 'progressNFeBox') {
+  const nomeLote = nomeDoLote(entrada);
   const temValidacaoAtiva = STATE.ultimaValidacao && STATE.ultimaValidacao.resultados?.length > 0;
   const progressBox = $('#' + progressBoxId);
   progressBox.classList.remove('hidden');
   progressBox.textContent = 'Lendo XMLs de NF-e…';
 
   try {
-    const { nfes, falhas } = await readNFesFromZip(file, (done, total) => {
+    const { nfes, falhas, totalArquivos } = await readNFesFromZip(entrada, (done, total) => {
       progressBox.textContent = `Lendo XMLs de NF-e… ${done}/${total}`;
     });
     if (falhas.length) toast(`${falhas.length} arquivo(s) não puderam ser lidos como NF-e.`, 'warn');
-    if (nfes.length === 0) { toast('Nenhuma NF-e válida encontrada no .zip.', 'error'); progressBox.classList.add('hidden'); return; }
+    if (nfes.length === 0) { toast(totalArquivos === 0 ? 'Nenhum arquivo .xml encontrado (nem solto, nem dentro de .zip).' : 'Nenhuma NF-e válida encontrada nos arquivos enviados.', 'error'); progressBox.classList.add('hidden'); return; }
 
     // usa TODAS as NF-es lidas pra casar com os CT-es dessa sessão, se tiver alguma
     // validação carregada agora (mesmo as já vistas antes — isso é só leitura); só a
@@ -1909,7 +2002,7 @@ async function processarNotasFiscais(file, progressBoxId = 'progressNFeBox') {
     const nfesNovas = nfes.filter(n => n.chave && !chavesExistentesNfe.has(n.chave));
     const nfesDuplicadas = nfes.length - nfesNovas.length;
     const agoraNfe = new Date().toISOString();
-    await DataLayer.salvarNfesEmLote(nfesNovas.map(n => ({ ...n, arquivoOrigem: file.name, importadoEm: agoraNfe }))).catch(e => console.error('[NF-e global] falha ao salvar:', e));
+    await DataLayer.salvarNfesEmLote(nfesNovas.map(n => ({ ...n, arquivoOrigem: nomeLote, importadoEm: agoraNfe }))).catch(e => console.error('[NF-e global] falha ao salvar:', e));
 
     let resumoCubagem = null;
     if (temValidacaoAtiva) {
@@ -1945,7 +2038,7 @@ async function processarNotasFiscais(file, progressBoxId = 'progressNFeBox') {
   } catch (e) {
     console.error(e);
     progressBox.classList.add('hidden');
-    toast('Erro ao processar o arquivo de notas fiscais. Confira se é um .zip válido de NF-e.', 'error');
+    toast('Erro ao processar as notas fiscais. Confira se são XMLs (ou .zip) válidos de NF-e.', 'error');
   }
 }
 
@@ -2009,7 +2102,9 @@ function renderResultadosValidacao() {
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
           ${nfeImportada ? 'Reimportar Notas Fiscais' : 'Importar Notas Fiscais'}
         </button>
-        <input type="file" id="fileNFe" accept=".zip" class="hidden">
+        <input type="file" id="fileNFe" accept=".zip,.xml" multiple class="hidden">
+        <input type="file" id="folderNFeRes" webkitdirectory directory multiple class="hidden">
+        <button id="btnImportarNFePasta" class="text-sm font-medium text-ink-600 hover:text-ink-800">(pasta)</button>
         <button id="btnExportar" class="text-sm font-medium text-brand-600 hover:text-brand-700 flex items-center gap-1.5">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H8a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
           Exportar Excel
@@ -2055,14 +2150,16 @@ function renderResultadosValidacao() {
 
   $('#btnExportar').addEventListener('click', () => {
     const blob = exportResultadosParaXlsx(resultados, semParceiro, STATE.parceiros, outrosFluxos, reentregas);
-    downloadBlob(blob, `Validacao_Fretes_${nomeArquivo.replace(/\.zip$/i,'')}.xlsx`);
+    downloadBlob(blob, `Validacao_Fretes_${String(nomeArquivo).replace(/\.zip$/i,'').replace(/[\\/:*?"<>|]+/g,'_')}.xlsx`);
   });
 
   $('#btnImportarNFe').addEventListener('click', () => $('#fileNFe').click());
-  $('#fileNFe').addEventListener('change', (e) => {
-    const f = e.target.files[0];
-    if (f) processarNotasFiscais(f);
-  });
+  $('#btnImportarNFePasta').addEventListener('click', () => $('#folderNFeRes').click());
+  ['#fileNFe', '#folderNFeRes'].forEach(sel => $(sel).addEventListener('change', (e) => {
+    const arquivos = Array.from(e.target.files || []);
+    e.target.value = '';
+    if (arquivos.length) processarNotasFiscais(arquivos);
+  }));
 
   $$('.filtro-card').forEach(c => c.addEventListener('click', () => {
     STATE._filtroAtual = c.dataset.filtro;
