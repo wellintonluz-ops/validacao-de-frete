@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-09-29-planilha-canal-filtros';
+const APP_VERSION = '2026-09-29-analise-sem-erro-cota';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -330,6 +330,23 @@ function dividirDetalheEmPartes(registro, limite = 700000) {
   });
   partes.push(atual);
   return partes;
+}
+
+// Quando a cota do Firebase estoura (plano gratuito: ~20 mil gravações e ~50 mil leituras
+// por dia), o SDK não devolve erro na hora — fica tentando de novo em segundo plano e a
+// tela parece "travada". Isso limita a espera e traduz o erro pra algo acionável.
+function comTimeout(promessa, ms, rotulo) {
+  return Promise.race([
+    promessa,
+    new Promise((_, rej) => setTimeout(() => { const e = new Error(`Tempo esgotado ao ${rotulo || 'gravar no banco'}`); e.code = 'timeout'; rej(e); }, ms)),
+  ]);
+}
+function mensagemErroFirebase(e, acao) {
+  const code = (e && (e.code || '')) + ' ' + (e && e.message || '');
+  if (/resource-exhausted|quota/i.test(code)) return `Não foi possível ${acao}: o Firebase atingiu o limite diário do plano gratuito. O limite zera por volta das 4h (horário de Brasília) — ou ative o plano Blaze no console do Firebase.`;
+  if (/timeout/i.test(code)) return `Não foi possível ${acao}: o banco não respondeu. Provavelmente o limite diário do Firebase foi atingido (veja o console F12) ou a internet caiu.`;
+  if (/permission/i.test(code)) return `Não foi possível ${acao}: sem permissão no banco (confira se está logado com um e-mail autorizado).`;
+  return `Não foi possível ${acao}. Detalhe no console (F12).`;
 }
 
 const DataLayer = {
@@ -479,7 +496,7 @@ const DataLayer = {
       localDB_write(data);
       return revisao;
     }
-    await db.collection('revisoes').doc(revisao.chave).set(limparParaFirestore(revisao), { merge: true });
+    await comTimeout(db.collection('revisoes').doc(revisao.chave).set(limparParaFirestore(revisao), { merge: true }), 20000, 'salvar a análise');
     return revisao;
   },
 
@@ -503,6 +520,24 @@ const DataLayer = {
   // ----- CT-es e NF-es importados globalmente (persistem entre lotes/sessões) -----
   // Guardados por CHAVE de acesso (44 dígitos) — é o identificador único oficial da SEFAZ,
   // então serve tanto pra persistir os dados quanto pra bloquear reimportação duplicada.
+  // Confere só as chaves do lote atual (em blocos de 30), em vez de ler a coleção inteira
+  // de CT-es a cada upload — com milhares de CT-es salvos, ler tudo estourava a cota diária.
+  async chavesExistentes(colecao, chaves) {
+    const unicas = Array.from(new Set((chaves || []).filter(Boolean)));
+    const existentes = new Set();
+    if (!unicas.length) return existentes;
+    if (OFFLINE_MODE) {
+      const data = localDB_read();
+      const mapa = colecao === 'ctes' ? (data.ctes || {}) : (data.notasFiscaisSalvas || {});
+      unicas.forEach(c => { if (mapa[c]) existentes.add(c); });
+      return existentes;
+    }
+    for (let i = 0; i < unicas.length; i += 30) {
+      const snap = await db.collection(colecao).where(firebase.firestore.FieldPath.documentId(), 'in', unicas.slice(i, i + 30)).get();
+      snap.docs.forEach(d => existentes.add(d.id));
+    }
+    return existentes;
+  },
   async listChavesCtes() {
     if (OFFLINE_MODE) return new Set(Object.keys(localDB_read().ctes || {}));
     const snap = await db.collection('ctes').get();
@@ -2198,16 +2233,16 @@ function montarRegistroHistorico(nomeLote, v) {
   const { resultados, semParceiro = [], outrosFluxos = [], reentregas = [], duplicadosIgnorados = 0 } = v;
   const tol = 0.05;
   // devolução/reentrega ficam só na aba própria delas — não contam aqui, pra não duplicar
-  const maior = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia > tol);
-  const menor = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia < -tol);
+  const maior = resultados.filter(r => r.tipoOperacao !== 'devolucao' && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) > tol);
+  const menor = resultados.filter(r => r.tipoOperacao !== 'devolucao' && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) < -tol);
   const devolucoesResultados = resultados.filter(r => r.tipoOperacao === 'devolucao');
   const resumoFin = calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFluxos);
   const resumo = {
     total: resultados.length + semParceiro.length + outrosFluxos.length + reentregas.length,
     qtdDivergenciaMaior: maior.length,
     qtdDivergenciaMenor: menor.length,
-    valorDivergenteMaior: clamp2(maior.reduce((a,r) => a + r.divergencia, 0)),
-    valorDivergenteMenor: clamp2(menor.reduce((a,r) => a + r.divergencia, 0)),
+    valorDivergenteMaior: clamp2(maior.reduce((a,r) => a + divergenciaEfetiva(r), 0)),
+    valorDivergenteMenor: clamp2(menor.reduce((a,r) => a + divergenciaEfetiva(r), 0)),
     parceiros: Array.from(new Set(resultados.map(r => r.parceiro.nome))),
     semParceiro: semParceiro.length,
     devolucoes: devolucoesResultados.length,
@@ -2276,8 +2311,8 @@ async function recalcularLoteAtual() {
       const salvo = await DataLayer.saveValidacao(registro).catch(e => { console.error(e); return null; });
       v.historicoId = salvo?.id || null;
     }
-    const atualizacoesCtes = v.resultados.filter(r => r.cte.chave).map(r => ({ chave: r.cte.chave, ...trimResultadoParaHistorico(r), recalculadoEm: new Date().toISOString() }));
-    await DataLayer.atualizarCtesEmLote(atualizacoesCtes).catch(e => console.error('[CT-e global] falha ao atualizar:', e));
+    // (os CT-es em 'ctes' servem só pro bloqueio de duplicados — não precisam ser regravados
+    //  a cada recálculo; o detalhe atualizado fica no Histórico. Economiza centenas de gravações.)
 
     toast(`${recalculados} CT-e(s) recalculado(s) com o cadastro atual${semCadastro ? ` · ${semCadastro} sem parceiro cadastrado (mantidos como estavam)` : ''}.`, 'success');
   } catch (e) {
@@ -2314,7 +2349,7 @@ async function processarZip(entrada) {
     // registro, não deixa duplicar mesmo que o mesmo .zip (ou lotes sobrepostos) seja
     // subido de novo por engano
     $('#progressLabel').textContent = 'Conferindo CT-es já importados antes…';
-    const chavesExistentes = await DataLayer.listChavesCtes().catch(() => new Set());
+    const chavesExistentes = await DataLayer.chavesExistentes('ctes', todosCtes.map(c => c.chave)).catch(e => { console.error(e); return new Set(); });
     const ctesDuplicados = todosCtes.filter(c => c.chave && chavesExistentes.has(c.chave));
     const ctes = todosCtes.filter(c => !c.chave || !chavesExistentes.has(c.chave));
 
@@ -2413,7 +2448,7 @@ async function processarNotasFiscais(entrada, progressBoxId = 'progressNFeBox') 
     if (temValidacaoAtiva) await aplicarPlanilhaAoLote(STATE.ultimaValidacao).catch(e => console.error(e));
 
     progressBox.textContent = 'Guardando notas fiscais novas…';
-    const chavesExistentesNfe = await DataLayer.listChavesNfes().catch(() => new Set());
+    const chavesExistentesNfe = await DataLayer.chavesExistentes('notasFiscais', nfes.map(n => n.chave)).catch(e => { console.error(e); return new Set(); });
     const nfesNovas = nfes.filter(n => n.chave && !chavesExistentesNfe.has(n.chave));
     const nfesDuplicadas = nfes.length - nfesNovas.length;
     const agoraNfe = new Date().toISOString();
@@ -2538,6 +2573,15 @@ function renderResumoFinanceiro(r) {
     </div>`;
 }
 
+// CT-e analisado como "Sem erro": a diferença (e a margem do cliente) contam como ZERO nos
+// cards e na tabela — a diferença original continua no detalhe/tooltip só como referência.
+function analisadoSemErro(r) {
+  const rev = r && r.cte && STATE.revisoes ? STATE.revisoes[r.cte.chave] : null;
+  return !!(rev && rev.classificacao === 'sem_erro');
+}
+function divergenciaEfetiva(r) { return analisadoSemErro(r) && r.divergencia !== null && r.divergencia !== undefined ? 0 : r.divergencia; }
+function margemClienteEfetiva(r) { return analisadoSemErro(r) && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined ? 0 : r.divergenciaCliente; }
+
 // ----- Filtros da tela de resultados (canal, parceiro, UF, busca livre) -----
 function normBusca(s) { return (s ?? '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase(); }
 function passaFiltrosResultado(x, f, ehSemParceiro) {
@@ -2608,13 +2652,13 @@ function renderResultadosValidacao() {
   // devolução/reversa tem aba própria (prejuízo total) — não conta em nenhuma outra, pra
   // não aparecer duplicada em "cobrado a maior/menor" etc. (reentrega já nem entra em
   // "resultados", então nunca aparecia nessas abas mesmo)
-  const maior = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia > tol);
-  const menor = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && r.divergencia < -tol);
+  const maior = resultados.filter(r => r.tipoOperacao !== 'devolucao' && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) > tol);
+  const menor = resultados.filter(r => r.tipoOperacao !== 'devolucao' && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) < -tol);
   const revisao = resultados.filter(r => r.tipoOperacao !== 'devolucao' && (r.calc.status === 'REVISAO_MANUAL' || r.calc.status === 'SEM_TARIFA' || r.calc.status === 'SEM_ABRANGENCIA'));
-  const ok = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergencia !== null && Math.abs(r.divergencia) <= tol && r.calc.status === 'OK');
+  const ok = resultados.filter(r => r.tipoOperacao !== 'devolucao' && divergenciaEfetiva(r) !== null && Math.abs(divergenciaEfetiva(r)) <= tol && (r.calc.status === 'OK' || analisadoSemErro(r)));
   const devolucoes = resultados.filter(r => r.tipoOperacao === 'devolucao');
   const nfeImportada = resultados.some(r => r.valorFreteCliente !== undefined);
-  const margemNegativa = resultados.filter(r => r.tipoOperacao !== 'devolucao' && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined && r.divergenciaCliente < -tol);
+  const margemNegativa = resultados.filter(r => r.tipoOperacao !== 'devolucao' && margemClienteEfetiva(r) !== null && margemClienteEfetiva(r) !== undefined && margemClienteEfetiva(r) < -tol);
   const comNfe = resultados.filter(r => r.valorFreteCliente !== null && r.valorFreteCliente !== undefined);
   const resumoFin = calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFluxos);
 
@@ -2650,15 +2694,15 @@ function renderResultadosValidacao() {
 
     <div class="grid grid-cols-5 gap-3 mb-3">
       ${filtroCard('todos', 'Todos os CT-es', qtdFiltrada, fmtBRL(cobradoFiltrado) + ' cobrado', 'ink')}
-      ${filtroCard('maior', 'Cobrado a maior', maior.length, fmtBRL(maior.reduce((a,r)=>a+r.divergencia,0)), 'red')}
-      ${filtroCard('menor', 'Cobrado a menor', menor.length, fmtBRL(menor.reduce((a,r)=>a+r.divergencia,0)), 'amber')}
-      ${filtroCard('ok', 'Conferem com a tabela', ok.length, '', 'emerald')}
+      ${filtroCard('maior', 'Cobrado a maior', maior.length, fmtBRL(maior.reduce((a,r)=>a+divergenciaEfetiva(r),0)), 'red')}
+      ${filtroCard('menor', 'Cobrado a menor', menor.length, fmtBRL(menor.reduce((a,r)=>a+divergenciaEfetiva(r),0)), 'amber')}
+      ${filtroCard('ok', 'Conferem / analisados sem erro', ok.length, (() => { const q = resultados.filter(analisadoSemErro).length; return q ? `${q} analisado(s) sem erro` : ''; })(), 'emerald')}
       ${filtroCard('revisao', 'Revisão manual / sem cobertura', revisao.length, '', 'ink')}
     </div>
     <div class="grid ${nfeImportada ? 'grid-cols-3' : 'grid-cols-2'} gap-3 mb-5">
       ${filtroCard('devolucao', 'Devolução (prejuízo total)', devolucoes.length, fmtBRL(devolucoes.reduce((a,r)=>a+(r.cobrado||0),0)), 'brand')}
       ${filtroCard('reentrega', 'Reentrega (prejuízo total)', reentregas.length, fmtBRL(reentregas.reduce((a,x)=>a+(x.cte.vTPrest||0),0)), 'purple')}
-      ${nfeImportada ? filtroCard('margem_negativa', 'Cliente pagou menos que o frete', margemNegativa.length, fmtBRL(margemNegativa.reduce((a,r)=>a+r.divergenciaCliente,0)), 'red') : ''}
+      ${nfeImportada ? filtroCard('margem_negativa', 'Cliente pagou menos que o frete', margemNegativa.length, fmtBRL(margemNegativa.reduce((a,r)=>a+margemClienteEfetiva(r),0)), 'red') : ''}
     </div>
 
     <div id="tabelaResultados"></div>
@@ -2806,7 +2850,9 @@ function badgeAnalise(r) {
   if (!revisao || !revisao.classificacao) return '';
   const info = LABEL_CLASSIFICACAO[revisao.classificacao];
   if (!info) return '';
-  return ` <span title="Analisado: ${escapeHtml(info.label)}" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border ${info.cls}">${info.label}</span>`;
+  const quando = revisao.atualizadoEm ? ` em ${fmtDate(revisao.atualizadoEm)}` : '';
+  const extra = revisao.classificacao === 'sem_erro' && revisao.diferencaApurada ? ` — diferença original ${fmtBRL(revisao.diferencaApurada)} considerada R$ 0,00` : '';
+  return ` <span title="Analisado${quando} por ${escapeHtml(revisao.atualizadoPor || '—')}: ${escapeHtml(info.label)}${extra}" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border ${info.cls}">✓ ${info.label}</span>`;
 }
 
 function statusBadge(status) {
@@ -2871,11 +2917,13 @@ function renderTabelaResultados(lista, filtro) {
                 ? `<td class="px-4 py-3 text-right num font-semibold text-brand-700" title="Devolução — prejuízo total (valor cobrado)">${fmtBRL(r.cobrado)}</td>`
                 : r.divergencia === null || r.divergencia === undefined
                   ? `<td class="px-4 py-3 text-right num text-ink-300">—</td>`
-                  : `<td class="px-4 py-3 text-right num font-semibold ${Math.abs(r.divergencia) <= 0.05 ? 'text-emerald-600' : r.divergencia>0?'text-red-600':'text-amber-700'}">${r.divergencia>0.05?'+':''}${fmtBRL(r.divergencia)}</td>`
+                  : analisadoSemErro(r) && Math.abs(r.divergencia) > 0.05
+                    ? `<td class="px-4 py-3 text-right num font-semibold text-emerald-600" title="Analisado como Sem erro — diferença original ${fmtBRL(r.divergencia)} considerada R$ 0,00">${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(r.divergencia)}</span></td>`
+                    : `<td class="px-4 py-3 text-right num font-semibold ${Math.abs(r.divergencia) <= 0.05 ? 'text-emerald-600' : r.divergencia>0?'text-red-600':'text-amber-700'}">${r.divergencia>0.05?'+':''}${fmtBRL(r.divergencia)}</td>`
               ) : ''}
               ${mostrarMargem ? `
                 <td class="px-4 py-3 text-right num text-ink-700">${r.valorFreteCliente != null ? fmtBRL(r.valorFreteCliente) : '<span class="text-ink-300">sem NF-e</span>'}</td>
-                <td class="px-4 py-3 text-right num font-semibold ${r.divergenciaCliente == null ? 'text-ink-300' : r.divergenciaCliente < 0 ? 'text-red-600' : 'text-emerald-600'}">${r.divergenciaCliente != null ? (r.divergenciaCliente>0?'+':'') + fmtBRL(r.divergenciaCliente) : '—'}</td>
+                <td class="px-4 py-3 text-right num font-semibold ${r.divergenciaCliente == null ? 'text-ink-300' : margemClienteEfetiva(r) < 0 ? 'text-red-600' : 'text-emerald-600'}" ${analisadoSemErro(r) && r.divergenciaCliente ? `title="Analisado como Sem erro — margem original ${fmtBRL(r.divergenciaCliente)} considerada R$ 0,00"` : ''}>${r.divergenciaCliente != null ? (analisadoSemErro(r) && r.divergenciaCliente ? `${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(r.divergenciaCliente)}</span>` : (r.divergenciaCliente>0?'+':'') + fmtBRL(r.divergenciaCliente)) : '—'}</td>
               ` : ''}
               <td class="px-4 py-3">${statusBadge(r.calc.status)}${calcularReconciliacaoXml(r).temPendencia ? ' <span title="Existe cobrança no XML que nenhuma regra cadastrada reconhece" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border bg-red-50 text-red-700 border-red-200">$ não cadastrado</span>' : ''}${badgeAnalise(r)}</td>
               <td class="px-4 py-3 text-right">
@@ -3038,7 +3086,8 @@ function renderSecaoAnalise(idx, revisao, subtotalCobrado, subtotalCalculado, va
           </div>
           <p class="col-span-3 text-red-600/80 mt-1">Valores sobre o subtotal (sem ICMS) — vai pra aba Tratativas assim que você salvar.</p>
         </div>
-        <button onclick="salvarAnaliseAtual(${idx})" class="w-full bg-ink-900 hover:bg-ink-800 text-white text-sm font-medium py-2 rounded-lg">${revisao ? 'Atualizar análise' : 'Concluir análise'}</button>
+        <p id="avisoSemErro-${idx}" class="${classificacaoAtual === 'sem_erro' ? '' : 'hidden'} text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">Ao concluir como <strong>Sem erro</strong>, a diferença deste CT-e passa a contar como <strong>R$ 0,00</strong> (positiva ou negativa — já explicada por desconto, custo previsto etc.) e ele fica marcado como analisado.</p>
+        <button id="btnSalvarAnalise-${idx}" onclick="salvarAnaliseAtual(${idx})" class="w-full bg-ink-900 hover:bg-ink-800 text-white text-sm font-medium py-2 rounded-lg">${revisao ? 'Atualizar análise' : 'Concluir análise'}</button>
       </div>
     </div>`;
 }
@@ -3048,6 +3097,8 @@ function atualizarCamposTratativa(idx) {
   const box = $(`#camposTransportadora-${idx}`);
   if (!sel || !box) return;
   box.classList.toggle('hidden', sel.value !== 'transportadora');
+  const aviso = $(`#avisoSemErro-${idx}`);
+  if (aviso) aviso.classList.toggle('hidden', sel.value !== 'sem_erro');
 }
 
 // Monta um texto automático listando TODOS os componentes que divergem entre cobrado e
@@ -3107,8 +3158,11 @@ async function salvarAnaliseAtual(idx) {
   const icmsCobrado = reconciliacao.componenteImposto ? reconciliacao.componenteImposto.valor : r.cte.vICMS;
   const subtotalCobrado = (r.cobrado != null && icmsCobrado != null) ? clamp2(r.cobrado - icmsCobrado) : null;
   const subtotalCalculado = r.calc.subtotalCalculado ?? null;
-  const valorRessarcir = (subtotalCobrado != null && subtotalCalculado != null)
+  const diferencaApurada = (subtotalCobrado != null && subtotalCalculado != null)
     ? clamp2(subtotalCobrado - subtotalCalculado) : null;
+  // "Sem erro" = diferença já explicada (desconto, custo já considerado...) -> conta como ZERO,
+  // seja positiva ou negativa. A diferença original fica guardada só como referência.
+  const valorRessarcir = classificacao === 'sem_erro' ? 0 : diferencaApurada;
 
   const existente = STATE.revisoes[r.cte.chave];
   const statusAtual = existente?.statusTratativa || 'pendente';
@@ -3130,21 +3184,29 @@ async function salvarAnaliseAtual(idx) {
     valorCobradoSubtotal: subtotalCobrado,
     valorRealSubtotal: subtotalCalculado,
     valorRessarcir,
-    statusTratativa: statusAtual,
+    diferencaApurada,
+    margemClienteApurada: r.divergenciaCliente ?? null,
+    analisado: true,
+    statusTratativa: classificacao === 'sem_erro' ? 'resolvido' : statusAtual,
     datasStatus,
   };
+  if (classificacao === 'sem_erro' && !revisao.datasStatus.resolvido) revisao.datasStatus.resolvido = new Date().toISOString();
 
+  const btnSalvar = document.getElementById(`btnSalvarAnalise-${idx}`);
+  if (btnSalvar) { btnSalvar.disabled = true; btnSalvar.textContent = 'Salvando…'; btnSalvar.classList.add('opacity-60'); }
   try {
     await DataLayer.saveRevisao(revisao);
     STATE.revisoes[revisao.chave] = revisao;
     atualizarBadgeTratativas();
-    toast('Análise salva.', 'success');
+    toast(classificacao === 'sem_erro' ? 'Análise salva — marcado como analisado, diferença considerada R$ 0,00.' : 'Análise salva.', 'success');
+    if (STATE.ultimaValidacao) renderResultadosValidacao();
     const modalAberto = document.querySelector('.fixed.inset-0');
     if (modalAberto) modalAberto.remove();
     abrirDetalheCte(idx);
   } catch (e) {
     console.error(e);
-    toast('Não foi possível salvar a análise.', 'error');
+    toast(mensagemErroFirebase(e, 'salvar a análise'), 'error');
+    if (btnSalvar) { btnSalvar.disabled = false; btnSalvar.textContent = 'Concluir análise'; btnSalvar.classList.remove('opacity-60'); }
   }
 }
 
