@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-09-29-importar-pasta-xml';
+const APP_VERSION = '2026-09-29-fix-salvar-historico';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -303,6 +303,35 @@ function localDB_write(data) {
   localStorage.setItem(LOCAL_KEY, JSON.stringify(data));
 }
 
+// O Firestore recusa o documento INTEIRO se qualquer campo estiver `undefined` (ex:
+// valorFreteCliente de um CT-e que ainda não tem NF-e casada). Era isso que impedia de
+// gravar os CT-es e o detalhe do histórico. Remove os undefined antes de qualquer gravação.
+function limparParaFirestore(obj) {
+  return JSON.parse(JSON.stringify(obj, (k, v) => (typeof v === 'number' && !isFinite(v)) ? null : v));
+}
+
+// Divide o detalhe linha a linha do lote em partes de até ~700KB (limite do Firestore é
+// 1MB por documento), pra lotes grandes também poderem ser reabertos pelo Histórico.
+function dividirDetalheEmPartes(registro, limite = 700000) {
+  const partes = [];
+  let atual = { resultados: [], semParceiro: [], outrosFluxos: [], reentregas: [] };
+  let tamanho = 0;
+  ['resultados', 'semParceiro', 'outrosFluxos', 'reentregas'].forEach(campo => {
+    (registro[campo] || []).forEach(item => {
+      const t = JSON.stringify(item).length;
+      if (tamanho + t > limite && tamanho > 0) {
+        partes.push(atual);
+        atual = { resultados: [], semParceiro: [], outrosFluxos: [], reentregas: [] };
+        tamanho = 0;
+      }
+      atual[campo].push(item);
+      tamanho += t;
+    });
+  });
+  partes.push(atual);
+  return partes;
+}
+
 const DataLayer = {
   async listParceiros() {
     if (OFFLINE_MODE) return localDB_read().parceiros;
@@ -317,7 +346,8 @@ const DataLayer = {
       localDB_write(data);
       return parceiro;
     }
-    const { id, ...rest } = parceiro;
+    const { id, ...restBruto } = parceiro;
+    const rest = limparParaFirestore(restBruto);
     rest.atualizadoEm = new Date().toISOString();
     if (id && !id.startsWith('novo_')) {
       await db.collection('parceiros').doc(id).set(rest, { merge: false });
@@ -364,8 +394,30 @@ const DataLayer = {
       }
       return registro;
     }
-    const ref = await db.collection('validacoes').add(registro);
-    return { id: ref.id, ...registro };
+    const limpo = limparParaFirestore(registro);
+    const temDetalhe = Array.isArray(limpo.resultados);
+    if (!temDetalhe || JSON.stringify(limpo).length <= 900000) {
+      const ref = await db.collection('validacoes').add(limpo);
+      return { id: ref.id, ...limpo };
+    }
+    // lote grande: resumo no documento principal + detalhe em partes numa subcoleção
+    const partes = dividirDetalheEmPartes(limpo);
+    const { resultados, semParceiro, outrosFluxos, reentregas, ...principal } = limpo;
+    principal.detalheDisponivel = true;
+    principal.detalheEmPartes = partes.length;
+    const ref = await db.collection('validacoes').add(principal);
+    for (let i = 0; i < partes.length; i++) {
+      await ref.collection('partes').doc(String(i).padStart(3, '0')).set({ indice: i, ...partes[i] });
+    }
+    return { id: ref.id, ...principal };
+  },
+  async carregarDetalheHistorico(h) {
+    if (!h.detalheEmPartes || OFFLINE_MODE) return h;
+    const snap = await db.collection('validacoes').doc(h.id).collection('partes').get();
+    const docs = snap.docs.map(d => d.data()).sort((a, b) => a.indice - b.indice);
+    if (docs.length < h.detalheEmPartes) throw new Error(`Detalhe incompleto: ${docs.length}/${h.detalheEmPartes} partes`);
+    const junta = (campo) => docs.flatMap(d => d[campo] || []);
+    return { ...h, resultados: junta('resultados'), semParceiro: junta('semParceiro'), outrosFluxos: junta('outrosFluxos'), reentregas: junta('reentregas') };
   },
   // Atualiza só o resumo (ex: totais financeiros) de um lote já salvo — usado quando a
   // pessoa importa as notas fiscais DEPOIS de já ter validado e salvo o lote de CT-es,
@@ -380,7 +432,7 @@ const DataLayer = {
     }
     const doc = await db.collection('validacoes').doc(id).get();
     if (doc.exists) {
-      await db.collection('validacoes').doc(id).update({ resumo: { ...doc.data().resumo, ...patchResumo } });
+      await db.collection('validacoes').doc(id).update({ resumo: limparParaFirestore({ ...doc.data().resumo, ...patchResumo }) });
     }
   },
 
@@ -402,7 +454,7 @@ const DataLayer = {
       localDB_write(data);
       return revisao;
     }
-    await db.collection('revisoes').doc(revisao.chave).set(revisao, { merge: true });
+    await db.collection('revisoes').doc(revisao.chave).set(limparParaFirestore(revisao), { merge: true });
     return revisao;
   },
 
@@ -443,7 +495,7 @@ const DataLayer = {
     for (let i = 0; i < lista.length; i += 400) {
       const chunk = lista.slice(i, i + 400);
       const batch = db.batch();
-      chunk.forEach(c => batch.set(db.collection('ctes').doc(c.chave), c));
+      chunk.forEach(c => batch.set(db.collection('ctes').doc(c.chave), limparParaFirestore(c)));
       await batch.commit();
     }
   },
@@ -482,7 +534,7 @@ const DataLayer = {
     for (let i = 0; i < lista.length; i += 400) {
       const chunk = lista.slice(i, i + 400);
       const batch = db.batch();
-      chunk.forEach(n => batch.set(db.collection('notasFiscais').doc(n.chave), n));
+      chunk.forEach(n => batch.set(db.collection('notasFiscais').doc(n.chave), limparParaFirestore(n)));
       await batch.commit();
     }
   },
@@ -1037,6 +1089,29 @@ function parseNumeroFlexivel(v) {
   return parseFloat(s);
 }
 
+// Número vindo de planilha/tela, em qualquer formato comum: 0.003, "0,30%", "0.30 %",
+// "R$ 3,00", "1.234,56". Com `percentual: true`, um texto com "%" é dividido por 100
+// ("0,30%" -> 0.003). Antes, parseFloat("0,30%") dava 0 e o ADV caía sempre no mínimo.
+function parseNumeroPlanilha(v, opts = {}) {
+  if (v === null || v === undefined || v === '') return NaN;
+  if (typeof v === 'number') return v;
+  let s = v.toString().trim();
+  const temPct = s.includes('%');
+  s = s.replace(/R\$/gi, '').replace(/%/g, '').replace(/\s+/g, '');
+  if (s === '' || s === '-') return NaN;
+  const n = parseNumeroFlexivel(s);
+  if (isNaN(n)) return NaN;
+  return (opts.percentual && temPct) ? n / 100 : n;
+}
+
+// ADV/GRIS nunca passam de 5% do valor da carga. Se o percentual chegou como 0,30 (quem
+// digitou quis dizer 0,30%, não 30%), converte pra fração. Sem isso o cálculo sai
+// absurdo (30% da nota) ou, no caso do texto, zerado (e cai no mínimo).
+function normalizaPercentualCarga(n) {
+  if (n === null || n === undefined || isNaN(n)) return n;
+  return n > 0.05 ? n / 100 : n;
+}
+
 // Planilhas de produto costumam ter VÁRIAS seções empilhadas (uma por categoria), cada
 // uma com seu próprio cabeçalho repetido no meio dos dados — por isso não dá pra usar
 // "uma linha de cabeçalho" única. Em vez disso, cada linha é reconhecida como dado (não
@@ -1171,25 +1246,41 @@ function calcFaixaPeso(peso, tarifaRow, faixasPeso, baseExcedente) {
   return { valor, explicacao: `Peso ${fmtNum(peso)}kg acima de ${ultimaFaixa}kg: ${fmtBRL(valorUltimo)} (faixa base) + ${fmtNum(excesso)}kg excedente × ${fmtBRL(excedenteRate)}/kg = ${fmtBRL(valor)}.` };
 }
 
-function getRegraValor(regra, campo, tarifaRow, fallback) {
+function getRegraValorBruto(regra, campo, tarifaRow) {
   const porLinha = regra[campo + 'PorLinha'];
-  if (porLinha && tarifaRow && tarifaRow.extras && tarifaRow.extras[regra.id + '_' + campo] !== undefined) {
+  if (porLinha && tarifaRow && tarifaRow.extras) {
     const v = tarifaRow.extras[regra.id + '_' + campo];
-    return (v === '' || v === null) ? fallback : parseFloat(v);
+    if (v !== undefined && v !== null && v !== '') return v;
   }
   const g = regra[campo];
-  return (g === undefined || g === null || g === '') ? fallback : parseFloat(g);
+  return (g === undefined || g === null || g === '') ? null : g;
+}
+function getRegraValor(regra, campo, tarifaRow, fallback) {
+  const bruto = getRegraValorBruto(regra, campo, tarifaRow);
+  if (bruto === null) return fallback;
+  let n = parseNumeroPlanilha(bruto, { percentual: campo === 'pct' });
+  if (isNaN(n)) return fallback;
+  if (campo === 'pct' && regra.tipo === 'percentual_com_minimo') n = normalizaPercentualCarga(n);
+  if (campo === 'pct' && regra.tipo === 'percentual_sobre_subtotal' && n > 1) n = n / 100;
+  return n;
 }
 
 function calcRegraAdicional(regra, ctx) {
   switch (regra.tipo) {
     case 'percentual_com_minimo': {
-      const base = ctx[regra.base] || 0;
+      // regra criada pelo "+ Adicionar regra" nascia sem o campo base (a tela mostrava
+      // "Valor da carga" só porque é a única opção) -> base 0 -> sempre caía no mínimo
+      const campoBase = regra.base || 'vCarga';
+      const base = ctx[campoBase] || 0;
       const pct = getRegraValor(regra, 'pct', ctx.tarifaRow, 0);
       const min = getRegraValor(regra, 'min', ctx.tarifaRow, 0);
       const bruto = pct * base;
       const valor = clamp2(Math.max(bruto, min));
-      const nomeBase = regra.base === 'vCarga' ? 'valor da carga' : regra.base;
+      const nomeBase = campoBase === 'vCarga' ? 'valor da carga' : campoBase;
+      if (!(pct > 0)) {
+        const onde = ctx.tarifaRow ? `${ctx.tarifaRow.uf} / ${ctx.tarifaRow.regiao}` : 'esta região';
+        return { valor, aplicavel: true, semPercentual: true, explicacao: `⚠ Percentual de ${regra.nome} não encontrado na tabela do parceiro para ${onde} (célula vazia ou em formato não reconhecido) — só o mínimo de ${fmtBRL(min)} foi aplicado. Confira a coluna do percentual em Parceiros e reimporte a tabela.` };
+      }
       const explicacao = min > 0 && bruto < min
         ? `${fmtNum(pct*100,2)}% sobre o ${nomeBase} (${fmtBRL(base)}) = ${fmtBRL(bruto)}, abaixo do mínimo de ${fmtBRL(min)} → aplica o mínimo: ${fmtBRL(valor)}.`
         : `${fmtNum(pct*100,2)}% sobre o ${nomeBase} (${fmtBRL(base)}) = ${fmtBRL(valor)}${min>0?` (mínimo seria ${fmtBRL(min)}, não precisou aplicar)`:''}.`;
@@ -1403,7 +1494,31 @@ function readWorkbookFile(file) {
 function sheetToGrid(workbook, sheetName) {
   const ws = workbook.Sheets[sheetName];
   if (!ws) return [];
-  return XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
+  const grid = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
+  // Células mescladas (ex: o mesmo "0,30%" de ADV mesclado pra todas as regiões de uma UF)
+  // só guardam o valor na primeira célula — as demais linhas vinham vazias e a regra
+  // ficava sem percentual. Replica o valor pro intervalo inteiro da mesclagem.
+  const merges = ws['!merges'] || [];
+  if (merges.length) {
+    const ref = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : { s: { r: 0, c: 0 } };
+    merges.forEach(m => {
+      // só mesclagens verticais (uma coluna, várias linhas) — as horizontais são títulos
+      // de seção ("GENERALIDADES" etc.) e replicá-las criaria linhas de tarifa falsas
+      if (m.s.c !== m.e.c || m.e.r === m.s.r) return;
+      const r0 = m.s.r - ref.s.r, c0 = m.s.c - ref.s.c;
+      const val = (grid[r0] || [])[c0];
+      if (val === null || val === undefined || val === '') return;
+      for (let r = m.s.r; r <= m.e.r; r++) {
+        const ri = r - ref.s.r;
+        if (!grid[ri]) grid[ri] = [];
+        for (let c = m.s.c; c <= m.e.c; c++) {
+          const ci = c - ref.s.c;
+          if (grid[ri][ci] === null || grid[ri][ci] === undefined || grid[ri][ci] === '') grid[ri][ci] = val;
+        }
+      }
+    });
+  }
+  return grid;
 }
 
 // Extrai as linhas não vazias de uma grade (array de arrays), a partir de uma
@@ -1923,7 +2038,10 @@ async function processarZip(entrada) {
       ...outrosFluxos.filter(x => x.cte.chave).map(x => ({ chave: x.cte.chave, nCT: x.cte.nCT, dhEmi: x.cte.dhEmi, parceiroNome: x.parceiro.nome, xMunIni: x.cte.xMunIni, UFIni: x.cte.UFIni, xMunFim: x.cte.xMunFim, UFFim: x.cte.UFFim, vTPrest: x.cte.vTPrest, categoria: 'trajeto_atipico' })),
       ...reentregas.filter(x => x.cte.chave).map(x => ({ chave: x.cte.chave, nCT: x.cte.nCT, dhEmi: x.cte.dhEmi, parceiroNome: x.parceiro.nome, destMun: x.cte.destMun, destUF: x.cte.destUF, vTPrest: x.cte.vTPrest, categoria: 'reentrega' })),
     ].map(o => ({ ...o, arquivoOrigem: nomeLote, importadoEm: agora }));
-    await DataLayer.salvarCtesEmLote(paraSalvarGlobal).catch(e => console.error('[CT-e global] falha ao salvar:', e));
+    await DataLayer.salvarCtesEmLote(paraSalvarGlobal).catch(e => {
+      console.error('[CT-e global] falha ao salvar:', e);
+      toast('Falha ao gravar os CT-es no banco (o bloqueio de duplicados não vai valer pra este lote). Detalhe no console (F12).', 'error');
+    });
 
     // salva resumo no histórico
     const tol = 0.05;
@@ -1958,12 +2076,9 @@ async function processarZip(entrada) {
     const outrosFluxosTrim = outrosFluxos.map(trimForaFluxoParaHistorico);
     const reentregasTrim = reentregas.map(trimForaFluxoParaHistorico);
     let registro = { nomeArquivo: nomeLote, resumo, resultados: resultadosTrim, semParceiro: semParceiroTrim, outrosFluxos: outrosFluxosTrim, reentregas: reentregasTrim, detalheDisponivel: true };
-    if (!OFFLINE_MODE && JSON.stringify(registro).length > 900000) {
-      registro = { nomeArquivo: nomeLote, resumo, detalheDisponivel: false };
-      toast('Lote salvo no histórico, mas ficou grande demais pra guardar o detalhe linha a linha — exporte o Excel se precisar revisitar.', 'warn');
-    }
     const salvo = await DataLayer.saveValidacao(registro).catch(async (e) => {
       console.error(e);
+      toast('Não foi possível salvar o detalhe do lote no histórico — salvando só o resumo. Detalhe do erro no console (F12).', 'warn');
       // se falhar por tamanho, tenta de novo só com o resumo
       return DataLayer.saveValidacao({ nomeArquivo: nomeLote, resumo, detalheDisponivel: false }).catch(e2 => console.error(e2));
     });
@@ -3088,7 +3203,13 @@ function atualizarTarifaValor(i, j, valor) {
 }
 function atualizarTarifaExtra(i, chave, valor) {
   STATE._parceiroDraft.motor.tarifas[i].extras = STATE._parceiroDraft.motor.tarifas[i].extras || {};
-  STATE._parceiroDraft.motor.tarifas[i].extras[chave] = valor === '' ? null : parseFloat(valor);
+  if (valor === '') { STATE._parceiroDraft.motor.tarifas[i].extras[chave] = null; return; }
+  let n = parseNumeroPlanilha(valor, { percentual: /_pct$/.test(chave) });
+  if (/_pct$/.test(chave) && !isNaN(n)) {
+    const regra = (STATE._parceiroDraft.regrasAdicionais || []).find(r => chave === r.id + '_pct');
+    if (regra && regra.tipo === 'percentual_com_minimo') n = normalizaPercentualCarga(n);
+  }
+  STATE._parceiroDraft.motor.tarifas[i].extras[chave] = isNaN(n) ? null : n;
 }
 
 function colunasExtrasPorLinha() {
@@ -3160,7 +3281,7 @@ const TIPOS_REGRA = [
 function adicionarRegra() {
   const p = STATE._parceiroDraft;
   p.regrasAdicionais = p.regrasAdicionais || [];
-  p.regrasAdicionais.push({ id: 'r' + uid(), nome: 'Nova taxa', tipo: 'fixo_por_cte', valor: 0, valorPorLinha: false });
+  p.regrasAdicionais.push({ id: 'r' + uid(), nome: 'Nova taxa', tipo: 'fixo_por_cte', base: 'vCarga', valor: 0, valorPorLinha: false });
   renderRegrasBox();
   renderTarifaGrid();
 }
@@ -3170,7 +3291,9 @@ function removerRegra(i) {
   renderTarifaGrid();
 }
 function atualizarRegraCampo(i, campo, valor) {
-  STATE._parceiroDraft.regrasAdicionais[i][campo] = valor;
+  const regra = STATE._parceiroDraft.regrasAdicionais[i];
+  regra[campo] = valor;
+  if (!regra.base) regra.base = 'vCarga';
   renderRegrasBox();
   renderTarifaGrid();
 }
@@ -3757,20 +3880,26 @@ function confirmarImportacao() {
 
     const novas = linhas.map((l, k) => {
       const valores = [];
-      for (let i = 0; i < nFaixas; i++) valores.push(parseFloat(l['faixa_'+i]) || 0);
+      for (let i = 0; i < nFaixas; i++) valores.push(parseNumeroPlanilha(l['faixa_'+i]) || 0);
       const extras = {};
       (st.regrasImport || []).forEach(r => {
         if (!r.nome) return;
         const row = linhasBrutas[k] || [];
-        if (r.colPct != null) { const v = row[r.colPct]; if (v !== undefined && v !== null && v !== '') extras[r.id+'_pct'] = parseFloat(v); }
-        if (r.colMin != null) { const v = row[r.colMin]; if (v !== undefined && v !== null && v !== '') extras[r.id+'_min'] = parseFloat(v); }
-        if (r.colValor != null) { const v = row[r.colValor]; if (v !== undefined && v !== null && v !== '') extras[r.id+'_valor'] = parseFloat(v); }
+        const num = (v, pct) => { const n = parseNumeroPlanilha(v, { percentual: pct }); return isNaN(n) ? null : n; };
+        if (r.colPct != null) {
+          let n = num(row[r.colPct], true);
+          if (n !== null && r.tipo === 'percentual_com_minimo') n = normalizaPercentualCarga(n);
+          if (n !== null && r.tipo === 'percentual_sobre_subtotal' && n > 1) n = n / 100;
+          if (n !== null) extras[r.id+'_pct'] = n;
+        }
+        if (r.colMin != null) { const n = num(row[r.colMin], false); if (n !== null) extras[r.id+'_min'] = n; }
+        if (r.colValor != null) { const n = num(row[r.colValor], false); if (n !== null) extras[r.id+'_valor'] = n; }
       });
       return {
         uf: (l.uf || '').toString().toUpperCase().trim(),
         regiao: (l.regiao || '').toString().trim(),
         valores,
-        excedente: parseFloat(l.excedente) || 0,
+        excedente: parseNumeroPlanilha(l.excedente) || 0,
         extras,
       };
     }).filter(t => t.uf && t.regiao);
@@ -3798,6 +3927,10 @@ function confirmarImportacao() {
     renderTarifaGrid();
     renderRegrasBox();
     toast(`${novas.length} linhas de tarifa e ${novasRegras.length} regra(s) importadas.`, 'success');
+    const faltando = novasRegras.filter(r => r.pctPorLinha).map(r => ({ nome: r.nome, n: novas.filter(t => !(t.extras[r.id + '_pct'] > 0)).length })).filter(x => x.n > 0);
+    if (faltando.length) {
+      setTimeout(() => toast(`Atenção: ${faltando.map(f => `${f.nome} sem percentual em ${f.n} linha(s)`).join(' · ')} — nessas regiões só o mínimo será cobrado. Confira a grade abaixo.`, 'warn'), 400);
+    }
   } else if (st.tipo === 'abrangencia') {
     const novas = linhas.map(l => ({
       uf: (l.uf || '').toString().toUpperCase().trim(),
@@ -3894,8 +4027,13 @@ async function salvarParceiro() {
 // 18. VIEW: HISTÓRICO
 // ---------------------------------------------------------------------
 // Reabre a tela de comparação (igual a aba Validar Fretes) a partir de um lote do histórico
-function abrirHistoricoDetalhe(indice) {
-  const h = STATE.historico[indice];
+async function abrirHistoricoDetalhe(indice) {
+  let h = STATE.historico[indice];
+  if (h && h.detalheEmPartes && !h.resultados) {
+    toast('Carregando detalhe do lote…', 'info');
+    try { h = await DataLayer.carregarDetalheHistorico(h); STATE.historico[indice] = h; }
+    catch (e) { console.error(e); toast('Não foi possível carregar o detalhe desse lote.', 'error'); return; }
+  }
   if (!h || !h.resultados) { toast('Detalhe não disponível para este lote.', 'warn'); return; }
   STATE.ultimaValidacao = {
     nomeArquivo: h.nomeArquivo,
@@ -3940,7 +4078,7 @@ async function renderHistorico() {
         </thead>
         <tbody class="divide-y divide-ink-100">
           ${historico.map((h, i) => {
-            const temDetalhe = h.detalheDisponivel && Array.isArray(h.resultados);
+            const temDetalhe = h.detalheDisponivel && (Array.isArray(h.resultados) || h.detalheEmPartes > 0);
             const temFaturado = h.resumo?.faturado !== undefined && h.resumo?.faturado !== null;
             const faturadoPositivo = temFaturado && h.resumo.faturado >= 0;
             return `
