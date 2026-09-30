@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-09-30-fatura-reposicao-emissao';
+const APP_VERSION = '2026-09-30-fluxo-nfe-v2';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -780,19 +780,24 @@ const DataLayer = {
     lista.filter(n => n.chave).forEach(n => { (porBalde[this._baldeNfe(n.chave)] = porBalde[this._baldeNfe(n.chave)] || []).push(n); });
     const agora = new Date().toISOString();
     const cacheNfe = STATE._nfesCache = STATE._nfesCache || {};
+    let novas = 0, completadas = 0, jaExistiam = 0;
     for (const [idBalde, notas] of Object.entries(porBalde)) {
       const ref = db.collection('nfeBaldes').doc(idBalde);
       const doc = await ref.get(); // lê fresco pra não sobrescrever o que outra pessoa salvou
       const atuais = doc.exists ? JSON.parse(doc.data().dados || '{}') : {};
       let mudou = false;
       notas.forEach(n => {
-        if (!atuais[n.chave]) { atuais[n.chave] = limparParaFirestore(n); mudou = true; }
-        else if (!('fluxo' in atuais[n.chave]) && 'fluxo' in n) { atuais[n.chave].fluxo = n.fluxo; atuais[n.chave].obsFluxo = n.obsFluxo ?? null; mudou = true; } // completa nota antiga, mantém o resto
+        if (!atuais[n.chave]) { atuais[n.chave] = limparParaFirestore(n); mudou = true; novas++; }
+        else if ('fluxo' in n && (!('fluxo' in atuais[n.chave]) || (n.fluxo && !atuais[n.chave].fluxo))) {
+          // nota já existente: mantém o registro original e só completa a leitura das observações
+          atuais[n.chave].fluxo = n.fluxo; atuais[n.chave].obsFluxo = n.obsFluxo ?? null; mudou = true; completadas++;
+        } else jaExistiam++;
       });
       if (mudou) await ref.set({ dados: JSON.stringify(atuais), qtd: Object.keys(atuais).length, atualizadoEm: agora });
       (STATE._nfeBaldes = STATE._nfeBaldes || {})[idBalde] = atuais;
       notas.forEach(n => { cacheNfe[n.chave] = atuais[n.chave]; });
     }
+    return { novas, completadas, jaExistiam };
   },
 };
 
@@ -1241,7 +1246,9 @@ function parseNFeXml(xmlString, fileName) {
     ...(() => {
       // observações da nota (infAdic: infCpl, infAdFisco, obsCont) — "FLUXO" = reposição
       const infAdic = infNFe.getElementsByTagName('infAdic')[0];
-      const obs = infAdic ? [xmlText(infAdic, 'infCpl'), xmlText(infAdic, 'infAdFisco'), ...Array.from(infAdic.getElementsByTagName('xTexto')).map(n => n.textContent)].filter(Boolean).join(' | ') : '';
+      const obsNota = infAdic ? [xmlText(infAdic, 'infCpl'), xmlText(infAdic, 'infAdFisco'), ...Array.from(infAdic.getElementsByTagName('xTexto')).map(n => n.textContent)] : [];
+      const obsItens = Array.from(infNFe.getElementsByTagName('infAdProd')).map(n => n.textContent);
+      const obs = [...obsNota, ...obsItens].filter(Boolean).join(' | ');
       return { fluxo: textoTemFluxo(obs), obsFluxo: trechoFluxo(obs) };
     })(),
   };
@@ -1434,8 +1441,9 @@ function enriquecerComNotasFiscais(resultados, nfes) {
     // guarda os itens (mesmo sem vFrete) pra eventualmente recalcular a cubagem
     r._itensNFe = nfeEncontrada ? nfeEncontrada.itens : null;
     // "FLUXO" nas observações da NF-e -> reposição (prejuízo total, igual devolução)
-    r.reposicao = !!(nfeEncontrada && nfeEncontrada.fluxo);
-    r.obsFluxo = r.reposicao ? (nfeEncontrada.obsFluxo || null) : null;
+    const fluxoNota = !!(nfeEncontrada && nfeEncontrada.fluxo);
+    r.reposicao = fluxoNota || !!r.reposicaoCte;
+    r.obsFluxo = fluxoNota ? (nfeEncontrada.obsFluxo || null) : (r.reposicaoCte ? r.obsFluxo : null);
   });
   return { casados, total: resultados.length, nfesLidas: nfes.length };
 }
@@ -1938,10 +1946,15 @@ function validarLoteCtes(ctes, parceiros) {
     const calculado = calc.totalCalculado;
     const divergencia = (calculado !== null) ? clamp2(cobrado - calculado) : null;
 
+    const obsCte = (cte.xObs || '') + ' ' + (cte.obsContTextos || '');
+    const reposicaoCte = textoTemFluxo(obsCte);
     resultados.push({
       cte, parceiro, calc,
       cobrado, calculado, divergencia,
       tipoOperacao,
+      reposicaoCte,
+      reposicao: reposicaoCte,
+      obsFluxo: reposicaoCte ? (trechoFluxo(obsCte) + ' (observação do CT-e)') : null,
     });
   }
   return { resultados, semParceiro, outrosFluxos, reentregas };
@@ -2429,6 +2442,7 @@ function trimResultadoParaHistorico(r) {
     canal: r.canal ?? null,
     pedido: r.pedido ?? null,
     reposicao: !!r.reposicao,
+    reposicaoCte: !!r.reposicaoCte,
     obsFluxo: r.obsFluxo ?? null,
   };
 }
@@ -2791,7 +2805,18 @@ async function processarNotasFiscais(entrada, progressBoxId = 'progressNFeBox') 
     const nfesNovas = nfes.filter(n => n.chave && !chavesExistentesNfe.has(n.chave));
     const nfesDuplicadas = nfes.length - nfesNovas.length;
     const agoraNfe = new Date().toISOString();
-    await DataLayer.salvarNfesEmLote(nfes.map(n => ({ ...n, arquivoOrigem: nomeLote, importadoEm: agoraNfe }))).catch(e => console.error('[NF-e global] falha ao salvar:', e));
+    let gravacaoNfe = null;
+    try {
+      gravacaoNfe = await comTimeout(DataLayer.salvarNfesEmLote(nfes.map(n => ({ ...n, arquivoOrigem: nomeLote, importadoEm: agoraNfe }))), 60000, 'salvar as notas fiscais');
+    } catch (e) {
+      console.error('[NF-e global] falha ao salvar:', e);
+      toast(mensagemErroFirebase(e, 'salvar as notas fiscais'), 'error');
+    }
+    const qtdFluxoLidas = nfes.filter(n => n.fluxo).length;
+    const txtGravacao = gravacaoNfe
+      ? ` Salvas automaticamente: ${gravacaoNfe.novas} nova(s)${gravacaoNfe.completadas ? `, ${gravacaoNfe.completadas} já existente(s) atualizada(s) com as observações` : ''}${gravacaoNfe.jaExistiam ? `, ${gravacaoNfe.jaExistiam} já estavam salvas` : ''}.`
+      : '';
+    const txtFluxo = ` ${qtdFluxoLidas} com "FLUXO" nas observações (reposição).`;
 
     let resumoCubagem = null;
     if (temValidacaoAtiva) {
@@ -2807,25 +2832,25 @@ async function processarNotasFiscais(entrada, progressBoxId = 'progressNFeBox') 
     if (temValidacaoAtiva) {
       msg = `${resumoMatch.casados} de ${resumoMatch.total} CT-es casados com nota fiscal (${nfes.length} NF-e lida(s)${semFrete ? `, ${semFrete} sem vFrete preenchido` : ''}${nfesDuplicadas ? `, ${nfesDuplicadas} já importada(s) antes` : ''}).`;
       if (resumoCubagem && resumoCubagem.recalculados > 0) msg += ` ${resumoCubagem.recalculados} recalculado(s) com peso cubado próprio.`;
-      const qtdRepos = STATE.ultimaValidacao.resultados.filter(ehReposicao).length;
-      if (qtdRepos) msg += ` ${qtdRepos} reposição(ões) identificada(s) ("FLUXO" nas observações da nota).`;
       else if (resumoCubagem && resumoCubagem.semFator > 0) msg += ` ${resumoCubagem.semFator} CT-e(s) sem fator de cubagem cadastrado no parceiro.`;
+      const qtdRepos = STATE.ultimaValidacao.resultados.filter(r => r.reposicao).length;
+      msg += txtGravacao + txtFluxo + (qtdRepos ? ` ${qtdRepos} CT-e(s) deste lote marcado(s) como reposição.` : '');
       renderResultadosValidacao();
       // atualiza o resumo financeiro do lote já salvo no histórico, se houver
       const resumoFinAtualizado = calcularResumoFinanceiro(STATE.ultimaValidacao.resultados, STATE.ultimaValidacao.reentregas || [], STATE.ultimaValidacao.semParceiro || [], STATE.ultimaValidacao.outrosFluxos || []);
       if (STATE.ultimaValidacao.historicoId) {
-        DataLayer.atualizarResumoHistorico(STATE.ultimaValidacao.historicoId, {
-          totalCobrado: resumoFinAtualizado.totalCobrado,
-          totalClientePagou: resumoFinAtualizado.totalClientePagou,
-          faturado: resumoFinAtualizado.faturado,
-        }).catch(e => console.error('[Histórico] falha ao atualizar resumo financeiro:', e));
+        // lote já salvo: atualiza o registro inteiro (reposições, frete do cliente, Faturado)
+        const vH = STATE.ultimaValidacao;
+        DataLayer.substituirValidacao(vH.historicoId, montarRegistroHistorico(vH.nomeArquivo, vH))
+          .then(() => { vH._resumoGravado = { ...montarRegistroHistorico(vH.nomeArquivo, vH).resumo }; })
+          .catch(e => console.error('[Histórico] falha ao atualizar:', e));
       }
     } else {
       // sem validação carregada agora — só guarda pra casar automaticamente depois,
       // quando algum CT-e referenciando essas NF-es for validado
-      msg = `${nfesNovas.length} nota(s) fiscal(is) nova(s) salva(s) (${nfes.length} lida(s)${semFrete ? `, ${semFrete} sem vFrete preenchido` : ''}${nfesDuplicadas ? `, ${nfesDuplicadas} já importada(s) antes` : ''}). Vão casar sozinhas quando você validar os CT-es correspondentes.`;
+      msg = `${nfes.length} NF-e(s) lida(s)${semFrete ? ` (${semFrete} sem vFrete preenchido)` : ''}.${txtGravacao}${txtFluxo} Vão casar sozinhas quando você validar os CT-es correspondentes (ou use "Recalcular" num lote aberto pelo Histórico).`;
     }
-    toast(msg, (temValidacaoAtiva ? resumoMatch.casados > 0 : nfesNovas.length > 0) ? 'success' : 'warn');
+    toast(msg, gravacaoNfe || (temValidacaoAtiva && resumoMatch.casados > 0) ? 'success' : 'warn');
   } catch (e) {
     console.error(e);
     progressBox.classList.add('hidden');
