@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-09-30-fluxo-nfe-v2';
+const APP_VERSION = '2026-09-30-fluxo-nfe-v3';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -1426,6 +1426,11 @@ function enriquecerComNotasFiscais(resultados, nfes) {
     for (const nf of notas) {
       if (nf.chave && porChave[nf.chave]) { nfeEncontrada = porChave[nf.chave]; break; }
     }
+    // "FLUXO" em QUALQUER nota do CT-e (um CT-e pode levar várias NF-es) — inclusive notas
+    // lidas nesta sessão cuja gravação no banco ainda não terminou
+    const memFluxo = STATE._fluxoPorChave || {};
+    const notaComFluxo = notas.map(nf => nf.chave && (porChave[nf.chave] || null)).find(n => n && (n.fluxo || memFluxo[n.chave]))
+      || (notas.find(nf => nf.chave && memFluxo[nf.chave]) ? { obsFluxo: memFluxo[notas.find(nf => nf.chave && memFluxo[nf.chave]).chave] } : null);
     if (nfeEncontrada && nfeEncontrada.vFrete !== null && nfeEncontrada.vFrete !== undefined) {
       r.valorFreteCliente = nfeEncontrada.vFrete;
       r.nfeVinculada = { nNF: nfeEncontrada.nNF, chave: nfeEncontrada.chave, vNF: nfeEncontrada.vNF };
@@ -1441,9 +1446,9 @@ function enriquecerComNotasFiscais(resultados, nfes) {
     // guarda os itens (mesmo sem vFrete) pra eventualmente recalcular a cubagem
     r._itensNFe = nfeEncontrada ? nfeEncontrada.itens : null;
     // "FLUXO" nas observações da NF-e -> reposição (prejuízo total, igual devolução)
-    const fluxoNota = !!(nfeEncontrada && nfeEncontrada.fluxo);
+    const fluxoNota = !!notaComFluxo;
     r.reposicao = fluxoNota || !!r.reposicaoCte;
-    r.obsFluxo = fluxoNota ? (nfeEncontrada.obsFluxo || null) : (r.reposicaoCte ? r.obsFluxo : null);
+    r.obsFluxo = fluxoNota ? (notaComFluxo.obsFluxo || memFluxo[notaComFluxo.chave] || 'FLUXO') : (r.reposicaoCte ? r.obsFluxo : null);
   });
   return { casados, total: resultados.length, nfesLidas: nfes.length };
 }
@@ -2788,6 +2793,14 @@ async function processarNotasFiscais(entrada, progressBoxId = 'progressNFeBox') 
     // validação carregada agora (mesmo as já vistas antes — isso é só leitura); só a
     // gravação global no banco é que ignora duplicata
     const semFrete = nfes.filter(n => n.vFrete === null || n.vFrete === undefined).length;
+    // memória da sessão: vale na hora pro Recalcular, mesmo que a gravação no banco demore/falhe
+    STATE._fluxoPorChave = STATE._fluxoPorChave || {};
+    const cacheSessao = STATE._nfesCache = STATE._nfesCache || {};
+    nfes.forEach(n => {
+      if (!n.chave) return;
+      if (n.fluxo) STATE._fluxoPorChave[n.chave] = n.obsFluxo || 'FLUXO';
+      cacheSessao[n.chave] = { ...(cacheSessao[n.chave] || {}), ...n, fluxo: !!(n.fluxo || (cacheSessao[n.chave] && cacheSessao[n.chave].fluxo)) };
+    });
     // casa com as NF-es lidas agora + as já salvas antes (senão, importar só parte das notas
     // "descasaria" os CT-es cujas notas vieram numa importação anterior)
     let nfesParaCasar = nfes;
@@ -3794,6 +3807,13 @@ function abrirDetalheCte(idx) {
   const emissaoTxt = r.cte.dhEmi ? ` · emitido em <strong>${fmtDia(r.cte.dhEmi)}</strong>` : '';
   const canalTxt = (ehReposicao(r) ? ` · <span class="font-semibold text-amber-700" title="${escapeHtml(r.obsFluxo || '')}">REPOSIÇÃO (prejuízo total)</span>` : '') + (r.canal ? ` · canal <strong>${escapeHtml(r.canal)}</strong>${r.pedido ? ` · pedido ${escapeHtml(r.pedido)}` : ''}` : '');
 
+  const infoNotaCliente = (() => {
+    const partes = [];
+    if (r.nfeVinculada) partes.push(`Nota do cliente casada: NF ${escapeHtml(r.nfeVinculada.nNF || '')} (${r.nfeVinculada.fonte === 'planilha' ? 'planilha Excel' : 'XML da NF-e'})`);
+    else partes.push('Nenhuma nota do cliente (XML ou planilha) casada com este CT-e ainda');
+    partes.push(r.reposicao ? `<strong class="text-amber-700">REPOSIÇÃO</strong> — ${escapeHtml(r.obsFluxo || 'FLUXO')}` : '"FLUXO" não encontrado nas observações da nota/CT-e');
+    return `<div class="mt-1.5 text-[11px] text-ink-400 bg-ink-50 border border-ink-200 rounded-lg px-2.5 py-1.5">${partes.join(' · ')}</div>`;
+  })();
   const avisoReconciliacao = reconciliacao.temPendencia ? `
     <div class="mt-3 text-xs px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200">
       ⚠ <strong>${fmtBRL(reconciliacao.somaResidual)}</strong> em cobrança(s) do XML (linha amarela acima) ainda não têm regra cadastrada — a divergência total pode estar inflada por isso, não necessariamente é cobrança indevida. Cadastre essa taxa em Parceiros pra ela entrar na conta.
@@ -3821,6 +3841,7 @@ function abrirDetalheCte(idx) {
           <div class="text-xs text-ink-400">${escapeHtml(r.cte.destMun)}/${escapeHtml(r.cte.destUF)} · região "${escapeHtml(r.calc.regiaoEncontrada || '—')}" · peso base cálc. ${fmtNum(r.cte.pesoBC ?? r.cte.pesoReal)} kg${r.pesoCubadoInfo ? ` <span class="text-ink-300">(peso usado no cálculo: ${fmtNum(r.pesoCubadoInfo.pesoFinal)} kg — cubagem própria)</span>` : ''}</div>
           <div class="text-xs text-ink-400 mt-0.5">${nfsTxt}${emissaoTxt}${canalTxt} · chave CT-e <span class="font-mono text-[10px]">${escapeHtml(r.cte.chave)}</span></div>
           ${renderAbrangenciaUsada(r)}
+          ${infoNotaCliente}
           ${r.pesoCubadoInfo ? renderInfoCubagem(r) : ''}
         </div>
         <button onclick="this.closest('.fixed').remove()" class="text-ink-400 hover:text-ink-700 text-xl leading-none shrink-0 ml-2">&times;</button>
