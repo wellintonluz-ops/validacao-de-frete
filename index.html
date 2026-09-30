@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-09-30-fluxo-nfe-v3';
+const APP_VERSION = '2026-09-30-nfe-grandes-lotes';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -767,37 +767,71 @@ const DataLayer = {
     }
     return unicas.map(c => cache[c]).filter(Boolean);
   },
-  async salvarNfesEmLote(lista) {
-    if (!lista.length) return;
+  // Grava as NF-es em grupos de 500 números por documento. Vários grupos ao mesmo tempo
+  // (bem mais rápido pra zips com dezenas de milhares de notas), cada grupo com nova tentativa
+  // se falhar, e um grupo com erro não interrompe os outros.
+  async salvarNfesEmLote(lista, onProgress) {
+    if (!lista.length) return { novas: 0, completadas: 0, jaExistiam: 0 };
     if (OFFLINE_MODE) {
       const data = localDB_read();
       data.notasFiscaisSalvas = data.notasFiscaisSalvas || {};
       lista.forEach(n => { data.notasFiscaisSalvas[n.chave] = n; });
       localDB_write(data);
-      return;
+      return { novas: lista.length, completadas: 0, jaExistiam: 0 };
     }
+    // só o que o site usa (sem descrição de produto/destinatário) — documentos menores, gravação mais rápida
+    const enxuta = (n) => limparParaFirestore({ chave: n.chave, nNF: n.nNF, serie: n.serie, dhEmi: n.dhEmi, vNF: n.vNF, vFrete: n.vFrete,
+      itens: (n.itens || []).map(i => ({ cProd: i.cProd, qCom: i.qCom })), fluxo: !!n.fluxo, obsFluxo: n.obsFluxo || null,
+      arquivoOrigem: n.arquivoOrigem || null, importadoEm: n.importadoEm || null });
     const porBalde = {};
     lista.filter(n => n.chave).forEach(n => { (porBalde[this._baldeNfe(n.chave)] = porBalde[this._baldeNfe(n.chave)] || []).push(n); });
     const agora = new Date().toISOString();
     const cacheNfe = STATE._nfesCache = STATE._nfesCache || {};
-    let novas = 0, completadas = 0, jaExistiam = 0;
-    for (const [idBalde, notas] of Object.entries(porBalde)) {
+    const tot = { novas: 0, completadas: 0, jaExistiam: 0 };
+    const falhas = [];
+    const gravarGrupo = async (idBalde, notas) => {
       const ref = db.collection('nfeBaldes').doc(idBalde);
       const doc = await ref.get(); // lê fresco pra não sobrescrever o que outra pessoa salvou
       const atuais = doc.exists ? JSON.parse(doc.data().dados || '{}') : {};
+      const c = { novas: 0, completadas: 0, jaExistiam: 0 };
       let mudou = false;
       notas.forEach(n => {
-        if (!atuais[n.chave]) { atuais[n.chave] = limparParaFirestore(n); mudou = true; novas++; }
+        if (!atuais[n.chave]) { atuais[n.chave] = enxuta(n); mudou = true; c.novas++; }
         else if ('fluxo' in n && (!('fluxo' in atuais[n.chave]) || (n.fluxo && !atuais[n.chave].fluxo))) {
           // nota já existente: mantém o registro original e só completa a leitura das observações
-          atuais[n.chave].fluxo = n.fluxo; atuais[n.chave].obsFluxo = n.obsFluxo ?? null; mudou = true; completadas++;
-        } else jaExistiam++;
+          atuais[n.chave].fluxo = !!n.fluxo; atuais[n.chave].obsFluxo = n.obsFluxo ?? null; mudou = true; c.completadas++;
+        } else c.jaExistiam++;
       });
       if (mudou) await ref.set({ dados: JSON.stringify(atuais), qtd: Object.keys(atuais).length, atualizadoEm: agora });
       (STATE._nfeBaldes = STATE._nfeBaldes || {})[idBalde] = atuais;
       notas.forEach(n => { cacheNfe[n.chave] = atuais[n.chave]; });
+      return c;
+    };
+    const fila = Object.entries(porBalde);
+    const total = fila.length;
+    let feitos = 0;
+    const trabalhador = async () => {
+      while (fila.length) {
+        const [idBalde, notas] = fila.shift();
+        let c = null, erro = null;
+        for (let tentativa = 1; tentativa <= 3 && !c; tentativa++) {
+          try { c = await comTimeout(gravarGrupo(idBalde, notas), 60000, 'gravar um grupo de notas'); }
+          catch (e) { erro = e; console.warn(`[NF-e] grupo ${idBalde}, tentativa ${tentativa} falhou:`, e); if (/resource-exhausted|quota|permission/i.test((e.code || '') + (e.message || ''))) break; }
+        }
+        if (c) { tot.novas += c.novas; tot.completadas += c.completadas; tot.jaExistiam += c.jaExistiam; }
+        else falhas.push({ idBalde, qtd: notas.length, erro });
+        feitos++;
+        if (onProgress) onProgress(feitos, total, falhas.length);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(6, total) }, trabalhador));
+    if (falhas.length) {
+      const e = falhas[0].erro || new Error('falha desconhecida');
+      e.message = `${falhas.reduce((a, f) => a + f.qtd, 0)} de ${lista.length} nota(s) não foram gravadas (${falhas.length} de ${total} grupo(s)) — suba o mesmo arquivo de novo que ele completa só o que faltou: ${e.message || e}`;
+      e.parcial = tot;
+      throw e;
     }
-    return { novas, completadas, jaExistiam };
+    return tot;
   },
 };
 
@@ -1352,6 +1386,7 @@ function aplicarPlanilhaNosItens(itens, mapa) {
     if (nota.canal) { x.canal = nota.canal; comCanal++; }
     if (nota.pedido) x.pedido = nota.pedido;
     if (nota.fluxo && 'cobrado' in x) { x.reposicao = true; x.obsFluxo = x.obsFluxo || nota.obsFluxo || 'FLUXO (planilha de notas)'; }
+    if ('fluxo' in nota && 'cobrado' in x) x.notaSemObs = false; // planilha com observações lidas também vale como conferida
     if ('cobrado' in x) {
       if ((x.valorFreteCliente === null || x.valorFreteCliente === undefined) && nota.frete !== null && nota.frete !== undefined) {
         x.valorFreteCliente = nota.frete;
@@ -1447,6 +1482,8 @@ function enriquecerComNotasFiscais(resultados, nfes) {
     r._itensNFe = nfeEncontrada ? nfeEncontrada.itens : null;
     // "FLUXO" nas observações da NF-e -> reposição (prejuízo total, igual devolução)
     const fluxoNota = !!notaComFluxo;
+    // nota importada antes da leitura das observações existir: não dá pra saber se tem FLUXO
+    r.notaSemObs = !fluxoNota && !!nfeEncontrada && !('fluxo' in nfeEncontrada) && !(nfeEncontrada.chave in memFluxo);
     r.reposicao = fluxoNota || !!r.reposicaoCte;
     r.obsFluxo = fluxoNota ? (notaComFluxo.obsFluxo || memFluxo[notaComFluxo.chave] || 'FLUXO') : (r.reposicaoCte ? r.obsFluxo : null);
   });
@@ -2691,6 +2728,7 @@ async function podeSairDaValidacao(texto = 'Deseja sair sem salvar a validação
 }
 
 window.addEventListener('beforeunload', (e) => {
+  if (STATE._gravandoNfes) { e.preventDefault(); e.returnValue = 'As notas fiscais ainda estão sendo gravadas.'; return e.returnValue; }
   if (temValidacaoNaoSalva()) { e.preventDefault(); e.returnValue = 'Deseja sair sem salvar a validação?'; return e.returnValue; }
 });
 
@@ -2819,17 +2857,25 @@ async function processarNotasFiscais(entrada, progressBoxId = 'progressNFeBox') 
     const nfesDuplicadas = nfes.length - nfesNovas.length;
     const agoraNfe = new Date().toISOString();
     let gravacaoNfe = null;
+    STATE._gravandoNfes = true;
     try {
-      gravacaoNfe = await comTimeout(DataLayer.salvarNfesEmLote(nfes.map(n => ({ ...n, arquivoOrigem: nomeLote, importadoEm: agoraNfe }))), 60000, 'salvar as notas fiscais');
+      gravacaoNfe = await DataLayer.salvarNfesEmLote(nfes.map(n => ({ ...n, arquivoOrigem: nomeLote, importadoEm: agoraNfe })), (feitos, total, falhas) => {
+        progressBox.classList.remove('hidden');
+        progressBox.textContent = `Gravando as notas no banco… ${feitos}/${total} grupo(s)${falhas ? ` (${falhas} com erro)` : ''} — não feche nem recarregue a página até terminar.`;
+      });
     } catch (e) {
       console.error('[NF-e global] falha ao salvar:', e);
-      toast(mensagemErroFirebase(e, 'salvar as notas fiscais'), 'error');
+      toast(/resource-exhausted|quota/i.test((e.code || '') + e.message) ? mensagemErroFirebase(e, 'salvar todas as notas fiscais') : 'Não foi possível salvar todas as notas: ' + e.message, 'error');
+      gravacaoNfe = e.parcial || null;
+    } finally {
+      STATE._gravandoNfes = false;
     }
     const qtdFluxoLidas = nfes.filter(n => n.fluxo).length;
     const txtGravacao = gravacaoNfe
       ? ` Salvas automaticamente: ${gravacaoNfe.novas} nova(s)${gravacaoNfe.completadas ? `, ${gravacaoNfe.completadas} já existente(s) atualizada(s) com as observações` : ''}${gravacaoNfe.jaExistiam ? `, ${gravacaoNfe.jaExistiam} já estavam salvas` : ''}.`
       : '';
-    const txtFluxo = ` ${qtdFluxoLidas} com "FLUXO" nas observações (reposição).`;
+    const numsLidos = nfes.map(n => parseInt(n.nNF, 10)).filter(n => !isNaN(n)).sort((a, b) => a - b);
+    const txtFluxo = ` ${qtdFluxoLidas} com "FLUXO" nas observações (reposição).${numsLidos.length ? ` Notas lidas: NF ${numsLidos[0]} a ${numsLidos[numsLidos.length - 1]}.` : ''}`;
 
     let resumoCubagem = null;
     if (temValidacaoAtiva) {
@@ -3081,6 +3127,17 @@ function renderResultadosValidacao() {
     <div id="progressNFeBox" class="hidden mb-4 bg-white rounded-xl border border-ink-100 p-3 text-xs text-ink-500"></div>
     ${vAtual.naoSalvo && !vAtual.historicoId ? `<div class="mb-4 text-xs px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200">Esta validação <strong>ainda não foi salva</strong>. Confira os resultados e clique em <strong>Salvar validação</strong> pra registrar no Histórico — só depois de salvar os CT-es passam a ser bloqueados como duplicados em importações futuras.</div>` : ''}
 
+    ${(() => {
+      const semObs = vAtual.resultados.filter(r => r.notaSemObs && !r.reposicao);
+      if (!semObs.length) return '';
+      const nums = Array.from(new Set(semObs.flatMap(r => (r.cte.notasFiscais || []).map(n => n.numero)))).sort((a, b) => a - b);
+      STATE._nfsSemObs = nums;
+      return `<div class="mb-4 text-xs px-3 py-2.5 rounded-lg bg-red-50 text-red-800 border border-red-200 flex flex-wrap items-center gap-2">
+        <span>⚠ <strong>${semObs.length} CT-e(s)</strong> casaram com notas fiscais importadas <strong>antes</strong> da leitura das observações — o site ainda não sabe se elas têm "FLUXO" (reposição). Reimporte os XMLs dessas ${nums.length} nota(s) (NF ${nums[0]} a ${nums[nums.length - 1]}) e clique em <strong>Recalcular</strong>.</span>
+        <button id="btnCopiarNfsSemObs" class="ml-auto text-red-700 font-semibold underline">Copiar números das NF</button>
+      </div>`;
+    })()}
+
     ${renderBarraFiltros(vAtual, filtrosRes, qtdFiltrada, qtdTotalLote)}
 
     ${renderResumoFinanceiro(resumoFin)}
@@ -3139,6 +3196,11 @@ function renderResultadosValidacao() {
   if (btnLimpar) btnLimpar.addEventListener('click', () => { STATE._filtrosRes = {}; renderResultadosValidacao(); });
 
   $('#btnRecalcular').addEventListener('click', recalcularLoteAtual);
+  const btnCopiarNfs = $('#btnCopiarNfsSemObs');
+  if (btnCopiarNfs) btnCopiarNfs.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText((STATE._nfsSemObs || []).join('\n')); toast(`${(STATE._nfsSemObs || []).length} número(s) de NF copiado(s).`, 'success'); }
+    catch (e) { toast('Não consegui copiar — veja a lista no console (F12).', 'warn'); console.log((STATE._nfsSemObs || []).join('\n')); }
+  });
   const btnSalvarVal = $('#btnSalvarValidacao');
   if (btnSalvarVal) btnSalvarVal.addEventListener('click', salvarValidacaoAtual);
   const inpFatura = $('#numeroFatura');
