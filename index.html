@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-09-30-nfe-grandes-lotes';
+const APP_VERSION = '2026-09-30-reposicao-palavras';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -261,14 +261,51 @@ function fmtDia(iso) {
   try { return new Date(iso).toLocaleDateString('pt-BR'); } catch { return iso; }
 }
 // "FLUXO" nas observações da nota = reposição (produto reenviado ao cliente por conta da TBX)
-function textoTemFluxo(txt) {
-  return /\bFLUXO\b/.test((txt || '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase());
+// Reposição é identificada pela palavra "FLUXO" OU por "REPOSIÇÃO" — esta digitada à mão,
+// então aceita variações e erros comuns: sem acento, Ç/C/S/SS/Z trocados, letra faltando ou
+// trocada (ex: REPOSICAO, REPOSISAO, REPOSSIÇÃO, REPOZICAO, REPOSCAO, REPOSIÇOES, REPISIÇÃO, REP0SICAO).
+function normTextoBusca(txt) {
+  return (txt || '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase()
+    .replace(/(?<=[A-Z])0|0(?=[A-Z])/g, 'O'); // zero digitado no lugar de O
 }
+function distanciaEdicao(a, b) {
+  const m = a.length, n = b.length;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[n];
+}
+function palavraIndicaReposicao(tok) {
+  if (/^FLUXOS?$/.test(tok)) return true;
+  if (tok.length < 7 || tok.length > 12 || !tok.startsWith('RE')) return false;
+  if (/^(REPOSITOR|RECEPC|REPOST|REPASS|REPOSICION|REPORT|REPETIC|REQUISIC|REPARTIC|REVISA|RELACA|REDACA|REMOCA|REPROVA|REPRODU|RESCISA|REVOGA)/.test(tok)) return false; // palavras parecidas que não são reposição
+  if (/^REPO[SZC]{1,2}I?[CSZ]{1,2}[AO]{1,3}(ES|S)?$/.test(tok)) return true;
+  const base = tok.replace(/(OES|ES|S)$/, '');
+  return distanciaEdicao(base, 'REPOSICAO') <= 2 || distanciaEdicao(tok, 'REPOSICOES') <= 2;
+}
+function posicaoReposicao(txt) {
+  const norm = normTextoBusca(txt);
+  const re = /[A-Z]+/g; let m;
+  while ((m = re.exec(norm))) { if (palavraIndicaReposicao(m[0])) return m.index; }
+  return -1;
+}
+function textoTemFluxo(txt) { return posicaoReposicao(txt) >= 0; }
 function trechoFluxo(txt) {
   const t = (txt || '').toString().replace(/\s+/g, ' ');
-  const i = t.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().search(/\bFLUXO\b/);
+  const i = posicaoReposicao(t);
   if (i < 0) return null;
   return (i > 60 ? '…' : '') + t.slice(Math.max(0, i - 60), i + 80) + (i + 80 < t.length ? '…' : '');
+}
+// Reposição: o cliente NUNCA paga esse frete — frete do cliente = 0 e o valor cobrado inteiro é
+// prejuízo, mesmo que a NF tenha frete destacado. O valor da NF fica guardado só como referência.
+function aplicarRegraReposicao(r) {
+  if (!r || !('cobrado' in r) || !ehReposicao(r)) return;
+  if (r.valorFreteCliente != null && r.valorFreteCliente !== 0 && r.freteNfOriginal == null) r.freteNfOriginal = r.valorFreteCliente;
+  r.valorFreteCliente = 0;
+  r.divergenciaCliente = clamp2(0 - (r.cobrado || 0));
 }
 // Devolução e reposição: prejuízo total (a TBX paga o frete inteiro, o cliente não paga nada)
 function ehPrejuizoTotal(r) { return r.tipoOperacao === 'devolucao' || !!r.reposicao; }
@@ -1387,6 +1424,7 @@ function aplicarPlanilhaNosItens(itens, mapa) {
     if (nota.pedido) x.pedido = nota.pedido;
     if (nota.fluxo && 'cobrado' in x) { x.reposicao = true; x.obsFluxo = x.obsFluxo || nota.obsFluxo || 'FLUXO (planilha de notas)'; }
     if ('fluxo' in nota && 'cobrado' in x) x.notaSemObs = false; // planilha com observações lidas também vale como conferida
+    aplicarRegraReposicao(x);
     if ('cobrado' in x) {
       if ((x.valorFreteCliente === null || x.valorFreteCliente === undefined) && nota.frete !== null && nota.frete !== undefined) {
         x.valorFreteCliente = nota.frete;
@@ -1433,7 +1471,8 @@ function calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFlu
       temAlgumaNfe = true;
     }
     if (typeof analisadoSemErro === 'function' && analisadoSemErro(r)) {
-      if (ehPrejuizoTotal(r)) { ajusteSemErro += r.cobrado || 0; qtdSemErro++; }
+      if (ehReposicao(r)) { /* reposição é sempre prejuízo — "Sem erro" não neutraliza */ }
+      else if (ehPrejuizoTotal(r)) { ajusteSemErro += r.cobrado || 0; qtdSemErro++; }
       else if (r.valorFreteCliente != null) { ajusteSemErro += (r.cobrado || 0) - r.valorFreteCliente; qtdSemErro++; }
     }
   });
@@ -1486,6 +1525,8 @@ function enriquecerComNotasFiscais(resultados, nfes) {
     r.notaSemObs = !fluxoNota && !!nfeEncontrada && !('fluxo' in nfeEncontrada) && !(nfeEncontrada.chave in memFluxo);
     r.reposicao = fluxoNota || !!r.reposicaoCte;
     r.obsFluxo = fluxoNota ? (notaComFluxo.obsFluxo || memFluxo[notaComFluxo.chave] || 'FLUXO') : (r.reposicaoCte ? r.obsFluxo : null);
+    if (!r.reposicao) r.freteNfOriginal = null;
+    aplicarRegraReposicao(r);
   });
   return { casados, total: resultados.length, nfesLidas: nfes.length };
 }
@@ -1998,6 +2039,7 @@ function validarLoteCtes(ctes, parceiros) {
       reposicao: reposicaoCte,
       obsFluxo: reposicaoCte ? (trechoFluxo(obsCte) + ' (observação do CT-e)') : null,
     });
+    aplicarRegraReposicao(resultados[resultados.length - 1]);
   }
   return { resultados, semParceiro, outrosFluxos, reentregas };
 }
@@ -2485,6 +2527,7 @@ function trimResultadoParaHistorico(r) {
     pedido: r.pedido ?? null,
     reposicao: !!r.reposicao,
     reposicaoCte: !!r.reposicaoCte,
+    freteNfOriginal: r.freteNfOriginal ?? null,
     obsFluxo: r.obsFluxo ?? null,
   };
 }
@@ -2875,7 +2918,7 @@ async function processarNotasFiscais(entrada, progressBoxId = 'progressNFeBox') 
       ? ` Salvas automaticamente: ${gravacaoNfe.novas} nova(s)${gravacaoNfe.completadas ? `, ${gravacaoNfe.completadas} já existente(s) atualizada(s) com as observações` : ''}${gravacaoNfe.jaExistiam ? `, ${gravacaoNfe.jaExistiam} já estavam salvas` : ''}.`
       : '';
     const numsLidos = nfes.map(n => parseInt(n.nNF, 10)).filter(n => !isNaN(n)).sort((a, b) => a - b);
-    const txtFluxo = ` ${qtdFluxoLidas} com "FLUXO" nas observações (reposição).${numsLidos.length ? ` Notas lidas: NF ${numsLidos[0]} a ${numsLidos[numsLidos.length - 1]}.` : ''}`;
+    const txtFluxo = ` ${qtdFluxoLidas} com "FLUXO" ou "REPOSIÇÃO" nas observações (reposição).${numsLidos.length ? ` Notas lidas: NF ${numsLidos[0]} a ${numsLidos[numsLidos.length - 1]}.` : ''}`;
 
     let resumoCubagem = null;
     if (temValidacaoAtiva) {
@@ -3011,7 +3054,7 @@ function analisadoSemErro(r) {
   return !!(rev && rev.classificacao === 'sem_erro');
 }
 function divergenciaEfetiva(r) { return analisadoSemErro(r) && r.divergencia !== null && r.divergencia !== undefined ? 0 : r.divergencia; }
-function margemClienteEfetiva(r) { return analisadoSemErro(r) && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined ? 0 : r.divergenciaCliente; }
+function margemClienteEfetiva(r) { if (ehReposicao(r)) return r.divergenciaCliente; return analisadoSemErro(r) && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined ? 0 : r.divergenciaCliente; }
 
 // ----- Filtros da tela de resultados (canal, parceiro, UF, busca livre) -----
 function normBusca(s) { return (s ?? '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase(); }
@@ -3133,7 +3176,7 @@ function renderResultadosValidacao() {
       const nums = Array.from(new Set(semObs.flatMap(r => (r.cte.notasFiscais || []).map(n => n.numero)))).sort((a, b) => a - b);
       STATE._nfsSemObs = nums;
       return `<div class="mb-4 text-xs px-3 py-2.5 rounded-lg bg-red-50 text-red-800 border border-red-200 flex flex-wrap items-center gap-2">
-        <span>⚠ <strong>${semObs.length} CT-e(s)</strong> casaram com notas fiscais importadas <strong>antes</strong> da leitura das observações — o site ainda não sabe se elas têm "FLUXO" (reposição). Reimporte os XMLs dessas ${nums.length} nota(s) (NF ${nums[0]} a ${nums[nums.length - 1]}) e clique em <strong>Recalcular</strong>.</span>
+        <span>⚠ <strong>${semObs.length} CT-e(s)</strong> casaram com notas fiscais importadas <strong>antes</strong> da leitura das observações — o site ainda não sabe se elas têm "FLUXO"/"REPOSIÇÃO". Reimporte os XMLs dessas ${nums.length} nota(s) (NF ${nums[0]} a ${nums[nums.length - 1]}) e clique em <strong>Recalcular</strong>.</span>
         <button id="btnCopiarNfsSemObs" class="ml-auto text-red-700 font-semibold underline">Copiar números das NF</button>
       </div>`;
     })()}
@@ -3349,7 +3392,7 @@ function renderTabelaResultados(lista, filtro) {
   const nfsTxt = (r) => (r.cte.notasFiscais || []).map(n => n.numero).join(', ') || '—';
   const bannerDevolucao = filtro === 'reposicao' ? `
     <div class="mb-4 text-xs px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200">
-      <strong>Reposição é prejuízo direto, igual devolução</strong> — a nota fiscal do cliente tem "FLUXO" nas observações (produto reenviado por conta da TBX). O cliente não paga esse frete, então a coluna "Prejuízo" mostra o <strong>valor total cobrado</strong> pela transportadora e ele não entra no "Cliente pagou" do Faturado. O cálculo contra a tabela continua disponível em "Detalhes".
+      <strong>Reposição é prejuízo direto, igual devolução</strong> — a nota fiscal do cliente tem "FLUXO" ou "REPOSIÇÃO" (em qualquer grafia) nas observações — produto reenviado por conta da TBX. O cliente não paga esse frete, então a coluna "Prejuízo" mostra o <strong>valor total cobrado</strong> pela transportadora e ele não entra no "Cliente pagou" do Faturado. O cálculo contra a tabela continua disponível em "Detalhes".
     </div>` : ehDevolucao ? `
     <div class="mb-4 text-xs px-3 py-2.5 rounded-lg bg-brand-50 text-brand-800 border border-brand-200">
       <strong>Devolução/reversa é prejuízo direto</strong> — o Grupo TBX paga esse frete do próprio bolso, sem repasse pro cliente. Por isso, a coluna "Prejuízo" abaixo mostra o <strong>valor total cobrado</strong> pela transportadora, não a diferença contra a tabela. O "Calculado" continua útil só pra conferir se a transportadora está cobrando certo (e não a mais) — não é o valor do prejuízo em si.
@@ -3873,7 +3916,7 @@ function abrirDetalheCte(idx) {
     const partes = [];
     if (r.nfeVinculada) partes.push(`Nota do cliente casada: NF ${escapeHtml(r.nfeVinculada.nNF || '')} (${r.nfeVinculada.fonte === 'planilha' ? 'planilha Excel' : 'XML da NF-e'})`);
     else partes.push('Nenhuma nota do cliente (XML ou planilha) casada com este CT-e ainda');
-    partes.push(r.reposicao ? `<strong class="text-amber-700">REPOSIÇÃO</strong> — ${escapeHtml(r.obsFluxo || 'FLUXO')}` : '"FLUXO" não encontrado nas observações da nota/CT-e');
+    partes.push(r.reposicao ? `<strong class="text-amber-700">REPOSIÇÃO</strong> — ${escapeHtml(r.obsFluxo || 'FLUXO')}` : '"FLUXO"/"REPOSIÇÃO" não encontrado nas observações da nota/CT-e');
     return `<div class="mt-1.5 text-[11px] text-ink-400 bg-ink-50 border border-ink-200 rounded-lg px-2.5 py-1.5">${partes.join(' · ')}</div>`;
   })();
   const avisoReconciliacao = reconciliacao.temPendencia ? `
@@ -3935,7 +3978,10 @@ function abrirDetalheCte(idx) {
           ${r.divergencia===null ? 'Não foi possível calcular (ver status).' : r.divergencia>0.05 ? `Cobrado R$ ${fmtNum(r.divergencia)} a mais do que o calculado pela tabela.` : r.divergencia<-0.05 ? `Cobrado R$ ${fmtNum(Math.abs(r.divergencia))} a menos do que o calculado (a favor do Grupo TBX).` : 'Valor confere com a tabela negociada.'}
           ${subtotalDiverge ? `<div class="mt-1 ${r.divergencia>0.05||r.divergencia<-0.05?'':'text-red-700'}">Olhando só o subtotal (sem o efeito do ICMS): ${subtotalCobrado - r.calc.subtotalCalculado > 0 ? 'cobrado' : 'calculado'} R$ ${fmtNum(Math.abs(subtotalCobrado - r.calc.subtotalCalculado))} a mais nos componentes de frete em si — é aí que está a causa, o ICMS só amplia essa diferença proporcionalmente.</div>` : ''}
         </div>
-        ${r.valorFreteCliente != null ? `
+        ${ehReposicao(r) ? `
+        <div class="mt-3 text-xs px-3 py-2 rounded-lg bg-amber-50 text-amber-800 border border-amber-200">
+          ⚠ <strong>Reposição</strong> — o cliente não paga esse frete: frete do cliente considerado <strong>R$ 0,00</strong>${r.freteNfOriginal ? ` (a NF tinha ${fmtBRL(r.freteNfOriginal)} destacado, desconsiderado)` : ''} e o valor cobrado inteiro, <strong>${fmtBRL(r.cobrado)}</strong>, é prejuízo.
+        </div>` : r.valorFreteCliente != null ? `
         <div class="mt-3 text-xs px-3 py-2 rounded-lg ${r.divergenciaCliente < -0.05 ? 'bg-red-50 text-red-700' : r.divergenciaCliente > 0.05 ? 'bg-emerald-50 text-emerald-700' : 'bg-ink-50 text-ink-600'}">
           ${r.divergenciaCliente < -0.05
             ? `⚠ O cliente pagou R$ ${fmtNum(Math.abs(r.divergenciaCliente))} a menos de frete do que a transportadora cobrou da TBX — prejuízo nesse frete.`
