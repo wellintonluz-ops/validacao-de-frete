@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-09-29-analise-sem-erro-cota';
+const APP_VERSION = '2026-09-30-salvar-manual';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -1179,11 +1179,20 @@ function calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFlu
   let totalCobrado = 0;
   let totalClientePagou = 0;
   let temAlgumaNfe = false;
+  // CT-e analisado como "Sem erro": a diferença entre o que o cliente pagou e o que a
+  // transportadora cobrou já está explicada (desconto, custo previsto…) -> neutraliza no
+  // Faturado, pra mais ou pra menos. Em devolução (cliente não paga nada) neutraliza o cobrado.
+  let ajusteSemErro = 0;
+  let qtdSemErro = 0;
   resultados.forEach(r => {
     totalCobrado += r.cobrado || 0;
     if (r.tipoOperacao !== 'devolucao' && r.valorFreteCliente != null) {
       totalClientePagou += r.valorFreteCliente;
       temAlgumaNfe = true;
+    }
+    if (typeof analisadoSemErro === 'function' && analisadoSemErro(r)) {
+      if (r.tipoOperacao === 'devolucao') { ajusteSemErro += r.cobrado || 0; qtdSemErro++; }
+      else if (r.valorFreteCliente != null) { ajusteSemErro += (r.cobrado || 0) - r.valorFreteCliente; qtdSemErro++; }
     }
   });
   (reentregas || []).forEach(x => { totalCobrado += x.cte.vTPrest || 0; });
@@ -1192,7 +1201,9 @@ function calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFlu
   return {
     totalCobrado: clamp2(totalCobrado),
     totalClientePagou: clamp2(totalClientePagou),
-    faturado: clamp2(totalClientePagou - totalCobrado),
+    ajusteSemErro: clamp2(ajusteSemErro),
+    qtdSemErro,
+    faturado: clamp2(totalClientePagou - totalCobrado + ajusteSemErro),
     temAlgumaNfe,
   };
 }
@@ -1954,6 +1965,7 @@ async function carregarRevisoes() {
     const lista = await DataLayer.listRevisoes();
     STATE.revisoes = {};
     lista.forEach(r => { STATE.revisoes[r.chave] = r; });
+    STATE._revisoesCarregadas = true;
     atualizarBadgeTratativas();
   } catch (e) {
     console.error(e);
@@ -1985,9 +1997,9 @@ async function boot() {
 
 document.addEventListener('DOMContentLoaded', () => {
   initFirebase();
-  $$('.nav-btn').forEach(b => b.addEventListener('click', () => goToView(b.dataset.view)));
+  $$('.nav-btn').forEach(b => b.addEventListener('click', async () => { if (await podeSairDaValidacao()) goToView(b.dataset.view); }));
   $('#btnGoogleLogin').addEventListener('click', doLogin);
-  $('#btnLogout').addEventListener('click', doLogout);
+  $('#btnLogout').addEventListener('click', async () => { if (await podeSairDaValidacao()) doLogout(); });
   const versaoEl = $('#appVersionLabel');
   if (versaoEl) versaoEl.textContent = 'v' + APP_VERSION;
   console.log('[Validador de Fretes] versão carregada:', APP_VERSION);
@@ -2253,6 +2265,7 @@ function montarRegistroHistorico(nomeLote, v) {
     duplicadosIgnorados,
     totalCobrado: resumoFin.totalCobrado,
     totalClientePagou: resumoFin.totalClientePagou,
+    ajusteSemErro: resumoFin.ajusteSemErro,
     faturado: resumoFin.faturado,
   };
   return {
@@ -2268,6 +2281,27 @@ function montarRegistroHistorico(nomeLote, v) {
 // Recalcula o lote que está aberto na tela (recém-validado ou reaberto pelo Histórico)
 // com o cadastro ATUAL dos parceiros — sem precisar subir os XMLs de novo (que agora
 // seriam bloqueados como duplicados). Atualiza a tela, o Histórico e os CT-es salvos.
+// Recalcula o resumo (divergências, Faturado…) do lote aberto e grava no Histórico se mudou —
+// usado quando uma análise "Sem erro" muda o que conta como diferença.
+async function atualizarResumoDoLoteNoHistorico() {
+  const v = STATE.ultimaValidacao;
+  if (!v || !v.historicoId || !v.resultados?.length) return;
+  // sem as análises carregadas não dá pra saber quem é "Sem erro" — não mexe no Histórico
+  if (!STATE._revisoesCarregadas) return;
+  const novo = montarRegistroHistorico(v.nomeArquivo, v).resumo;
+  const campos = ['qtdDivergenciaMaior', 'qtdDivergenciaMenor', 'valorDivergenteMaior', 'valorDivergenteMenor', 'totalCobrado', 'totalClientePagou', 'faturado', 'ajusteSemErro'];
+  const anterior = v._resumoGravado || {};
+  if (campos.every(k => anterior[k] === novo[k])) return;
+  const patch = {}; campos.forEach(k => { patch[k] = novo[k] ?? null; });
+  try {
+    await comTimeout(DataLayer.atualizarResumoHistorico(v.historicoId, patch), 20000, 'atualizar o Histórico');
+    v._resumoGravado = { ...anterior, ...patch };
+  } catch (e) {
+    console.error('[Histórico] falha ao atualizar resumo:', e);
+    toast(mensagemErroFirebase(e, 'atualizar o Faturado no Histórico'), 'warn');
+  }
+}
+
 async function recalcularLoteAtual() {
   const v = STATE.ultimaValidacao;
   if (!v || !v.resultados?.length) { toast('Nenhum lote aberto pra recalcular.', 'warn'); return; }
@@ -2307,10 +2341,8 @@ async function recalcularLoteAtual() {
     const registro = montarRegistroHistorico(v.nomeArquivo, v);
     if (v.historicoId) {
       await DataLayer.substituirValidacao(v.historicoId, registro).catch(e => { console.error(e); toast('Recalculado na tela, mas não consegui atualizar o Histórico. Detalhe no console (F12).', 'error'); });
-    } else {
-      const salvo = await DataLayer.saveValidacao(registro).catch(e => { console.error(e); return null; });
-      v.historicoId = salvo?.id || null;
     }
+    // (se ainda não foi salva, o recálculo fica só na tela até clicar em "Salvar validação")
     // (os CT-es em 'ctes' servem só pro bloqueio de duplicados — não precisam ser regravados
     //  a cada recálculo; o detalhe atualizado fica no Histórico. Economiza centenas de gravações.)
 
@@ -2324,8 +2356,110 @@ async function recalcularLoteAtual() {
   }
 }
 
+// ----- Salvar a validação manualmente -----
+function temValidacaoNaoSalva() {
+  const v = STATE.ultimaValidacao;
+  return !!(v && v.naoSalvo && !v.historicoId && (v.resultados?.length || v.semParceiro?.length || v.reentregas?.length || v.outrosFluxos?.length));
+}
+
+async function salvarValidacaoAtual() {
+  const v = STATE.ultimaValidacao;
+  if (!v) return false;
+  if (v.historicoId) { toast('Essa validação já está salva no Histórico.', 'info'); return true; }
+  if (STATE._salvandoValidacao) return false;
+  STATE._salvandoValidacao = true;
+  const btn = $('#btnSalvarValidacao');
+  if (btn) { btn.disabled = true; btn.textContent = 'Salvando…'; }
+  const { resultados, semParceiro = [], outrosFluxos = [], reentregas = [] } = v;
+  const nomeLote = v.nomeArquivo;
+  try {
+    // confere de novo quem já está no banco (alguém da equipe pode ter salvo o mesmo CT-e
+    // enquanto esta validação estava aberta) — mantém sempre o primeiro registro
+    const todasChaves = [...resultados.map(r => r.cte.chave), ...semParceiro.map(c => c.chave), ...outrosFluxos.map(x => x.cte.chave), ...reentregas.map(x => x.cte.chave)];
+    const jaNoBanco = await comTimeout(DataLayer.chavesExistentes('ctes', todasChaves), 30000, 'conferir duplicados');
+    const agora = new Date().toISOString();
+    const paraSalvarGlobal = [
+      ...resultados.filter(r => r.cte.chave).map(r => ({ chave: r.cte.chave, ...trimResultadoParaHistorico(r), categoria: 'validado' })),
+      ...semParceiro.filter(c => c.chave).map(c => ({ chave: c.chave, nCT: c.nCT, dhEmi: c.dhEmi, emitNome: c.emitNome, emitCNPJ: c.emitCNPJ, destMun: c.destMun, destUF: c.destUF, vTPrest: c.vTPrest, categoria: 'sem_parceiro' })),
+      ...outrosFluxos.filter(x => x.cte.chave).map(x => ({ chave: x.cte.chave, nCT: x.cte.nCT, dhEmi: x.cte.dhEmi, parceiroNome: x.parceiro.nome, xMunIni: x.cte.xMunIni, UFIni: x.cte.UFIni, xMunFim: x.cte.xMunFim, UFFim: x.cte.UFFim, vTPrest: x.cte.vTPrest, categoria: 'trajeto_atipico' })),
+      ...reentregas.filter(x => x.cte.chave).map(x => ({ chave: x.cte.chave, nCT: x.cte.nCT, dhEmi: x.cte.dhEmi, parceiroNome: x.parceiro.nome, destMun: x.cte.destMun, destUF: x.cte.destUF, vTPrest: x.cte.vTPrest, categoria: 'reentrega' })),
+    ].filter(o => !jaNoBanco.has(o.chave)).map(o => ({ ...o, arquivoOrigem: nomeLote, importadoEm: agora }));
+
+    const registro = montarRegistroHistorico(nomeLote, v);
+    let salvo;
+    try {
+      salvo = await comTimeout(DataLayer.saveValidacao(registro), 60000, 'salvar no Histórico');
+    } catch (e) {
+      console.error(e);
+      if (/resource-exhausted|quota|timeout|permission/i.test((e.code || '') + (e.message || ''))) throw e;
+      // falha por outro motivo (ex: tamanho) — tenta só com o resumo
+      salvo = await comTimeout(DataLayer.saveValidacao({ nomeArquivo: nomeLote, resumo: registro.resumo, detalheDisponivel: false }), 30000, 'salvar no Histórico');
+      toast('Salvo no Histórico só com o resumo (o detalhe linha a linha não coube). Detalhe no console (F12).', 'warn');
+    }
+    v.historicoId = salvo?.id || null;
+    v.naoSalvo = false;
+    v._resumoGravado = { ...registro.resumo };
+    const ignorados = todasChaves.filter(Boolean).length - paraSalvarGlobal.length;
+    try {
+      await comTimeout(DataLayer.salvarCtesEmLote(paraSalvarGlobal), 60000, 'registrar os CT-es');
+      toast(`Validação salva no Histórico${ignorados > 0 ? ` (${ignorados} CT-e(s) já estavam registrados por outra validação — mantido o primeiro)` : ''}.`, 'success');
+    } catch (e) {
+      console.error('[CT-e global] falha ao salvar:', e);
+      toast('Validação salva no Histórico, mas não consegui registrar os CT-es pro bloqueio de duplicados. ' + mensagemErroFirebase(e, 'registrar os CT-es'), 'warn');
+    }
+    renderResultadosValidacao();
+    return true;
+  } catch (e) {
+    console.error(e);
+    toast(mensagemErroFirebase(e, 'salvar a validação'), 'error');
+    const b = $('#btnSalvarValidacao');
+    if (b) { b.disabled = false; b.textContent = 'Salvar validação'; }
+    return false;
+  } finally {
+    STATE._salvandoValidacao = false;
+  }
+}
+
+// Pergunta o que fazer com a validação não salva. Resolve 'salvar' | 'descartar' | 'cancelar'.
+function perguntarSobreValidacaoNaoSalva(texto, rotuloDescartar = 'Sair sem salvar') {
+  return new Promise(resolve => {
+    const wrap = document.createElement('div');
+    wrap.className = 'fixed inset-0 z-[60] bg-ink-900/40 flex items-center justify-center p-4';
+    wrap.innerHTML = `
+      <div class="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6">
+        <div class="text-base font-semibold text-ink-900 mb-1">Validação não salva</div>
+        <p class="text-sm text-ink-500 mb-5">${escapeHtml(texto)}</p>
+        <div class="flex flex-wrap justify-end gap-2">
+          <button data-r="cancelar" class="px-3 py-2 rounded-lg text-sm text-ink-600 hover:bg-ink-50">Cancelar</button>
+          <button data-r="descartar" class="px-3 py-2 rounded-lg text-sm font-medium text-red-600 border border-red-200 hover:bg-red-50">${escapeHtml(rotuloDescartar)}</button>
+          <button data-r="salvar" class="px-3 py-2 rounded-lg text-sm font-medium text-white bg-ink-900 hover:bg-ink-800">Salvar e continuar</button>
+        </div>
+      </div>`;
+    const fim = (r) => { wrap.remove(); document.removeEventListener('keydown', esc); resolve(r); };
+    const esc = (e) => { if (e.key === 'Escape') fim('cancelar'); };
+    wrap.addEventListener('click', (e) => { const b = e.target.closest('[data-r]'); if (b) fim(b.dataset.r); else if (e.target === wrap) fim('cancelar'); });
+    document.addEventListener('keydown', esc);
+    document.body.appendChild(wrap);
+  });
+}
+
+// true = pode seguir (salvou, descartou ou não tinha nada pendente); false = ficar na tela
+async function podeSairDaValidacao(texto = 'Deseja sair sem salvar a validação?', rotuloDescartar) {
+  if (!temValidacaoNaoSalva()) return true;
+  const resp = await perguntarSobreValidacaoNaoSalva(texto, rotuloDescartar);
+  if (resp === 'cancelar') return false;
+  if (resp === 'salvar') return await salvarValidacaoAtual();
+  STATE.ultimaValidacao = null; // descartou
+  return true;
+}
+
+window.addEventListener('beforeunload', (e) => {
+  if (temValidacaoNaoSalva()) { e.preventDefault(); e.returnValue = 'Deseja sair sem salvar a validação?'; return e.returnValue; }
+});
+
 async function processarZip(entrada) {
   const nomeLote = nomeDoLote(entrada);
+  if (!(await podeSairDaValidacao('Existe uma validação que ainda não foi salva. Deseja descartá-la e importar os novos arquivos?', 'Descartar e importar'))) return;
   if (STATE.parceiros.length === 0) {
     toast('Cadastre pelo menos um parceiro antes de validar.', 'warn');
     return;
@@ -2393,31 +2527,10 @@ async function processarZip(entrada) {
       toast(`CT-es casados automaticamente com notas já salvas: ${partes.join(' · ')}.`, 'success');
     }
 
-    // persiste globalmente (por chave, dedupicado) — é isso que permite bloquear
-    // reimportação em qualquer upload futuro, não só dentro desse mesmo lote
-    const agora = new Date().toISOString();
-    const paraSalvarGlobal = [
-      ...resultados.filter(r => r.cte.chave).map(r => ({ chave: r.cte.chave, ...trimResultadoParaHistorico(r), categoria: 'validado' })),
-      ...semParceiro.filter(c => c.chave).map(c => ({ chave: c.chave, nCT: c.nCT, dhEmi: c.dhEmi, emitNome: c.emitNome, emitCNPJ: c.emitCNPJ, destMun: c.destMun, destUF: c.destUF, vTPrest: c.vTPrest, categoria: 'sem_parceiro' })),
-      ...outrosFluxos.filter(x => x.cte.chave).map(x => ({ chave: x.cte.chave, nCT: x.cte.nCT, dhEmi: x.cte.dhEmi, parceiroNome: x.parceiro.nome, xMunIni: x.cte.xMunIni, UFIni: x.cte.UFIni, xMunFim: x.cte.xMunFim, UFFim: x.cte.UFFim, vTPrest: x.cte.vTPrest, categoria: 'trajeto_atipico' })),
-      ...reentregas.filter(x => x.cte.chave).map(x => ({ chave: x.cte.chave, nCT: x.cte.nCT, dhEmi: x.cte.dhEmi, parceiroNome: x.parceiro.nome, destMun: x.cte.destMun, destUF: x.cte.destUF, vTPrest: x.cte.vTPrest, categoria: 'reentrega' })),
-    ].map(o => ({ ...o, arquivoOrigem: nomeLote, importadoEm: agora }));
-    await DataLayer.salvarCtesEmLote(paraSalvarGlobal).catch(e => {
-      console.error('[CT-e global] falha ao salvar:', e);
-      toast('Falha ao gravar os CT-es no banco (o bloqueio de duplicados não vai valer pra este lote). Detalhe no console (F12).', 'error');
-    });
-
-    // salva resumo no histórico
-    const registro = montarRegistroHistorico(nomeLote, { resultados, semParceiro, outrosFluxos, reentregas, duplicadosIgnorados: ctesDuplicados.length });
-    const salvo = await DataLayer.saveValidacao(registro).catch(async (e) => {
-      console.error(e);
-      toast('Não foi possível salvar o detalhe do lote no histórico — salvando só o resumo. Detalhe do erro no console (F12).', 'warn');
-      // se falhar por tamanho, tenta de novo só com o resumo
-      return DataLayer.saveValidacao({ nomeArquivo: nomeLote, resumo: registro.resumo, detalheDisponivel: false }).catch(e2 => console.error(e2));
-    });
-    // guarda o id desse lote — se importar NF-e depois, atualiza o resumo financeiro
-    // desse mesmo registro no histórico em vez de deixar desatualizado
-    STATE.ultimaValidacao.historicoId = salvo?.id || null;
+    // NÃO grava mais sozinho: a validação fica pendente até clicar em "Salvar validação"
+    // (e só então os CT-es entram no bloqueio de duplicados e o lote vai pro Histórico).
+    STATE.ultimaValidacao.naoSalvo = true;
+    renderResultadosValidacao();
   } catch (e) {
     console.error(e);
     $('#progressBox').classList.add('hidden');
@@ -2558,6 +2671,12 @@ function renderResumoFinanceiro(r) {
             <div class="text-[11px] text-ink-400 font-medium uppercase tracking-wide">Cliente pagou (frete na NF-e)</div>
             <div class="text-xl font-bold num text-ink-800">${fmtBRL(r.totalClientePagou)}</div>
           </div>
+          ${r.qtdSemErro ? `
+          <div class="text-ink-300 text-xl">${r.ajusteSemErro >= 0 ? '+' : '−'}</div>
+          <div title="Soma das diferenças (cliente pagou × cobrado) dos CT-es analisados como Sem erro — já explicadas, então não contam no Faturado">
+            <div class="text-[11px] text-emerald-600 font-medium uppercase tracking-wide">Ajuste analisados sem erro (${r.qtdSemErro})</div>
+            <div class="text-xl font-bold num text-emerald-700">${fmtBRL(Math.abs(r.ajusteSemErro))}</div>
+          </div>` : ''}
           <div class="text-ink-300 text-xl">=</div>
           <div>
             <div class="text-[11px] text-ink-400 font-medium uppercase tracking-wide">Faturado</div>
@@ -2565,7 +2684,7 @@ function renderResumoFinanceiro(r) {
           </div>
         </div>
         <div class="text-[11px] text-ink-300 max-w-sm">
-          Faturado = Cliente pagou − Cobrado, sobre o lote inteiro. Devolução, reversa e reentrega entram só no "Cobrado" (o cliente não paga nada nesses casos).
+          Faturado = Cliente pagou − Cobrado${r.qtdSemErro ? ' + ajuste dos CT-es analisados como Sem erro (a diferença deles conta como zero)' : ''}, sobre o lote inteiro. Devolução, reversa e reentrega entram só no "Cobrado" (o cliente não paga nada nesses casos).
           <strong class="text-ink-400">Esse card já inclui tudo</strong> — não some com os números dos cards de "Cobrado a maior", "Devolução" etc. abaixo, eles são comparações diferentes (contra a tabela negociada, não contra o que o cliente pagou) e ficariam contados duas vezes.
           ${!r.temAlgumaNfe ? '<br><span class="text-amber-600">Ainda sem nenhuma nota fiscal casada — importe as NF-es pra esse número ficar completo.</span>' : ''}
         </div>
@@ -2672,6 +2791,11 @@ function renderResultadosValidacao() {
         ${resultados.length} CT-e(s) validado(s)${devolucoes.length ? ` (${devolucoes.length} devolução)` : ''}${semParceiro.length ? ` · ${semParceiro.length} sem parceiro cadastrado` : ''}${outrosFluxos.length ? ` · ${outrosFluxos.length} trajeto atípico` : ''}${reentregas.length ? ` · ${reentregas.length} reentrega` : ''}${nfeImportada ? ` · ${comNfe.length} com nota fiscal casada` : ''}${duplicadosIgnorados ? ` · <span class="text-amber-600">${duplicadosIgnorados} duplicado(s) ignorado(s)</span>` : ''}
       </div>
       <div class="flex items-center gap-4">
+        ${vAtual.historicoId
+          ? `<span class="text-sm font-medium text-emerald-700 flex items-center gap-1" title="Esta validação está no Histórico — análises, notas e recálculos feitos agora atualizam o registro salvo">✓ Salvo no Histórico</span>`
+          : vAtual.naoSalvo
+            ? `<button id="btnSalvarValidacao" class="text-sm font-semibold text-white bg-brand-600 hover:bg-brand-700 rounded-lg px-3 py-1.5 shadow-sm">Salvar validação</button>`
+            : ''}
         <button id="btnImportarNFe" class="text-sm font-medium text-ink-600 hover:text-ink-800 flex items-center gap-1.5">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
           ${nfeImportada ? 'Reimportar Notas Fiscais' : 'Importar Notas Fiscais'} <span class="text-ink-400 font-normal">(XML ou Excel)</span>
@@ -2687,6 +2811,7 @@ function renderResultadosValidacao() {
       </div>
     </div>
     <div id="progressNFeBox" class="hidden mb-4 bg-white rounded-xl border border-ink-100 p-3 text-xs text-ink-500"></div>
+    ${vAtual.naoSalvo && !vAtual.historicoId ? `<div class="mb-4 text-xs px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200">Esta validação <strong>ainda não foi salva</strong>. Confira os resultados e clique em <strong>Salvar validação</strong> pra registrar no Histórico — só depois de salvar os CT-es passam a ser bloqueados como duplicados em importações futuras.</div>` : ''}
 
     ${renderBarraFiltros(vAtual, filtrosRes, qtdFiltrada, qtdTotalLote)}
 
@@ -2745,6 +2870,8 @@ function renderResultadosValidacao() {
   if (btnLimpar) btnLimpar.addEventListener('click', () => { STATE._filtrosRes = {}; renderResultadosValidacao(); });
 
   $('#btnRecalcular').addEventListener('click', recalcularLoteAtual);
+  const btnSalvarVal = $('#btnSalvarValidacao');
+  if (btnSalvarVal) btnSalvarVal.addEventListener('click', salvarValidacaoAtual);
   $('#btnExportar').addEventListener('click', () => {
     const blob = exportResultadosParaXlsx(resultados, semParceiro, STATE.parceiros, outrosFluxos, reentregas);
     downloadBlob(blob, `Validacao_Fretes_${String(nomeArquivo).replace(/\.zip$/i,'').replace(/[\\/:*?"<>|]+/g,'_')}.xlsx`);
@@ -3198,8 +3325,11 @@ async function salvarAnaliseAtual(idx) {
     await DataLayer.saveRevisao(revisao);
     STATE.revisoes[revisao.chave] = revisao;
     atualizarBadgeTratativas();
-    toast(classificacao === 'sem_erro' ? 'Análise salva — marcado como analisado, diferença considerada R$ 0,00.' : 'Análise salva.', 'success');
-    if (STATE.ultimaValidacao) renderResultadosValidacao();
+    toast(classificacao === 'sem_erro' ? 'Análise salva — marcado como analisado, diferença considerada R$ 0,00 (inclusive no Faturado).' : 'Análise salva.', 'success');
+    if (STATE.ultimaValidacao) {
+      renderResultadosValidacao();
+      atualizarResumoDoLoteNoHistorico();
+    }
     const modalAberto = document.querySelector('.fixed.inset-0');
     if (modalAberto) modalAberto.remove();
     abrirDetalheCte(idx);
@@ -4538,6 +4668,7 @@ async function salvarParceiro() {
 // ---------------------------------------------------------------------
 // Reabre a tela de comparação (igual a aba Validar Fretes) a partir de um lote do histórico
 async function abrirHistoricoDetalhe(indice) {
+  if (!(await podeSairDaValidacao())) return;
   let h = STATE.historico[indice];
   if (h && h.detalheEmPartes && !h.resultados) {
     toast('Carregando detalhe do lote…', 'info');
@@ -4554,9 +4685,11 @@ async function abrirHistoricoDetalhe(indice) {
     outrosFluxos: h.outrosFluxos || [],
     reentregas: h.reentregas || [],
   };
+  STATE.ultimaValidacao._resumoGravado = { ...(h.resumo || {}) };
   STATE._filtroAtual = 'todos';
   STATE._filtrosRes = {};
   goToView('validar');
+  setTimeout(() => atualizarResumoDoLoteNoHistorico(), 50);
   // a view de Validar Fretes normalmente é montada vazia (esperando upload); aqui já
   // temos os resultados prontos, então renderiza a comparação direto por cima
   setTimeout(() => renderResultadosValidacao(), 0);
