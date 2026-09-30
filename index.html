@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-09-30-otimiza-firebase';
+const APP_VERSION = '2026-09-30-fatura-reposicao-emissao';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -256,6 +256,24 @@ function fmtNum(n, dec=2) {
   if (n === null || n === undefined || isNaN(n)) return '—';
   return n.toLocaleString('pt-BR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
 }
+function fmtDia(iso) {
+  if (!iso) return '—';
+  try { return new Date(iso).toLocaleDateString('pt-BR'); } catch { return iso; }
+}
+// "FLUXO" nas observações da nota = reposição (produto reenviado ao cliente por conta da TBX)
+function textoTemFluxo(txt) {
+  return /\bFLUXO\b/.test((txt || '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase());
+}
+function trechoFluxo(txt) {
+  const t = (txt || '').toString().replace(/\s+/g, ' ');
+  const i = t.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().search(/\bFLUXO\b/);
+  if (i < 0) return null;
+  return (i > 60 ? '…' : '') + t.slice(Math.max(0, i - 60), i + 80) + (i + 80 < t.length ? '…' : '');
+}
+// Devolução e reposição: prejuízo total (a TBX paga o frete inteiro, o cliente não paga nada)
+function ehPrejuizoTotal(r) { return r.tipoOperacao === 'devolucao' || !!r.reposicao; }
+function ehReposicao(r) { return !!r.reposicao && r.tipoOperacao !== 'devolucao'; }
+
 function fmtDate(iso) {
   if (!iso) return '—';
   try {
@@ -605,7 +623,7 @@ const DataLayer = {
       localDB_write(data);
       return;
     }
-    await db.collection('registroChaves').doc(idLote).set({ chaves: unicas, qtd: unicas.length, nomeArquivo: nomeLote, criadoEm: new Date().toISOString(), criadoPor: currentUser ? currentUser.email : '' });
+    await db.collection('registroChaves').doc(idLote).set({ chaves: unicas, qtd: unicas.length, nomeArquivo: nomeLote, numeroFatura: (STATE.ultimaValidacao && STATE.ultimaValidacao.numeroFatura) || null, criadoEm: new Date().toISOString(), criadoPor: currentUser ? currentUser.email : '' });
   },
   async listChavesCtes() {
     if (OFFLINE_MODE) return new Set(Object.keys(localDB_read().ctes || {}));
@@ -669,7 +687,11 @@ const DataLayer = {
       const atuais = doc.exists ? JSON.parse(doc.data().dados || '{}') : {};
       let mudou = false;
       Object.values(notasNovas).forEach(n => {
-        if (atuais[n.nNF]) { jaExistiam++; return; }
+        if (atuais[n.nNF]) {
+          jaExistiam++;
+          if (!('fluxo' in atuais[n.nNF]) && 'fluxo' in n) { atuais[n.nNF].fluxo = n.fluxo; atuais[n.nNF].obsFluxo = n.obsFluxo ?? null; mudou = true; }
+          return;
+        }
         atuais[n.nNF] = { ...n, arquivoOrigem: origem, importadoEm: agora };
         novas++; mudou = true;
       });
@@ -763,7 +785,10 @@ const DataLayer = {
       const doc = await ref.get(); // lê fresco pra não sobrescrever o que outra pessoa salvou
       const atuais = doc.exists ? JSON.parse(doc.data().dados || '{}') : {};
       let mudou = false;
-      notas.forEach(n => { if (!atuais[n.chave]) { atuais[n.chave] = limparParaFirestore(n); mudou = true; } });
+      notas.forEach(n => {
+        if (!atuais[n.chave]) { atuais[n.chave] = limparParaFirestore(n); mudou = true; }
+        else if (!('fluxo' in atuais[n.chave]) && 'fluxo' in n) { atuais[n.chave].fluxo = n.fluxo; atuais[n.chave].obsFluxo = n.obsFluxo ?? null; mudou = true; } // completa nota antiga, mantém o resto
+      });
       if (mudou) await ref.set({ dados: JSON.stringify(atuais), qtd: Object.keys(atuais).length, atualizadoEm: agora });
       (STATE._nfeBaldes = STATE._nfeBaldes || {})[idBalde] = atuais;
       notas.forEach(n => { cacheNfe[n.chave] = atuais[n.chave]; });
@@ -1213,6 +1238,12 @@ function parseNFeXml(xmlString, fileName) {
     vNF: xmlNum(icmsTot, 'vNF'),
     vFrete: xmlNum(icmsTot, 'vFrete'),
     itens,
+    ...(() => {
+      // observações da nota (infAdic: infCpl, infAdFisco, obsCont) — "FLUXO" = reposição
+      const infAdic = infNFe.getElementsByTagName('infAdic')[0];
+      const obs = infAdic ? [xmlText(infAdic, 'infCpl'), xmlText(infAdic, 'infAdFisco'), ...Array.from(infAdic.getElementsByTagName('xTexto')).map(n => n.textContent)].filter(Boolean).join(' | ') : '';
+      return { fluxo: textoTemFluxo(obs), obsFluxo: trechoFluxo(obs) };
+    })(),
   };
 }
 
@@ -1266,6 +1297,7 @@ async function lerPlanilhaNotas(file) {
   }
   if (!melhor) throw new Error('Não encontrei a coluna do número da nota (NF) em nenhuma aba da planilha.');
   const { grid, hr, cols } = melhor;
+  const colsObs = (grid[hr] || []).map((v, i) => normalizaCabecalho(v).includes('OBSERV') ? i : -1).filter(i => i >= 0);
   const val = (row, c) => (c >= 0 ? row[c] : null);
   const texto = (v) => (v === null || v === undefined) ? null : String(v).trim() || null;
   const notas = {};
@@ -1284,6 +1316,9 @@ async function lerPlanilhaNotas(file) {
     const uf = texto(val(row, cols.uf)); if (uf && !n.uf) n.uf = uf.toUpperCase();
     const dataPedido = texto(val(row, cols.dataPedido)); if (dataPedido && !n.dataPedido) n.dataPedido = dataPedido;
     const transp = texto(val(row, cols.transportadora)); if (transp && !n.transportadora) n.transportadora = transp;
+    const obsLinha = colsObs.map(c => texto(row[c])).filter(Boolean).join(' | ');
+    if (!('fluxo' in n)) { n.fluxo = false; n.obsFluxo = null; }
+    if (obsLinha && textoTemFluxo(obsLinha)) { n.fluxo = true; n.obsFluxo = n.obsFluxo || trechoFluxo(obsLinha); }
     const sku = texto(val(row, cols.sku));
     if (sku) {
       const q = parseNumeroPlanilha(val(row, cols.qtd));
@@ -1309,6 +1344,7 @@ function aplicarPlanilhaNosItens(itens, mapa) {
     if (!nota) return;
     if (nota.canal) { x.canal = nota.canal; comCanal++; }
     if (nota.pedido) x.pedido = nota.pedido;
+    if (nota.fluxo && 'cobrado' in x) { x.reposicao = true; x.obsFluxo = x.obsFluxo || nota.obsFluxo || 'FLUXO (planilha de notas)'; }
     if ('cobrado' in x) {
       if ((x.valorFreteCliente === null || x.valorFreteCliente === undefined) && nota.frete !== null && nota.frete !== undefined) {
         x.valorFreteCliente = nota.frete;
@@ -1350,12 +1386,12 @@ function calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFlu
   let qtdSemErro = 0;
   resultados.forEach(r => {
     totalCobrado += r.cobrado || 0;
-    if (r.tipoOperacao !== 'devolucao' && r.valorFreteCliente != null) {
+    if (!ehPrejuizoTotal(r) && r.valorFreteCliente != null) {
       totalClientePagou += r.valorFreteCliente;
       temAlgumaNfe = true;
     }
     if (typeof analisadoSemErro === 'function' && analisadoSemErro(r)) {
-      if (r.tipoOperacao === 'devolucao') { ajusteSemErro += r.cobrado || 0; qtdSemErro++; }
+      if (ehPrejuizoTotal(r)) { ajusteSemErro += r.cobrado || 0; qtdSemErro++; }
       else if (r.valorFreteCliente != null) { ajusteSemErro += (r.cobrado || 0) - r.valorFreteCliente; qtdSemErro++; }
     }
   });
@@ -1397,6 +1433,9 @@ function enriquecerComNotasFiscais(resultados, nfes) {
     }
     // guarda os itens (mesmo sem vFrete) pra eventualmente recalcular a cubagem
     r._itensNFe = nfeEncontrada ? nfeEncontrada.itens : null;
+    // "FLUXO" nas observações da NF-e -> reposição (prejuízo total, igual devolução)
+    r.reposicao = !!(nfeEncontrada && nfeEncontrada.fluxo);
+    r.obsFluxo = r.reposicao ? (nfeEncontrada.obsFluxo || null) : null;
   });
   return { casados, total: resultados.length, nfesLidas: nfes.length };
 }
@@ -1989,7 +2028,7 @@ function exportResultadosParaXlsx(resultados, semParceiro, parceirosEnvolvidos, 
     .sort((a,b) => Math.abs(b.divergencia||0) - Math.abs(a.divergencia||0))
     .forEach(r => {
       const row = [
-        r.tipoOperacao === 'devolucao' ? 'Devolução' : 'Saída',
+        r.tipoOperacao === 'devolucao' ? 'Devolução' : r.reposicao ? 'Reposição' : 'Saída',
         r.parceiro.nome, r.cte.nCT, (r.cte.notasFiscais||[]).map(n=>n.numero).join(', '), r.canal || '', r.pedido || '', r.cte.dhEmi,
         r.cte.xMunIni, r.cte.UFIni, r.cte.xMunFim, r.cte.UFFim,
         r.calc.regiaoEncontrada || '', r.cte.pesoBC ?? r.cte.pesoReal ?? '', r.cte.vCarga ?? '',
@@ -2389,6 +2428,8 @@ function trimResultadoParaHistorico(r) {
     nfeVinculada: r.nfeVinculada,
     canal: r.canal ?? null,
     pedido: r.pedido ?? null,
+    reposicao: !!r.reposicao,
+    obsFluxo: r.obsFluxo ?? null,
   };
 }
 function trimSemParceiroParaHistorico(c) {
@@ -2410,9 +2451,10 @@ function montarRegistroHistorico(nomeLote, v) {
   const { resultados, semParceiro = [], outrosFluxos = [], reentregas = [], duplicadosIgnorados = 0 } = v;
   const tol = 0.05;
   // devolução/reentrega ficam só na aba própria delas — não contam aqui, pra não duplicar
-  const maior = resultados.filter(r => r.tipoOperacao !== 'devolucao' && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) > tol);
-  const menor = resultados.filter(r => r.tipoOperacao !== 'devolucao' && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) < -tol);
+  const maior = resultados.filter(r => !ehPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) > tol);
+  const menor = resultados.filter(r => !ehPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) < -tol);
   const devolucoesResultados = resultados.filter(r => r.tipoOperacao === 'devolucao');
+  const reposicoesResultados = resultados.filter(ehReposicao);
   const resumoFin = calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFluxos);
   const resumo = {
     total: resultados.length + semParceiro.length + outrosFluxos.length + reentregas.length,
@@ -2427,6 +2469,8 @@ function montarRegistroHistorico(nomeLote, v) {
     outrosFluxos: outrosFluxos.length,
     reentregas: reentregas.length,
     valorReentregas: clamp2(reentregas.reduce((a,x) => a + (x.cte.vTPrest||0), 0)),
+    reposicoes: reposicoesResultados.length,
+    valorReposicoes: clamp2(reposicoesResultados.reduce((a,r) => a + (r.cobrado||0), 0)),
     duplicadosIgnorados,
     totalCobrado: resumoFin.totalCobrado,
     totalClientePagou: resumoFin.totalClientePagou,
@@ -2434,7 +2478,7 @@ function montarRegistroHistorico(nomeLote, v) {
     faturado: resumoFin.faturado,
   };
   return {
-    nomeArquivo: nomeLote, resumo,
+    nomeArquivo: nomeLote, numeroFatura: v.numeroFatura || null, resumo,
     resultados: resultados.map(trimResultadoParaHistorico),
     semParceiro: semParceiro.map(trimSemParceiroParaHistorico),
     outrosFluxos: outrosFluxos.map(trimForaFluxoParaHistorico),
@@ -2531,6 +2575,13 @@ async function salvarValidacaoAtual() {
   const v = STATE.ultimaValidacao;
   if (!v) return false;
   if (v.historicoId) { toast('Essa validação já está salva no Histórico.', 'info'); return true; }
+  const inpF = $('#numeroFatura');
+  if (inpF) v.numeroFatura = inpF.value.trim();
+  if (!v.numeroFatura) {
+    toast('Preencha o Nº da fatura antes de salvar a validação.', 'error');
+    if (inpF) { inpF.focus(); inpF.classList.add('ring-2', 'ring-red-300'); }
+    return false;
+  }
   if (STATE._salvandoValidacao) return false;
   STATE._salvandoValidacao = true;
   const btn = $('#btnSalvarValidacao');
@@ -2560,7 +2611,7 @@ async function salvarValidacaoAtual() {
       console.error(e);
       if (/resource-exhausted|quota|timeout|permission/i.test((e.code || '') + (e.message || ''))) throw e;
       // falha por outro motivo (ex: tamanho) — tenta só com o resumo
-      salvo = await comTimeout(DataLayer.saveValidacao({ _idFixo: v._idHistorico, nomeArquivo: nomeLote, resumo: registro.resumo, detalheDisponivel: false }), 30000, 'salvar no Histórico');
+      salvo = await comTimeout(DataLayer.saveValidacao({ _idFixo: v._idHistorico, nomeArquivo: nomeLote, numeroFatura: v.numeroFatura, resumo: registro.resumo, detalheDisponivel: false }), 30000, 'salvar no Histórico');
       toast('Salvo no Histórico só com o resumo (o detalhe linha a linha não coube). Detalhe no console (F12).', 'warn');
     }
     v.historicoId = salvo?.id || null;
@@ -2723,7 +2774,15 @@ async function processarNotasFiscais(entrada, progressBoxId = 'progressNFeBox') 
     // validação carregada agora (mesmo as já vistas antes — isso é só leitura); só a
     // gravação global no banco é que ignora duplicata
     const semFrete = nfes.filter(n => n.vFrete === null || n.vFrete === undefined).length;
-    const resumoMatch = temValidacaoAtiva ? enriquecerComNotasFiscais(STATE.ultimaValidacao.resultados, nfes) : null;
+    // casa com as NF-es lidas agora + as já salvas antes (senão, importar só parte das notas
+    // "descasaria" os CT-es cujas notas vieram numa importação anterior)
+    let nfesParaCasar = nfes;
+    if (temValidacaoAtiva) {
+      const chavesLote = STATE.ultimaValidacao.resultados.flatMap(r => (r.cte.notasFiscais || []).map(n => n.chave));
+      const jaSalvas = await DataLayer.listNfesPorChaves(chavesLote).catch(() => []);
+      nfesParaCasar = [...jaSalvas, ...nfes];
+    }
+    const resumoMatch = temValidacaoAtiva ? enriquecerComNotasFiscais(STATE.ultimaValidacao.resultados, nfesParaCasar) : null;
     // o XML reseta quem não casou — reaplica a planilha como segunda fonte (canal + frete)
     if (temValidacaoAtiva) await aplicarPlanilhaAoLote(STATE.ultimaValidacao).catch(e => console.error(e));
 
@@ -2732,7 +2791,7 @@ async function processarNotasFiscais(entrada, progressBoxId = 'progressNFeBox') 
     const nfesNovas = nfes.filter(n => n.chave && !chavesExistentesNfe.has(n.chave));
     const nfesDuplicadas = nfes.length - nfesNovas.length;
     const agoraNfe = new Date().toISOString();
-    await DataLayer.salvarNfesEmLote(nfesNovas.map(n => ({ ...n, arquivoOrigem: nomeLote, importadoEm: agoraNfe }))).catch(e => console.error('[NF-e global] falha ao salvar:', e));
+    await DataLayer.salvarNfesEmLote(nfes.map(n => ({ ...n, arquivoOrigem: nomeLote, importadoEm: agoraNfe }))).catch(e => console.error('[NF-e global] falha ao salvar:', e));
 
     let resumoCubagem = null;
     if (temValidacaoAtiva) {
@@ -2748,6 +2807,8 @@ async function processarNotasFiscais(entrada, progressBoxId = 'progressNFeBox') 
     if (temValidacaoAtiva) {
       msg = `${resumoMatch.casados} de ${resumoMatch.total} CT-es casados com nota fiscal (${nfes.length} NF-e lida(s)${semFrete ? `, ${semFrete} sem vFrete preenchido` : ''}${nfesDuplicadas ? `, ${nfesDuplicadas} já importada(s) antes` : ''}).`;
       if (resumoCubagem && resumoCubagem.recalculados > 0) msg += ` ${resumoCubagem.recalculados} recalculado(s) com peso cubado próprio.`;
+      const qtdRepos = STATE.ultimaValidacao.resultados.filter(ehReposicao).length;
+      if (qtdRepos) msg += ` ${qtdRepos} reposição(ões) identificada(s) ("FLUXO" nas observações da nota).`;
       else if (resumoCubagem && resumoCubagem.semFator > 0) msg += ` ${resumoCubagem.semFator} CT-e(s) sem fator de cubagem cadastrado no parceiro.`;
       renderResultadosValidacao();
       // atualiza o resumo financeiro do lote já salvo no histórico, se houver
@@ -2938,13 +2999,14 @@ function renderResultadosValidacao() {
   // devolução/reversa tem aba própria (prejuízo total) — não conta em nenhuma outra, pra
   // não aparecer duplicada em "cobrado a maior/menor" etc. (reentrega já nem entra em
   // "resultados", então nunca aparecia nessas abas mesmo)
-  const maior = resultados.filter(r => r.tipoOperacao !== 'devolucao' && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) > tol);
-  const menor = resultados.filter(r => r.tipoOperacao !== 'devolucao' && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) < -tol);
-  const revisao = resultados.filter(r => r.tipoOperacao !== 'devolucao' && (r.calc.status === 'REVISAO_MANUAL' || r.calc.status === 'SEM_TARIFA' || r.calc.status === 'SEM_ABRANGENCIA'));
-  const ok = resultados.filter(r => r.tipoOperacao !== 'devolucao' && divergenciaEfetiva(r) !== null && Math.abs(divergenciaEfetiva(r)) <= tol && (r.calc.status === 'OK' || analisadoSemErro(r)));
+  const maior = resultados.filter(r => !ehPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) > tol);
+  const menor = resultados.filter(r => !ehPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) < -tol);
+  const revisao = resultados.filter(r => !ehPrejuizoTotal(r) && (r.calc.status === 'REVISAO_MANUAL' || r.calc.status === 'SEM_TARIFA' || r.calc.status === 'SEM_ABRANGENCIA'));
+  const ok = resultados.filter(r => !ehPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && Math.abs(divergenciaEfetiva(r)) <= tol && (r.calc.status === 'OK' || analisadoSemErro(r)));
   const devolucoes = resultados.filter(r => r.tipoOperacao === 'devolucao');
+  const reposicoes = resultados.filter(ehReposicao);
   const nfeImportada = resultados.some(r => r.valorFreteCliente !== undefined);
-  const margemNegativa = resultados.filter(r => r.tipoOperacao !== 'devolucao' && margemClienteEfetiva(r) !== null && margemClienteEfetiva(r) !== undefined && margemClienteEfetiva(r) < -tol);
+  const margemNegativa = resultados.filter(r => !ehPrejuizoTotal(r) && margemClienteEfetiva(r) !== null && margemClienteEfetiva(r) !== undefined && margemClienteEfetiva(r) < -tol);
   const comNfe = resultados.filter(r => r.valorFreteCliente !== null && r.valorFreteCliente !== undefined);
   const resumoFin = calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFluxos);
 
@@ -2959,9 +3021,10 @@ function renderResultadosValidacao() {
       </div>
       <div class="flex items-center gap-4">
         ${vAtual.historicoId
-          ? `<span class="text-sm font-medium text-emerald-700 flex items-center gap-1" title="Esta validação está no Histórico — análises, notas e recálculos feitos agora atualizam o registro salvo">✓ Salvo no Histórico</span>`
+          ? `<span class="text-sm font-medium text-emerald-700 flex items-center gap-1" title="Esta validação está no Histórico — análises, notas e recálculos feitos agora atualizam o registro salvo">✓ Salvo no Histórico${vAtual.numeroFatura ? ` · fatura <strong>${escapeHtml(vAtual.numeroFatura)}</strong>` : ''}</span>`
           : vAtual.naoSalvo
-            ? `<button id="btnSalvarValidacao" class="text-sm font-semibold text-white bg-brand-600 hover:bg-brand-700 rounded-lg px-3 py-1.5 shadow-sm">Salvar validação</button>`
+            ? `<input id="numeroFatura" value="${escapeHtml(vAtual.numeroFatura || '')}" placeholder="Nº da fatura *" title="Obrigatório pra salvar a validação" class="text-sm border ${vAtual.numeroFatura ? 'border-ink-200' : 'border-amber-300 bg-amber-50/50'} rounded-lg px-2.5 py-1.5 w-40">
+               <button id="btnSalvarValidacao" class="text-sm font-semibold text-white bg-brand-600 hover:bg-brand-700 rounded-lg px-3 py-1.5 shadow-sm">Salvar validação</button>`
             : ''}
         <button id="btnImportarNFe" class="text-sm font-medium text-ink-600 hover:text-ink-800 flex items-center gap-1.5">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
@@ -2991,8 +3054,9 @@ function renderResultadosValidacao() {
       ${filtroCard('ok', 'Conferem / analisados sem erro', ok.length, (() => { const q = resultados.filter(analisadoSemErro).length; return q ? `${q} analisado(s) sem erro` : ''; })(), 'emerald')}
       ${filtroCard('revisao', 'Revisão manual / sem cobertura', revisao.length, '', 'ink')}
     </div>
-    <div class="grid ${nfeImportada ? 'grid-cols-3' : 'grid-cols-2'} gap-3 mb-5">
+    <div class="grid ${nfeImportada ? 'grid-cols-4' : 'grid-cols-3'} gap-3 mb-5">
       ${filtroCard('devolucao', 'Devolução (prejuízo total)', devolucoes.length, fmtBRL(devolucoes.reduce((a,r)=>a+(r.cobrado||0),0)), 'brand')}
+      ${filtroCard('reposicao', 'Reposição (prejuízo total)', reposicoes.length, fmtBRL(reposicoes.reduce((a,r)=>a+(r.cobrado||0),0)), 'amber')}
       ${filtroCard('reentrega', 'Reentrega (prejuízo total)', reentregas.length, fmtBRL(reentregas.reduce((a,x)=>a+(x.cte.vTPrest||0),0)), 'purple')}
       ${nfeImportada ? filtroCard('margem_negativa', 'Cliente pagou menos que o frete', margemNegativa.length, fmtBRL(margemNegativa.reduce((a,r)=>a+margemClienteEfetiva(r),0)), 'red') : ''}
     </div>
@@ -3039,6 +3103,16 @@ function renderResultadosValidacao() {
   $('#btnRecalcular').addEventListener('click', recalcularLoteAtual);
   const btnSalvarVal = $('#btnSalvarValidacao');
   if (btnSalvarVal) btnSalvarVal.addEventListener('click', salvarValidacaoAtual);
+  const inpFatura = $('#numeroFatura');
+  if (inpFatura) {
+    inpFatura.addEventListener('input', () => {
+      vAtual.numeroFatura = inpFatura.value.trim();
+      inpFatura.classList.toggle('border-amber-300', !vAtual.numeroFatura);
+      inpFatura.classList.toggle('bg-amber-50/50', !vAtual.numeroFatura);
+      inpFatura.classList.remove('ring-2', 'ring-red-300');
+    });
+    inpFatura.addEventListener('keydown', (e) => { if (e.key === 'Enter') salvarValidacaoAtual(); });
+  }
   $('#btnExportar').addEventListener('click', () => {
     const blob = exportResultadosParaXlsx(resultados, semParceiro, STATE.parceiros, outrosFluxos, reentregas);
     downloadBlob(blob, `Validacao_Fretes_${String(nomeArquivo).replace(/\.zip$/i,'').replace(/[\\/:*?"<>|]+/g,'_')}.xlsx`);
@@ -3057,7 +3131,7 @@ function renderResultadosValidacao() {
     renderResultadosValidacao();
   }));
 
-  const grupos = { todos: resultados, maior, menor, ok, revisao, devolucao: devolucoes, margem_negativa: margemNegativa };
+  const grupos = { todos: resultados, maior, menor, ok, revisao, devolucao: devolucoes, reposicao: reposicoes, margem_negativa: margemNegativa };
   if (STATE._filtroAtual === 'reentrega') {
     renderTabelaInformativa(reentregas, 'reentrega');
   } else {
@@ -3086,6 +3160,7 @@ function renderTabelaInformativa(lista, tipo) {
         <thead>
           <tr class="bg-ink-50 text-ink-500 text-[11px] uppercase tracking-wide">
             <th class="text-left font-semibold px-4 py-3">CT-e</th>
+            <th class="text-left font-semibold px-4 py-3">Emissão</th>
             <th class="text-left font-semibold px-4 py-3">Parceiro</th>
             <th class="text-left font-semibold px-4 py-3">Destino</th>
             <th class="text-right font-semibold px-4 py-3">Cobrado</th>
@@ -3096,6 +3171,7 @@ function renderTabelaInformativa(lista, tipo) {
           ${lista.slice(0, 300).map(x => `
             <tr class="hover:bg-ink-50/60">
               <td class="px-4 py-3 num text-ink-700">${escapeHtml(x.cte.nCT || '—')}</td>
+              <td class="px-4 py-3 num text-ink-500 text-xs whitespace-nowrap">${fmtDia(x.cte.dhEmi)}</td>
               <td class="px-4 py-3 text-ink-700">${escapeHtml(x.parceiro.nome)}${x.canal ? ` <span class="text-[11px] text-ink-400">· ${escapeHtml(x.canal)}</span>` : ''}</td>
               <td class="px-4 py-3 text-ink-600">${escapeHtml(x.cte.destMun)} <span class="text-ink-300">/</span> ${escapeHtml(x.cte.destUF)}</td>
               <td class="px-4 py-3 text-right num text-ink-700">${fmtBRL(x.cte.vTPrest)}</td>
@@ -3166,12 +3242,15 @@ function renderTabelaResultados(lista, filtro) {
     el.innerHTML = emptyState('Nada por aqui', 'Nenhum CT-e nesta categoria.');
     return;
   }
-  const ehDevolucao = filtro === 'devolucao';
+  const ehDevolucao = filtro === 'devolucao' || filtro === 'reposicao';
   const mostrarDivergencia = filtro === 'maior' || filtro === 'menor' || ehDevolucao || filtro === 'todos';
   const mostrarCanal = [...(STATE.ultimaValidacao?.resultados || []), ...(STATE.ultimaValidacao?.reentregas || [])].some(x => x.canal);
   const mostrarMargem = filtro === 'margem_negativa' || lista.some(r => r.valorFreteCliente !== null && r.valorFreteCliente !== undefined);
   const nfsTxt = (r) => (r.cte.notasFiscais || []).map(n => n.numero).join(', ') || '—';
-  const bannerDevolucao = ehDevolucao ? `
+  const bannerDevolucao = filtro === 'reposicao' ? `
+    <div class="mb-4 text-xs px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200">
+      <strong>Reposição é prejuízo direto, igual devolução</strong> — a nota fiscal do cliente tem "FLUXO" nas observações (produto reenviado por conta da TBX). O cliente não paga esse frete, então a coluna "Prejuízo" mostra o <strong>valor total cobrado</strong> pela transportadora e ele não entra no "Cliente pagou" do Faturado. O cálculo contra a tabela continua disponível em "Detalhes".
+    </div>` : ehDevolucao ? `
     <div class="mb-4 text-xs px-3 py-2.5 rounded-lg bg-brand-50 text-brand-800 border border-brand-200">
       <strong>Devolução/reversa é prejuízo direto</strong> — o Grupo TBX paga esse frete do próprio bolso, sem repasse pro cliente. Por isso, a coluna "Prejuízo" abaixo mostra o <strong>valor total cobrado</strong> pela transportadora, não a diferença contra a tabela. O "Calculado" continua útil só pra conferir se a transportadora está cobrando certo (e não a mais) — não é o valor do prejuízo em si.
     </div>` : '';
@@ -3196,13 +3275,14 @@ function renderTabelaResultados(lista, filtro) {
           <tr class="bg-ink-50 text-ink-500 text-[11px] uppercase tracking-wide">
             <th class="pl-4 pr-1 py-3 w-8"><input type="checkbox" id="chkTodos" title="Selecionar todos desta lista" class="w-4 h-4 rounded border-ink-300 cursor-pointer"></th>
             <th class="text-left font-semibold px-4 py-3">CT-e</th>
+            <th class="text-left font-semibold px-4 py-3">Emissão</th>
             <th class="text-left font-semibold px-4 py-3">NF-e</th>
             ${mostrarCanal ? '<th class="text-left font-semibold px-4 py-3">Canal</th>' : ''}
             <th class="text-left font-semibold px-4 py-3">Parceiro</th>
             <th class="text-left font-semibold px-4 py-3">Destino</th>
             <th class="text-right font-semibold px-4 py-3">Cobrado</th>
             <th class="text-right font-semibold px-4 py-3">Calculado</th>
-            ${mostrarDivergencia ? `<th class="text-right font-semibold px-4 py-3">${ehDevolucao ? 'Prejuízo (total cobrado)' : 'Divergência'}</th>` : ''}
+            ${mostrarDivergencia ? `<th class="text-right font-semibold px-4 py-3">${ehDevolucao ? 'Prejuízo (total cobrado)' : 'Divergência / prejuízo'}</th>` : ''}
             ${mostrarMargem ? '<th class="text-right font-semibold px-4 py-3">Frete Cliente</th><th class="text-right font-semibold px-4 py-3" title="Frete cliente − Cobrado da transportadora">Margem</th>' : ''}
             <th class="text-left font-semibold px-4 py-3">Status</th>
             <th class="px-4 py-3"></th>
@@ -3213,7 +3293,8 @@ function renderTabelaResultados(lista, filtro) {
             <tr class="hover:bg-ink-50/60 ${sel.has(r.cte.chave) ? 'bg-brand-50/60' : ''}">
               <td class="pl-4 pr-1 py-3"><input type="checkbox" class="chk-cte w-4 h-4 rounded border-ink-300 cursor-pointer" data-chave="${escapeHtml(r.cte.chave || '')}" ${sel.has(r.cte.chave) ? 'checked' : ''}></td>
               <td class="px-4 py-3 num text-ink-700">${escapeHtml(r.cte.nCT || '—')}</td>
-              <td class="px-4 py-3 num text-ink-600">${escapeHtml(nfsTxt(r))}</td>
+              <td class="px-4 py-3 num text-ink-500 text-xs whitespace-nowrap">${fmtDia(r.cte.dhEmi)}</td>
+              <td class="px-4 py-3 num text-ink-600">${escapeHtml(nfsTxt(r))}${ehReposicao(r) ? ` <span title="Reposição — observação da nota: ${escapeHtml(r.obsFluxo || 'FLUXO')}" class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full border bg-amber-50 text-amber-700 border-amber-200">REPOSIÇÃO</span>` : ''}</td>
               ${mostrarCanal ? `<td class="px-4 py-3 text-ink-600 text-xs">${r.canal ? escapeHtml(r.canal) : '<span class="text-ink-300">—</span>'}</td>` : ''}
               <td class="px-4 py-3 text-ink-700">${escapeHtml(r.parceiro.nome)}</td>
               <td class="px-4 py-3 text-ink-600">${r.tipoOperacao === 'devolucao'
@@ -3222,8 +3303,8 @@ function renderTabelaResultados(lista, filtro) {
               }</td>
               <td class="px-4 py-3 text-right num text-ink-700">${fmtBRL(r.cobrado)}</td>
               <td class="px-4 py-3 text-right num text-ink-700">${r.calculado !== null ? fmtBRL(r.calculado) : '—'}</td>
-              ${mostrarDivergencia ? ((ehDevolucao || r.tipoOperacao === 'devolucao')
-                ? `<td class="px-4 py-3 text-right num font-semibold text-brand-700" title="Devolução — prejuízo total (valor cobrado)">${fmtBRL(r.cobrado)}</td>`
+              ${mostrarDivergencia ? ((ehDevolucao || ehPrejuizoTotal(r))
+                ? `<td class="px-4 py-3 text-right num font-semibold ${ehReposicao(r) ? 'text-amber-700' : 'text-brand-700'}" title="${ehReposicao(r) ? 'Reposição' : 'Devolução'} — prejuízo total (valor cobrado)">${fmtBRL(r.cobrado)}</td>`
                 : r.divergencia === null || r.divergencia === undefined
                   ? `<td class="px-4 py-3 text-right num text-ink-300">—</td>`
                   : analisadoSemErro(r) && Math.abs(r.divergencia) > 0.05
@@ -3500,6 +3581,8 @@ function montarRevisao(r, classificacao, observacao) {
     dhEmi: r.cte.dhEmi,
     notaFiscal: (r.cte.notasFiscais || [])[0]?.numero || null,
     canal: r.canal || null,
+    numeroFatura: (STATE.ultimaValidacao && STATE.ultimaValidacao.numeroFatura) || null,
+    reposicao: !!r.reposicao,
     classificacao,
     observacao,
     detalhamentoErros: montarDetalhamentoDivergencias(r),
@@ -3683,7 +3766,8 @@ function abrirDetalheCte(idx) {
   const nfsTxt = notasFiscais.length
     ? notasFiscais.map(n => `NF-e nº <strong>${n.numero}</strong>`).join(', ')
     : 'nenhuma NF-e vinculada encontrada no XML';
-  const canalTxt = r.canal ? ` · canal <strong>${escapeHtml(r.canal)}</strong>${r.pedido ? ` · pedido ${escapeHtml(r.pedido)}` : ''}` : '';
+  const emissaoTxt = r.cte.dhEmi ? ` · emitido em <strong>${fmtDia(r.cte.dhEmi)}</strong>` : '';
+  const canalTxt = (ehReposicao(r) ? ` · <span class="font-semibold text-amber-700" title="${escapeHtml(r.obsFluxo || '')}">REPOSIÇÃO (prejuízo total)</span>` : '') + (r.canal ? ` · canal <strong>${escapeHtml(r.canal)}</strong>${r.pedido ? ` · pedido ${escapeHtml(r.pedido)}` : ''}` : '');
 
   const avisoReconciliacao = reconciliacao.temPendencia ? `
     <div class="mt-3 text-xs px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200">
@@ -3710,7 +3794,7 @@ function abrirDetalheCte(idx) {
         <div>
           <div class="text-sm font-semibold text-ink-900">CT-e ${escapeHtml(r.cte.nCT)} · ${escapeHtml(r.parceiro.nome)}</div>
           <div class="text-xs text-ink-400">${escapeHtml(r.cte.destMun)}/${escapeHtml(r.cte.destUF)} · região "${escapeHtml(r.calc.regiaoEncontrada || '—')}" · peso base cálc. ${fmtNum(r.cte.pesoBC ?? r.cte.pesoReal)} kg${r.pesoCubadoInfo ? ` <span class="text-ink-300">(peso usado no cálculo: ${fmtNum(r.pesoCubadoInfo.pesoFinal)} kg — cubagem própria)</span>` : ''}</div>
-          <div class="text-xs text-ink-400 mt-0.5">${nfsTxt}${canalTxt} · chave CT-e <span class="font-mono text-[10px]">${escapeHtml(r.cte.chave)}</span></div>
+          <div class="text-xs text-ink-400 mt-0.5">${nfsTxt}${emissaoTxt}${canalTxt} · chave CT-e <span class="font-mono text-[10px]">${escapeHtml(r.cte.chave)}</span></div>
           ${renderAbrangenciaUsada(r)}
           ${r.pesoCubadoInfo ? renderInfoCubagem(r) : ''}
         </div>
@@ -4930,6 +5014,7 @@ async function abrirHistoricoDetalhe(indice) {
   STATE.ultimaValidacao = {
     historicoId: h.id || null,
     nomeArquivo: h.nomeArquivo,
+    numeroFatura: h.numeroFatura || null,
     duplicadosIgnorados: h.resumo?.duplicadosIgnorados || 0,
     resultados: h.resultados,
     semParceiro: h.semParceiro || [],
@@ -4965,6 +5050,7 @@ async function renderHistorico() {
         <thead>
           <tr class="bg-ink-50 text-ink-500 text-[11px] uppercase tracking-wide">
             <th class="text-left font-semibold px-5 py-3">Data</th>
+            <th class="text-left font-semibold px-5 py-3">Fatura</th>
             <th class="text-left font-semibold px-5 py-3">Arquivo</th>
             <th class="text-left font-semibold px-5 py-3">Parceiros</th>
             <th class="text-right font-semibold px-5 py-3">CT-es</th>
@@ -4982,7 +5068,8 @@ async function renderHistorico() {
             return `
             <tr class="${temDetalhe ? 'hover:bg-brand-50/60 cursor-pointer' : 'opacity-60'}" ${temDetalhe ? `onclick="abrirHistoricoDetalhe(${i})"` : `title="Detalhe linha a linha não disponível pra este lote — exporte o Excel na época ou rode a validação de novo com o mesmo .zip"`}>
               <td class="px-5 py-3 text-ink-500 text-xs">${fmtDate(h.criadoEm)}</td>
-              <td class="px-5 py-3 text-ink-700 font-medium">${escapeHtml(h.nomeArquivo||'—')}</td>
+              <td class="px-5 py-3 text-ink-800 font-semibold num">${escapeHtml(h.numeroFatura||'—')}</td>
+              <td class="px-5 py-3 text-ink-600">${escapeHtml(h.nomeArquivo||'—')}</td>
               <td class="px-5 py-3 text-ink-600 text-xs">${escapeHtml((h.resumo?.parceiros||[]).join(', '))}</td>
               <td class="px-5 py-3 text-right num">${h.resumo?.total ?? 0}</td>
               <td class="px-5 py-3 text-right num ${h.resumo?.qtdDivergenciaMaior ? 'text-red-600 font-semibold' : 'text-emerald-600'}">${h.resumo?.qtdDivergenciaMaior ?? 0}</td>
@@ -5270,12 +5357,15 @@ async function renderTratativas() {
   const totalOutros = historico.reduce((a, h) => a + (h.resumo?.outrosFluxos || 0), 0);
   const totalReentregas = historico.reduce((a, h) => a + (h.resumo?.reentregas || 0), 0);
   const valorReentregas = historico.reduce((a, h) => a + (h.resumo?.valorReentregas || 0), 0);
+  const totalReposicoes = historico.reduce((a, h) => a + (h.resumo?.reposicoes || 0), 0);
+  const valorReposicoes = historico.reduce((a, h) => a + (h.resumo?.valorReposicoes || 0), 0);
   const boxForaFluxo = $('#resumoForaFluxoAnalises');
-  if (totalDevolucoes > 0 || totalOutros > 0 || totalReentregas > 0) {
+  if (totalDevolucoes > 0 || totalOutros > 0 || totalReentregas > 0 || totalReposicoes > 0) {
     boxForaFluxo.innerHTML = `
       <div class="bg-blue-50 border border-blue-200 rounded-2xl p-4">
         <div class="text-sm font-semibold text-blue-800 mb-2">Acumulado de todos os lotes já processados — prejuízo direto (pago do próprio bolso)</div>
-        <div class="grid grid-cols-3 gap-3 text-xs">
+        <div class="grid grid-cols-4 gap-3 text-xs">
+          <div><span class="text-amber-700 font-bold text-base">${totalReposicoes}</span> <span class="text-amber-700">reposição(ões) — ${fmtBRL(valorReposicoes)} de prejuízo total</span></div>
           <div><span class="text-brand-700 font-bold text-base">${totalDevolucoes}</span> <span class="text-brand-600">devolução(ões) — ${fmtBRL(valorDevolucoes)} de prejuízo total</span></div>
           <div><span class="text-purple-700 font-bold text-base">${totalReentregas}</span> <span class="text-purple-600">reentrega(s) — ${fmtBRL(valorReentregas)} de prejuízo total</span></div>
           <div><span class="text-ink-600 font-bold text-base">${totalOutros}</span> <span class="text-ink-500">trajeto(s) atípico(s) — sem tabela pra comparar, fora da validação</span></div>
@@ -5399,6 +5489,8 @@ function renderTabelaTratativa(analisadas) {
         <thead>
           <tr class="bg-ink-50 text-ink-500 text-[11px] uppercase tracking-wide">
             <th class="text-left font-semibold px-4 py-3">CT-e</th>
+            <th class="text-left font-semibold px-4 py-3">Emissão</th>
+            <th class="text-left font-semibold px-4 py-3">Fatura</th>
             <th class="text-left font-semibold px-4 py-3">Nota Fiscal</th>
             <th class="text-left font-semibold px-4 py-3">Canal</th>
             ${aba === 'todos' ? '<th class="text-left font-semibold px-4 py-3">Tipo de erro</th>' : ''}
@@ -5415,6 +5507,8 @@ function renderTabelaTratativa(analisadas) {
           ${filtrados.map(r => `
             <tr class="hover:bg-ink-50/60">
               <td class="px-4 py-3 num text-ink-700">${escapeHtml(r.nCT || '—')}</td>
+              <td class="px-4 py-3 num text-ink-500 text-xs whitespace-nowrap">${fmtDia(r.dhEmi)}</td>
+              <td class="px-4 py-3 num text-ink-600 text-xs">${escapeHtml(r.numeroFatura || '—')}</td>
               <td class="px-4 py-3 num text-ink-600">${escapeHtml(r.notaFiscal || '—')}</td>
               <td class="px-4 py-3 text-ink-600 text-xs">${r.canal ? escapeHtml(r.canal) : '<span class="text-ink-300">—</span>'}</td>
               ${aba === 'todos' ? `<td class="px-4 py-3 text-xs"><span class="px-2 py-0.5 rounded-full border ${(LABEL_CLASSIFICACAO[r.classificacao] || {}).cls || ''}">${escapeHtml((LABEL_CLASSIFICACAO[r.classificacao] || {}).label || r.classificacao)}</span></td>` : ''}
@@ -5469,7 +5563,7 @@ function exportarTratativasXlsx() {
   }
   if (todas.length === 0) { toast(`Nenhuma análise "${infoStatus ? infoStatus.label : 'Todos'}" pra exportar.`, 'warn'); return; }
 
-  const header = ['Nº CTe', 'Nota Fiscal', 'Canal', 'Parceiro', 'Emissão', 'Destino', 'UF', 'Valor Cobrado (R$)', 'Valor Calculado (R$)', 'Diferença (R$)', 'Status', 'Data Pendente', 'Data Em Tratativa', 'Data Resolvido', 'Detalhamento dos Erros de Cálculo (Subtotal)', 'Observação'];
+  const header = ['Nº CTe', 'Fatura', 'Nota Fiscal', 'Canal', 'Parceiro', 'Emissão', 'Destino', 'UF', 'Valor Cobrado (R$)', 'Valor Calculado (R$)', 'Diferença (R$)', 'Status', 'Data Pendente', 'Data Em Tratativa', 'Data Resolvido', 'Detalhamento dos Erros de Cálculo (Subtotal)', 'Observação'];
   const wb = XLSX.utils.book_new();
 
   // uma aba por tipo de erro — pra acompanhar onde está concentrado o problema
@@ -5481,7 +5575,7 @@ function exportarTratativasXlsx() {
     doTipo.forEach(r => {
       const datas = r.datasStatus || {};
       linhas.push([
-        r.nCT, r.notaFiscal, r.canal || '', r.parceiroNome, r.dhEmi ? fmtDate(r.dhEmi) : '', r.destMun, r.destUF,
+        r.nCT, r.numeroFatura || '', r.notaFiscal, r.canal || '', r.parceiroNome, r.dhEmi ? fmtDia(r.dhEmi) : '', r.destMun, r.destUF,
         r.valorCobradoSubtotal, r.valorRealSubtotal, r.valorRessarcir,
         (STATUS_TRATATIVA.find(s=>s.valor===(r.statusTratativa||'pendente'))||{}).label,
         datas.pendente ? fmtDate(datas.pendente) : '', datas.em_tratativa ? fmtDate(datas.em_tratativa) : '', datas.resolvido ? fmtDate(datas.resolvido) : '',
