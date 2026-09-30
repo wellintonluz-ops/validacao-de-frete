@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-09-30-salvar-manual';
+const APP_VERSION = '2026-09-30-otimiza-firebase';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -344,7 +344,7 @@ function comTimeout(promessa, ms, rotulo) {
 function mensagemErroFirebase(e, acao) {
   const code = (e && (e.code || '')) + ' ' + (e && e.message || '');
   if (/resource-exhausted|quota/i.test(code)) return `Não foi possível ${acao}: o Firebase atingiu o limite diário do plano gratuito. O limite zera por volta das 4h (horário de Brasília) — ou ative o plano Blaze no console do Firebase.`;
-  if (/timeout/i.test(code)) return `Não foi possível ${acao}: o banco não respondeu. Provavelmente o limite diário do Firebase foi atingido (veja o console F12) ou a internet caiu.`;
+  if (/timeout/i.test(code)) return `Não foi possível confirmar (${acao}): o banco não respondeu — provavelmente o limite diário do Firebase foi atingido ou a internet caiu. A gravação ficou na fila deste navegador e é enviada sozinha quando o Firebase voltar a aceitar; se tentar de novo, não duplica.`;
   if (/permission/i.test(code)) return `Não foi possível ${acao}: sem permissão no banco (confira se está logado com um e-mail autorizado).`;
   return `Não foi possível ${acao}. Detalhe no console (F12).`;
 }
@@ -352,6 +352,8 @@ function mensagemErroFirebase(e, acao) {
 const DataLayer = {
   async listParceiros() {
     if (OFFLINE_MODE) return localDB_read().parceiros;
+    const sinc = await dadosSincronizados('parceiros');
+    if (sinc) return sinc;
     const snap = await db.collection('parceiros').orderBy('nome').get();
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
   },
@@ -385,6 +387,8 @@ const DataLayer = {
   },
   async listHistorico() {
     if (OFFLINE_MODE) return (localDB_read().historico || []).sort((a,b) => (b.criadoEm||'').localeCompare(a.criadoEm||''));
+    const sinc = await dadosSincronizados('historico');
+    if (sinc) return sinc;
     const snap = await db.collection('validacoes').orderBy('criadoEm', 'desc').limit(30).get();
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
   },
@@ -411,21 +415,25 @@ const DataLayer = {
       }
       return registro;
     }
+    const idFixo = registro._idFixo; delete registro._idFixo;
     const limpo = limparParaFirestore(registro);
-    const temDetalhe = Array.isArray(limpo.resultados);
-    if (!temDetalhe || JSON.stringify(limpo).length <= 900000) {
-      const ref = await db.collection('validacoes').add(limpo);
+    // id gerado antes de gravar: se a pessoa clicar de novo (ou o Firebase reenviar depois
+    // de uma falha), grava no MESMO documento em vez de criar um lote duplicado
+    const ref = idFixo ? db.collection('validacoes').doc(idFixo) : db.collection('validacoes').doc();
+    if (!Array.isArray(limpo.resultados)) {
+      await ref.set(limpo);
       return { id: ref.id, ...limpo };
     }
-    // lote grande: resumo no documento principal + detalhe em partes numa subcoleção
+    // resumo no documento principal (é o que a lista do Histórico/Painel lê) e o detalhe
+    // linha a linha numa subcoleção, que só é lida quando alguém abre o lote
     const partes = dividirDetalheEmPartes(limpo);
     const { resultados, semParceiro, outrosFluxos, reentregas, ...principal } = limpo;
     principal.detalheDisponivel = true;
     principal.detalheEmPartes = partes.length;
-    const ref = await db.collection('validacoes').add(principal);
-    for (let i = 0; i < partes.length; i++) {
-      await ref.collection('partes').doc(String(i).padStart(3, '0')).set({ indice: i, ...partes[i] });
-    }
+    const batch = db.batch();
+    batch.set(ref, principal);
+    partes.forEach((pt, i) => batch.set(ref.collection('partes').doc(String(i).padStart(3, '0')), { indice: i, ...pt }));
+    await batch.commit();
     return { id: ref.id, ...principal };
   },
   async substituirValidacao(id, registro) {
@@ -439,27 +447,32 @@ const DataLayer = {
     }
     const limpo = limparParaFirestore(registro);
     const ref = db.collection('validacoes').doc(id);
-    const antigas = await ref.collection('partes').get();
-    for (const d of antigas.docs) await d.ref.delete();
+    // quantas partes existiam antes: vem da lista sincronizada (sem leitura extra)
+    const conhecido = (SYNC.dados.historico || []).find(h => h.id === id);
+    let partesAntigas = conhecido ? (conhecido.detalheEmPartes || 0) : null;
+    if (partesAntigas === null) partesAntigas = (await ref.collection('partes').get()).size;
     const del = firebase.firestore.FieldValue.delete();
-    if (JSON.stringify(limpo).length <= 900000) {
-      await ref.update({ ...limpo, detalheEmPartes: del });
-      return;
-    }
     const partes = dividirDetalheEmPartes(limpo);
     const { resultados, semParceiro, outrosFluxos, reentregas, ...principal } = limpo;
-    await ref.update({ ...principal, detalheDisponivel: true, detalheEmPartes: partes.length, resultados: del, semParceiro: del, outrosFluxos: del, reentregas: del });
-    for (let i = 0; i < partes.length; i++) {
-      await ref.collection('partes').doc(String(i).padStart(3, '0')).set({ indice: i, ...partes[i] });
-    }
+    const batch = db.batch();
+    batch.update(ref, { ...principal, detalheDisponivel: true, detalheEmPartes: partes.length, resultados: del, semParceiro: del, outrosFluxos: del, reentregas: del });
+    partes.forEach((pt, i) => batch.set(ref.collection('partes').doc(String(i).padStart(3, '0')), { indice: i, ...pt }));
+    for (let i = partes.length; i < partesAntigas; i++) batch.delete(ref.collection('partes').doc(String(i).padStart(3, '0')));
+    await batch.commit();
+    if (STATE._detalheCache) delete STATE._detalheCache[id];
   },
   async carregarDetalheHistorico(h) {
     if (!h.detalheEmPartes || OFFLINE_MODE) return h;
+    STATE._detalheCache = STATE._detalheCache || {};
+    const cache = STATE._detalheCache[h.id];
+    if (cache && cache.versao === (h.recalculadoEm || h.criadoEm)) return { ...h, ...JSON.parse(JSON.stringify(cache.dados)) };
     const snap = await db.collection('validacoes').doc(h.id).collection('partes').get();
     const docs = snap.docs.map(d => d.data()).sort((a, b) => a.indice - b.indice);
     if (docs.length < h.detalheEmPartes) throw new Error(`Detalhe incompleto: ${docs.length}/${h.detalheEmPartes} partes`);
     const junta = (campo) => docs.flatMap(d => d[campo] || []);
-    return { ...h, resultados: junta('resultados'), semParceiro: junta('semParceiro'), outrosFluxos: junta('outrosFluxos'), reentregas: junta('reentregas') };
+    const dados = { resultados: junta('resultados'), semParceiro: junta('semParceiro'), outrosFluxos: junta('outrosFluxos'), reentregas: junta('reentregas') };
+    STATE._detalheCache[h.id] = { versao: h.recalculadoEm || h.criadoEm, dados: JSON.parse(JSON.stringify(dados)) };
+    return { ...h, ...dados };
   },
   // Atualiza só o resumo (ex: totais financeiros) de um lote já salvo — usado quando a
   // pessoa importa as notas fiscais DEPOIS de já ter validado e salvo o lote de CT-es,
@@ -472,10 +485,10 @@ const DataLayer = {
       if (item) { item.resumo = { ...item.resumo, ...patchResumo }; localDB_write(data); }
       return;
     }
-    const doc = await db.collection('validacoes').doc(id).get();
-    if (doc.exists) {
-      await db.collection('validacoes').doc(id).update({ resumo: limparParaFirestore({ ...doc.data().resumo, ...patchResumo }) });
-    }
+    // atualiza só os campos do resumo, direto (sem ler o documento antes)
+    const upd = {};
+    Object.entries(limparParaFirestore(patchResumo)).forEach(([k, val]) => { upd['resumo.' + k] = val; });
+    await db.collection('validacoes').doc(id).update(upd);
   },
 
   // ----- Revisões de divergência (análise + tratativa com transportadora) -----
@@ -483,8 +496,28 @@ const DataLayer = {
   // persiste mesmo que o mesmo CT-e apareça de novo numa validação futura.
   async listRevisoes() {
     if (OFFLINE_MODE) return Object.values(localDB_read().revisoes || {});
+    const sinc = await dadosSincronizados('revisoes');
+    if (sinc) return sinc;
     const snap = await db.collection('revisoes').get();
     return snap.docs.map(d => ({ chave: d.id, ...d.data() }));
+  },
+  async saveRevisoesEmLote(lista) {
+    const agora = new Date().toISOString();
+    const quem = currentUser ? currentUser.email : 'offline';
+    lista.forEach(r => { r.atualizadoEm = agora; r.atualizadoPor = quem; });
+    if (OFFLINE_MODE) {
+      const data = localDB_read();
+      data.revisoes = data.revisoes || {};
+      lista.forEach(r => { data.revisoes[r.chave] = r; });
+      localDB_write(data);
+      return lista;
+    }
+    for (let i = 0; i < lista.length; i += 400) {
+      const batch = db.batch();
+      lista.slice(i, i + 400).forEach(r => batch.set(db.collection('revisoes').doc(r.chave), limparParaFirestore(r), { merge: true }));
+      await comTimeout(batch.commit(), 30000, 'salvar as análises');
+    }
+    return lista;
   },
   async saveRevisao(revisao) {
     revisao.atualizadoEm = new Date().toISOString();
@@ -532,11 +565,47 @@ const DataLayer = {
       unicas.forEach(c => { if (mapa[c]) existentes.add(c); });
       return existentes;
     }
+    if (colecao === 'notasFiscais') {
+      (await this.listNfesPorChaves(unicas)).forEach(n => existentes.add(n.chave));
+      return existentes;
+    }
+    // CT-es: cada lote salvo registra TODAS as suas chaves num único documento
+    // ('registroChaves'), então salvar um lote de 768 CT-es custa 1 gravação, não 768
+    const alvo = new Set(unicas);
     for (let i = 0; i < unicas.length; i += 30) {
-      const snap = await db.collection(colecao).where(firebase.firestore.FieldPath.documentId(), 'in', unicas.slice(i, i + 30)).get();
-      snap.docs.forEach(d => existentes.add(d.id));
+      const snap = await db.collection('registroChaves').where('chaves', 'array-contains-any', unicas.slice(i, i + 30)).get();
+      snap.docs.forEach(d => (d.data().chaves || []).forEach(c => { if (alvo.has(c)) existentes.add(c); }));
+    }
+    // CT-es salvos pelo formato antigo (um documento por CT-e em 'ctes') continuam valendo
+    if (await this._temLegado('ctes')) {
+      const restantes = unicas.filter(c => !existentes.has(c));
+      for (let i = 0; i < restantes.length; i += 30) {
+        const snap = await db.collection('ctes').where(firebase.firestore.FieldPath.documentId(), 'in', restantes.slice(i, i + 30)).get();
+        snap.docs.forEach(d => existentes.add(d.id));
+      }
     }
     return existentes;
+  },
+  // existe algum documento no formato antigo? (1 leitura por sessão)
+  async _temLegado(colecao) {
+    STATE._legado = STATE._legado || {};
+    if (!(colecao in STATE._legado)) {
+      const snap = await db.collection(colecao).limit(1).get();
+      STATE._legado[colecao] = snap.size > 0;
+    }
+    return STATE._legado[colecao];
+  },
+  async registrarChavesLote(idLote, nomeLote, chaves) {
+    const unicas = Array.from(new Set((chaves || []).filter(Boolean)));
+    if (!unicas.length) return;
+    if (OFFLINE_MODE) {
+      const data = localDB_read();
+      data.ctes = data.ctes || {};
+      unicas.forEach(c => { data.ctes[c] = { chave: c, arquivoOrigem: nomeLote }; });
+      localDB_write(data);
+      return;
+    }
+    await db.collection('registroChaves').doc(idLote).set({ chaves: unicas, qtd: unicas.length, nomeArquivo: nomeLote, criadoEm: new Date().toISOString(), criadoPor: currentUser ? currentUser.email : '' });
   },
   async listChavesCtes() {
     if (OFFLINE_MODE) return new Set(Object.keys(localDB_read().ctes || {}));
@@ -605,6 +674,7 @@ const DataLayer = {
         novas++; mudou = true;
       });
       if (mudou) await ref.set({ dados: JSON.stringify(atuais), qtd: Object.keys(atuais).length, atualizadoEm: agora });
+      (STATE._baldesPlanilha = STATE._baldesPlanilha || {})[idBalde] = atuais; // já fica em cache pra casar sem ler de novo
     }
     return { novas, jaExistiam };
   },
@@ -615,16 +685,18 @@ const DataLayer = {
       const salvas = localDB_read().planilhaNotas || {};
       const out = {}; unicos.forEach(n => { if (salvas[n]) out[n] = salvas[n]; }); return out;
     }
+    // baldes já lidos nesta sessão ficam em memória — recalcular/reabrir não lê de novo
+    const cache = STATE._baldesPlanilha = STATE._baldesPlanilha || {};
     const baldes = Array.from(new Set(unicos.map(n => this._baldeNF(n))));
-    const out = {};
-    for (let i = 0; i < baldes.length; i += 10) {
-      const chunk = baldes.slice(i, i + 10);
+    const faltam = baldes.filter(b => !(b in cache));
+    for (let i = 0; i < faltam.length; i += 30) {
+      const chunk = faltam.slice(i, i + 30);
       const snap = await db.collection('planilhaNotas').where(firebase.firestore.FieldPath.documentId(), 'in', chunk).get();
-      snap.docs.forEach(d => {
-        const dados = JSON.parse(d.data().dados || '{}');
-        unicos.forEach(n => { if (dados[n]) out[n] = dados[n]; });
-      });
+      chunk.forEach(b => { cache[b] = {}; }); // balde inexistente também fica marcado (não consulta de novo)
+      snap.docs.forEach(d => { cache[d.id] = JSON.parse(d.data().dados || '{}'); });
     }
+    const out = {};
+    unicos.forEach(n => { const dados = cache[this._baldeNF(n)]; if (dados && dados[n]) out[n] = dados[n]; });
     return out;
   },
   async listChavesNfes() {
@@ -635,20 +707,43 @@ const DataLayer = {
   // Busca só as NF-es específicas que interessam (pelas chaves que os CT-es do lote atual
   // referenciam) — usado pra casar automaticamente com o que já foi salvo antes, sem
   // precisar buscar a coleção inteira nem depender do usuário reimportar o mesmo .zip de NF-e.
+  _baldeNfe(chave) { const n = parseInt(String(chave).slice(25, 34), 10); return 'n' + (isNaN(n) ? 0 : Math.floor(n / 500)); },
+  async _carregarBaldesNfe(ids) {
+    const cache = STATE._nfeBaldes = STATE._nfeBaldes || {};
+    const faltam = Array.from(new Set(ids)).filter(b => !(b in cache));
+    for (let i = 0; i < faltam.length; i += 30) {
+      const chunk = faltam.slice(i, i + 30);
+      const snap = await db.collection('nfeBaldes').where(firebase.firestore.FieldPath.documentId(), 'in', chunk).get();
+      chunk.forEach(b => { cache[b] = {}; });
+      snap.docs.forEach(d => { cache[d.id] = JSON.parse(d.data().dados || '{}'); });
+    }
+    return cache;
+  },
+  // Busca só as NF-es que interessam (pelas chaves que os CT-es referenciam). Guardadas em
+  // "baldes" de 500 números por documento — um lote inteiro costuma cair em 1 ou 2 baldes.
   async listNfesPorChaves(chaves) {
-    const unicas = Array.from(new Set(chaves.filter(Boolean)));
+    const unicas = Array.from(new Set((chaves || []).filter(Boolean)));
     if (!unicas.length) return [];
     if (OFFLINE_MODE) {
       const salvas = localDB_read().notasFiscaisSalvas || {};
       return unicas.map(c => salvas[c]).filter(Boolean);
     }
-    const resultados = [];
-    for (let i = 0; i < unicas.length; i += 30) {
-      const chunk = unicas.slice(i, i + 30);
-      const snap = await db.collection('notasFiscais').where(firebase.firestore.FieldPath.documentId(), 'in', chunk).get();
-      snap.docs.forEach(d => resultados.push(d.data()));
+    const cache = STATE._nfesCache = STATE._nfesCache || {};
+    const faltam = unicas.filter(c => !(c in cache));
+    if (faltam.length) {
+      const baldes = await this._carregarBaldesNfe(faltam.map(c => this._baldeNfe(c)));
+      faltam.forEach(c => { const n = baldes[this._baldeNfe(c)][c]; if (n) cache[c] = n; });
+      // NF-es salvas no formato antigo (um documento por NF-e)
+      const restantes = faltam.filter(c => !(c in cache));
+      if (restantes.length && await this._temLegado('notasFiscais')) {
+        for (let i = 0; i < restantes.length; i += 30) {
+          const snap = await db.collection('notasFiscais').where(firebase.firestore.FieldPath.documentId(), 'in', restantes.slice(i, i + 30)).get();
+          snap.docs.forEach(d => { cache[d.id] = d.data(); });
+        }
+      }
+      faltam.forEach(c => { if (!(c in cache)) cache[c] = null; });
     }
-    return resultados;
+    return unicas.map(c => cache[c]).filter(Boolean);
   },
   async salvarNfesEmLote(lista) {
     if (!lista.length) return;
@@ -659,11 +754,19 @@ const DataLayer = {
       localDB_write(data);
       return;
     }
-    for (let i = 0; i < lista.length; i += 400) {
-      const chunk = lista.slice(i, i + 400);
-      const batch = db.batch();
-      chunk.forEach(n => batch.set(db.collection('notasFiscais').doc(n.chave), limparParaFirestore(n)));
-      await batch.commit();
+    const porBalde = {};
+    lista.filter(n => n.chave).forEach(n => { (porBalde[this._baldeNfe(n.chave)] = porBalde[this._baldeNfe(n.chave)] || []).push(n); });
+    const agora = new Date().toISOString();
+    const cacheNfe = STATE._nfesCache = STATE._nfesCache || {};
+    for (const [idBalde, notas] of Object.entries(porBalde)) {
+      const ref = db.collection('nfeBaldes').doc(idBalde);
+      const doc = await ref.get(); // lê fresco pra não sobrescrever o que outra pessoa salvou
+      const atuais = doc.exists ? JSON.parse(doc.data().dados || '{}') : {};
+      let mudou = false;
+      notas.forEach(n => { if (!atuais[n.chave]) { atuais[n.chave] = limparParaFirestore(n); mudou = true; } });
+      if (mudou) await ref.set({ dados: JSON.stringify(atuais), qtd: Object.keys(atuais).length, atualizadoEm: agora });
+      (STATE._nfeBaldes = STATE._nfeBaldes || {})[idBalde] = atuais;
+      notas.forEach(n => { cacheNfe[n.chave] = atuais[n.chave]; });
     }
   },
 };
@@ -680,6 +783,65 @@ function initFirebase() {
   app = firebase.initializeApp(FIREBASE_CONFIG);
   auth = firebase.auth();
   db = firebase.firestore();
+  // cache local no navegador: ao recarregar a página (ou abrir outra aba) em até 30 min,
+  // o Firebase só cobra os documentos que MUDARAM, não a coleção inteira de novo
+  try { db.enablePersistence({ synchronizeTabs: true }).catch(e => console.warn('[Firebase] cache local indisponível:', e.code || e)); }
+  catch (e) { console.warn('[Firebase] cache local indisponível:', e); }
+}
+
+// ---------------------------------------------------------------------
+// 5b. SINCRONIZAÇÃO EM TEMPO REAL (economia de leituras)
+//     Parceiros, análises e a lista do Histórico ficam "assinados": a primeira carga lê os
+//     documentos uma vez, e depois o Firebase só manda (e só cobra) o que mudou. Antes, cada
+//     visita ao Painel/Análises/Histórico relia tudo de novo — cada análise era uma leitura
+//     a cada clique de tela.
+// ---------------------------------------------------------------------
+const SYNC = { unsubs: [], prontos: {}, dados: {}, falhou: {} };
+function iniciarSincronizacao() {
+  if (OFFLINE_MODE || SYNC.unsubs.length) return;
+  const assinar = (nome, query, mapear) => {
+    SYNC.prontos[nome] = new Promise((resolve) => {
+      let resolvido = false;
+      const pronto = () => { if (!resolvido) { resolvido = true; resolve(); } };
+      setTimeout(pronto, 8000); // sem resposta do servidor (offline) — segue com o que tiver em cache
+      const unsub = query.onSnapshot({ includeMetadataChanges: false }, snap => {
+        SYNC.dados[nome] = mapear(snap);
+        SYNC.falhou[nome] = false;
+        if (!snap.metadata.fromCache) pronto();
+        else if (snap.size > 0) setTimeout(pronto, 1500); // cache local: dá um tempinho pro servidor confirmar
+        aoMudarDadosSincronizados(nome);
+      }, err => {
+        console.error(`[Sync ${nome}]`, err);
+        SYNC.falhou[nome] = true;
+        pronto();
+      });
+      SYNC.unsubs.push(unsub);
+    });
+  };
+  assinar('parceiros', db.collection('parceiros').orderBy('nome'), snap => snap.docs.map(d => ({ id: d.id, ...d.data() })));
+  assinar('revisoes', db.collection('revisoes'), snap => snap.docs.map(d => ({ chave: d.id, ...d.data() })));
+  assinar('historico', db.collection('validacoes').orderBy('criadoEm', 'desc').limit(30), snap => snap.docs.map(d => ({ id: d.id, ...d.data() })));
+}
+function pararSincronizacao() {
+  SYNC.unsubs.forEach(u => { try { u(); } catch (e) {} });
+  SYNC.unsubs = []; SYNC.prontos = {}; SYNC.dados = {}; SYNC.falhou = {};
+}
+async function dadosSincronizados(nome) {
+  if (OFFLINE_MODE || !SYNC.prontos[nome]) return null;
+  await SYNC.prontos[nome];
+  if (SYNC.falhou[nome] || !SYNC.dados[nome]) return null;
+  return JSON.parse(JSON.stringify(SYNC.dados[nome])); // cópia — quem chama pode alterar à vontade
+}
+function aoMudarDadosSincronizados(nome) {
+  if (nome === 'revisoes') {
+    const mapa = {};
+    SYNC.dados.revisoes.forEach(r => { mapa[r.chave] = r; });
+    STATE.revisoes = mapa;
+    STATE._revisoesCarregadas = true;
+    if (typeof atualizarBadgeTratativas === 'function') atualizarBadgeTratativas();
+  } else if (nome === 'parceiros' && !STATE._parceiroDraft) {
+    STATE.parceiros = JSON.parse(JSON.stringify(SYNC.dados.parceiros));
+  }
 }
 
 function showConnBanner() {
@@ -714,6 +876,7 @@ async function doLogin() {
 
 function doLogout() {
   if (OFFLINE_MODE) { location.reload(); return; }
+  pararSincronizacao();
   auth.signOut();
 }
 
@@ -736,6 +899,7 @@ function watchAuth() {
       onAuthed();
     } else {
       currentUser = null;
+      pararSincronizacao();
       $('#appShell').classList.add('hidden');
       $('#loginScreen').classList.remove('hidden');
     }
@@ -1985,6 +2149,7 @@ function atualizarBadgeTratativas() {
 }
 
 async function boot() {
+  iniciarSincronizacao();
   try {
     STATE.parceiros = await DataLayer.listParceiros();
   } catch (e) {
@@ -2386,6 +2551,8 @@ async function salvarValidacaoAtual() {
     ].filter(o => !jaNoBanco.has(o.chave)).map(o => ({ ...o, arquivoOrigem: nomeLote, importadoEm: agora }));
 
     const registro = montarRegistroHistorico(nomeLote, v);
+    if (!OFFLINE_MODE && !v._idHistorico) v._idHistorico = db.collection('validacoes').doc().id;
+    registro._idFixo = v._idHistorico;
     let salvo;
     try {
       salvo = await comTimeout(DataLayer.saveValidacao(registro), 60000, 'salvar no Histórico');
@@ -2393,7 +2560,7 @@ async function salvarValidacaoAtual() {
       console.error(e);
       if (/resource-exhausted|quota|timeout|permission/i.test((e.code || '') + (e.message || ''))) throw e;
       // falha por outro motivo (ex: tamanho) — tenta só com o resumo
-      salvo = await comTimeout(DataLayer.saveValidacao({ nomeArquivo: nomeLote, resumo: registro.resumo, detalheDisponivel: false }), 30000, 'salvar no Histórico');
+      salvo = await comTimeout(DataLayer.saveValidacao({ _idFixo: v._idHistorico, nomeArquivo: nomeLote, resumo: registro.resumo, detalheDisponivel: false }), 30000, 'salvar no Histórico');
       toast('Salvo no Histórico só com o resumo (o detalhe linha a linha não coube). Detalhe no console (F12).', 'warn');
     }
     v.historicoId = salvo?.id || null;
@@ -2401,7 +2568,7 @@ async function salvarValidacaoAtual() {
     v._resumoGravado = { ...registro.resumo };
     const ignorados = todasChaves.filter(Boolean).length - paraSalvarGlobal.length;
     try {
-      await comTimeout(DataLayer.salvarCtesEmLote(paraSalvarGlobal), 60000, 'registrar os CT-es');
+      await comTimeout(DataLayer.registrarChavesLote(v.historicoId || v._idHistorico || uid(), nomeLote, paraSalvarGlobal.map(o => o.chave)), 60000, 'registrar os CT-es');
       toast(`Validação salva no Histórico${ignorados > 0 ? ` (${ignorados} CT-e(s) já estavam registrados por outra validação — mantido o primeiro)` : ''}.`, 'success');
     } catch (e) {
       console.error('[CT-e global] falha ao salvar:', e);
@@ -2518,7 +2685,7 @@ async function processarZip(entrada) {
     $('#progressBox').classList.add('hidden');
 
     STATE.ultimaValidacao = { nomeArquivo: nomeLote, resultados, semParceiro, outrosFluxos, reentregas, duplicadosIgnorados: ctesDuplicados.length };
-    STATE._filtrosRes = {}; STATE._filtroAtual = 'todos';
+    STATE._filtrosRes = {}; STATE._filtroAtual = 'todos'; STATE._selecionados = new Set();
     renderResultadosValidacao();
     if ((resumoMatchAutomatico && resumoMatchAutomatico.casados > 0) || (resumoPlanilha && resumoPlanilha.comCanal > 0)) {
       const partes = [];
@@ -3008,12 +3175,26 @@ function renderTabelaResultados(lista, filtro) {
     <div class="mb-4 text-xs px-3 py-2.5 rounded-lg bg-brand-50 text-brand-800 border border-brand-200">
       <strong>Devolução/reversa é prejuízo direto</strong> — o Grupo TBX paga esse frete do próprio bolso, sem repasse pro cliente. Por isso, a coluna "Prejuízo" abaixo mostra o <strong>valor total cobrado</strong> pela transportadora, não a diferença contra a tabela. O "Calculado" continua útil só pra conferir se a transportadora está cobrando certo (e não a mais) — não é o valor do prejuízo em si.
     </div>` : '';
+  const sel = selecionadosSet();
+  const barraMassa = `
+    <div id="barraMassa" class="mb-3 bg-white rounded-2xl border border-ink-100 ring-brand-300 px-4 py-2.5 flex flex-wrap items-center gap-3 text-xs">
+      <span class="text-ink-500"><strong id="qtdSelecionados" class="text-ink-800">${sel.size}</strong> selecionado(s)</span>
+      <select id="selMassaClassificacao" class="border border-ink-200 rounded-lg px-2 py-1.5 max-w-[300px]">
+        <option value="">Classificar como…</option>
+        ${CLASSIFICACOES_DIVERGENCIA.map(c => `<option value="${c.valor}">${c.label}</option>`).join('')}
+      </select>
+      <input id="obsMassa" placeholder="Observação (opcional — vazio mantém a de cada CT-e)" class="border border-ink-200 rounded-lg px-2.5 py-1.5 flex-1 min-w-[220px]">
+      <button id="btnAplicarMassa" ${sel.size ? '' : 'disabled'} class="bg-ink-900 hover:bg-ink-800 disabled:opacity-40 text-white font-medium rounded-lg px-3 py-1.5">Aplicar aos selecionados</button>
+      <button id="btnLimparSelecao" class="text-ink-500 hover:text-ink-700">Limpar seleção</button>
+    </div>`;
   el.innerHTML = `
     ${bannerDevolucao}
+    ${barraMassa}
     <div class="bg-white rounded-2xl shadow-panel border border-ink-100 overflow-hidden">
       <table class="w-full text-sm">
         <thead>
           <tr class="bg-ink-50 text-ink-500 text-[11px] uppercase tracking-wide">
+            <th class="pl-4 pr-1 py-3 w-8"><input type="checkbox" id="chkTodos" title="Selecionar todos desta lista" class="w-4 h-4 rounded border-ink-300 cursor-pointer"></th>
             <th class="text-left font-semibold px-4 py-3">CT-e</th>
             <th class="text-left font-semibold px-4 py-3">NF-e</th>
             ${mostrarCanal ? '<th class="text-left font-semibold px-4 py-3">Canal</th>' : ''}
@@ -3029,7 +3210,8 @@ function renderTabelaResultados(lista, filtro) {
         </thead>
         <tbody class="divide-y divide-ink-100">
           ${lista.slice(0, 1000).map((r, i) => `
-            <tr class="hover:bg-ink-50/60">
+            <tr class="hover:bg-ink-50/60 ${sel.has(r.cte.chave) ? 'bg-brand-50/60' : ''}">
+              <td class="pl-4 pr-1 py-3"><input type="checkbox" class="chk-cte w-4 h-4 rounded border-ink-300 cursor-pointer" data-chave="${escapeHtml(r.cte.chave || '')}" ${sel.has(r.cte.chave) ? 'checked' : ''}></td>
               <td class="px-4 py-3 num text-ink-700">${escapeHtml(r.cte.nCT || '—')}</td>
               <td class="px-4 py-3 num text-ink-600">${escapeHtml(nfsTxt(r))}</td>
               ${mostrarCanal ? `<td class="px-4 py-3 text-ink-600 text-xs">${r.canal ? escapeHtml(r.canal) : '<span class="text-ink-300">—</span>'}</td>` : ''}
@@ -3063,6 +3245,25 @@ function renderTabelaResultados(lista, filtro) {
       ${lista.length > 1000 ? `<div class="text-center text-xs text-ink-400 py-3 border-t border-ink-100">Mostrando 1000 de ${lista.length} — use os filtros ou exporte para Excel para ver todos.</div>` : ''}
     </div>
   `;
+  $$('.chk-cte').forEach(chk => chk.addEventListener('change', () => {
+    if (!chk.dataset.chave) return;
+    if (chk.checked) sel.add(chk.dataset.chave); else sel.delete(chk.dataset.chave);
+    chk.closest('tr').classList.toggle('bg-brand-50/60', chk.checked);
+    atualizarBarraSelecao();
+  }));
+  const chkTodos = $('#chkTodos');
+  if (chkTodos) chkTodos.addEventListener('change', () => {
+    $$('.chk-cte').forEach(chk => {
+      if (!chk.dataset.chave) return;
+      chk.checked = chkTodos.checked;
+      if (chkTodos.checked) sel.add(chk.dataset.chave); else sel.delete(chk.dataset.chave);
+      chk.closest('tr').classList.toggle('bg-brand-50/60', chkTodos.checked);
+    });
+    atualizarBarraSelecao();
+  });
+  $('#btnAplicarMassa').addEventListener('click', aplicarClassificacaoEmMassa);
+  $('#btnLimparSelecao').addEventListener('click', () => { sel.clear(); $$('.chk-cte').forEach(c => { c.checked = false; c.closest('tr').classList.remove('bg-brand-50/60'); }); atualizarBarraSelecao(); });
+  atualizarBarraSelecao();
 }
 
 function resultadoIndexGlobal(r) {
@@ -3274,13 +3475,7 @@ function montarDetalhamentoDivergencias(r) {
   return partes.length ? partes.join(' | ') : 'Nenhum componente cobrado a maior que o calculado.';
 }
 
-async function salvarAnaliseAtual(idx) {
-  const r = STATE.ultimaValidacao.resultados[idx];
-  if (!r) return;
-  const classificacao = $(`#selClassificacao-${idx}`).value;
-  if (!classificacao) { toast('Escolha uma classificação antes de salvar.', 'error'); return; }
-  const observacao = $(`#obsAnalise-${idx}`).value.trim();
-
+function montarRevisao(r, classificacao, observacao) {
   const reconciliacao = calcularReconciliacaoXml(r);
   const icmsCobrado = reconciliacao.componenteImposto ? reconciliacao.componenteImposto.valor : r.cte.vICMS;
   const subtotalCobrado = (r.cobrado != null && icmsCobrado != null) ? clamp2(r.cobrado - icmsCobrado) : null;
@@ -3293,7 +3488,7 @@ async function salvarAnaliseAtual(idx) {
 
   const existente = STATE.revisoes[r.cte.chave];
   const statusAtual = existente?.statusTratativa || 'pendente';
-  const datasStatus = existente?.datasStatus || {};
+  const datasStatus = { ...(existente?.datasStatus || {}) };
   if (!datasStatus[statusAtual]) datasStatus[statusAtual] = new Date().toISOString(); // primeira vez que essa análise existe
 
   const revisao = {
@@ -3318,6 +3513,16 @@ async function salvarAnaliseAtual(idx) {
     datasStatus,
   };
   if (classificacao === 'sem_erro' && !revisao.datasStatus.resolvido) revisao.datasStatus.resolvido = new Date().toISOString();
+  return revisao;
+}
+
+async function salvarAnaliseAtual(idx) {
+  const r = STATE.ultimaValidacao.resultados[idx];
+  if (!r) return;
+  const classificacao = $(`#selClassificacao-${idx}`).value;
+  if (!classificacao) { toast('Escolha uma classificação antes de salvar.', 'error'); return; }
+  const observacao = $(`#obsAnalise-${idx}`).value.trim();
+  const revisao = montarRevisao(r, classificacao, observacao);
 
   const btnSalvar = document.getElementById(`btnSalvarAnalise-${idx}`);
   if (btnSalvar) { btnSalvar.disabled = true; btnSalvar.textContent = 'Salvando…'; btnSalvar.classList.add('opacity-60'); }
@@ -3337,6 +3542,52 @@ async function salvarAnaliseAtual(idx) {
     console.error(e);
     toast(mensagemErroFirebase(e, 'salvar a análise'), 'error');
     if (btnSalvar) { btnSalvar.disabled = false; btnSalvar.textContent = 'Concluir análise'; btnSalvar.classList.remove('opacity-60'); }
+  }
+}
+
+// ----- Classificação em massa (caixas de seleção na tabela de resultados) -----
+function selecionadosSet() {
+  if (!(STATE._selecionados instanceof Set)) STATE._selecionados = new Set();
+  return STATE._selecionados;
+}
+function atualizarBarraSelecao() {
+  const sel = selecionadosSet();
+  const cont = $('#qtdSelecionados'); if (cont) cont.textContent = sel.size;
+  const bar = $('#barraMassa'); if (bar) bar.classList.toggle('ring-2', sel.size > 0);
+  const btn = $('#btnAplicarMassa'); if (btn) btn.disabled = sel.size === 0;
+  const todos = $('#chkTodos');
+  if (todos) {
+    const visiveis = $$('.chk-cte');
+    const marcados = visiveis.filter(c => c.checked).length;
+    todos.checked = visiveis.length > 0 && marcados === visiveis.length;
+    todos.indeterminate = marcados > 0 && marcados < visiveis.length;
+  }
+}
+async function aplicarClassificacaoEmMassa() {
+  const sel = selecionadosSet();
+  const classificacao = $('#selMassaClassificacao')?.value;
+  const obsNova = ($('#obsMassa')?.value || '').trim();
+  if (!sel.size) { toast('Selecione pelo menos um CT-e na tabela.', 'warn'); return; }
+  if (!classificacao) { toast('Escolha a classificação a aplicar.', 'error'); return; }
+  const v = STATE.ultimaValidacao;
+  const alvos = v.resultados.filter(r => sel.has(r.cte.chave));
+  if (!alvos.length) { toast('Os CT-es selecionados não estão mais nesta validação.', 'warn'); sel.clear(); atualizarBarraSelecao(); return; }
+  const revisoes = alvos.map(r => montarRevisao(r, classificacao, obsNova || STATE.revisoes[r.cte.chave]?.observacao || ''));
+  const btn = $('#btnAplicarMassa');
+  if (btn) { btn.disabled = true; btn.textContent = 'Salvando…'; }
+  try {
+    await DataLayer.saveRevisoesEmLote(revisoes);
+    revisoes.forEach(rv => { STATE.revisoes[rv.chave] = rv; });
+    atualizarBadgeTratativas();
+    const info = CLASSIFICACOES_DIVERGENCIA.find(c => c.valor === classificacao);
+    sel.clear();
+    renderResultadosValidacao();
+    atualizarResumoDoLoteNoHistorico();
+    toast(`${revisoes.length} CT-e(s) classificado(s) como "${info ? info.labelCurta : classificacao}"${classificacao === 'sem_erro' ? ' — diferença considerada R$ 0,00 (inclusive no Faturado)' : ''}.`, 'success');
+  } catch (e) {
+    console.error(e);
+    toast(mensagemErroFirebase(e, 'salvar as análises'), 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Aplicar aos selecionados'; }
   }
 }
 
@@ -4688,6 +4939,7 @@ async function abrirHistoricoDetalhe(indice) {
   STATE.ultimaValidacao._resumoGravado = { ...(h.resumo || {}) };
   STATE._filtroAtual = 'todos';
   STATE._filtrosRes = {};
+  STATE._selecionados = new Set();
   goToView('validar');
   setTimeout(() => atualizarResumoDoLoteNoHistorico(), 50);
   // a view de Validar Fretes normalmente é montada vazia (esperando upload); aqui já
