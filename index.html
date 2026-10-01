@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-01-cores-negativos';
+const APP_VERSION = '2026-10-01-plataforma-frete-cliente';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -3809,10 +3809,23 @@ function montarRevisao(r, classificacao, observacao) {
     diferencaApurada,
     margemClienteApurada: r.divergenciaCliente ?? null,
     analisado: true,
+    baseComparacao: 'tabela',
     statusTratativa: classificacao === 'sem_erro' ? 'resolvido' : statusAtual,
     datasStatus,
   };
   if (classificacao === 'sem_erro' && !revisao.datasStatus.resolvido) revisao.datasStatus.resolvido = new Date().toISOString();
+  // Erro de plataforma (bug do site/e-commerce no frete cobrado do cliente): a diferença que importa
+  // é FRETE COBRADO pela transportadora × FRETE COBRADO DO CLIENTE na nota (negativa = prejuízo)
+  if (classificacao === 'plataforma') {
+    const freteCliente = r.valorFreteCliente != null ? r.valorFreteCliente : null;
+    revisao.baseComparacao = 'cliente';
+    revisao.valorCobradoSubtotal = r.cobrado ?? null;
+    revisao.valorRealSubtotal = freteCliente;
+    revisao.valorRessarcir = (freteCliente != null && r.cobrado != null) ? clamp2(freteCliente - r.cobrado) : null;
+    revisao.detalhamentoErros = freteCliente != null
+      ? `Frete cobrado pela transportadora ${fmtBRL(r.cobrado)} × frete cobrado do cliente ${fmtBRL(freteCliente)}${r.nfeVinculada?.nNF ? ` (NF ${r.nfeVinculada.nNF})` : ''}${ehReposicao(r) ? ' — reposição, cliente não paga' : ''} = diferença ${fmtBRL(revisao.valorRessarcir)}.`
+      : `Sem frete do cliente casado (importe o XML da NF-e ou a planilha) — não dá pra calcular a diferença frete cobrado × frete do cliente.`;
+  }
   return revisao;
 }
 
@@ -5772,7 +5785,7 @@ function renderTabelaTratativa(analisadas) {
   const infoAba = aba === 'todos' ? { label: 'Todos os tipos' } : CLASSIFICACOES_DIVERGENCIA.find(c => c.valor === aba);
   const doTipo = (aba === 'todos' ? analisadas.filter(r => r.classificacao !== 'sem_erro') : analisadas.filter(r => r.classificacao === aba)).sort((a, b) => (b.atualizadoEm || '').localeCompare(a.atualizadoEm || ''));
   const box = $('#tabelaTratativaAtiva');
-  const labelValor = aba === 'transportadora' ? 'A ressarcir' : 'Diferença';
+  const labelValor = aba === 'transportadora' ? 'A ressarcir' : aba === 'plataforma' ? 'Diferença (cliente − cobrado)' : 'Diferença';
 
   if (doTipo.length === 0) {
     box.innerHTML = emptyState(`Nenhum caso em "${infoAba?.label}"`, 'Nada classificado nessa categoria ainda.');
@@ -5811,8 +5824,8 @@ function renderTabelaTratativa(analisadas) {
             ${aba === 'todos' ? '<th class="text-left font-semibold px-4 py-3">Tipo de erro</th>' : ''}
             <th class="text-left font-semibold px-4 py-3">Parceiro</th>
             <th class="text-left font-semibold px-4 py-3">Destino</th>
-            <th class="text-right font-semibold px-4 py-3">Cobrado</th>
-            <th class="text-right font-semibold px-4 py-3">Calculado</th>
+            <th class="text-right font-semibold px-4 py-3">${aba === 'plataforma' ? 'Frete cobrado' : 'Cobrado'}</th>
+            <th class="text-right font-semibold px-4 py-3">${aba === 'plataforma' ? 'Frete do cliente' : aba === 'todos' ? 'Calculado / frete cliente' : 'Calculado'}</th>
             <th class="text-right font-semibold px-4 py-3">${labelValor}</th>
             <th class="text-left font-semibold px-4 py-3">Detalhamento dos erros</th>
             <th class="text-left font-semibold px-4 py-3">Status</th>
@@ -5829,9 +5842,9 @@ function renderTabelaTratativa(analisadas) {
               ${aba === 'todos' ? `<td class="px-4 py-3 text-xs"><span class="px-2 py-0.5 rounded-full border ${(LABEL_CLASSIFICACAO[r.classificacao] || {}).cls || ''}">${escapeHtml((LABEL_CLASSIFICACAO[r.classificacao] || {}).label || r.classificacao)}</span></td>` : ''}
               <td class="px-4 py-3 text-ink-700">${escapeHtml(r.parceiroNome || '—')}</td>
               <td class="px-4 py-3 text-ink-600">${escapeHtml(r.destMun || '')} / ${escapeHtml(r.destUF || '')}</td>
-              <td class="px-4 py-3 text-right num text-ink-700">${fmtBRL(r.valorCobradoSubtotal)}</td>
-              <td class="px-4 py-3 text-right num text-ink-700">${fmtBRL(r.valorRealSubtotal)}</td>
-              <td class="px-4 py-3 text-right num font-semibold text-red-600">${fmtBRL(r.valorRessarcir)}</td>
+              <td class="px-4 py-3 text-right num text-ink-700" title="${r.baseComparacao === 'cliente' ? 'Frete total cobrado pela transportadora' : 'Subtotal cobrado (sem ICMS)'}">${fmtBRL(r.valorCobradoSubtotal)}</td>
+              <td class="px-4 py-3 text-right num text-ink-700" title="${r.baseComparacao === 'cliente' ? 'Frete cobrado do cliente na nota fiscal' : 'Subtotal calculado pela tabela (sem ICMS)'}">${fmtBRL(r.valorRealSubtotal)}${r.baseComparacao === 'cliente' && aba === 'todos' ? '<div class="text-[10px] text-ink-400">frete do cliente</div>' : ''}</td>
+              <td class="px-4 py-3 text-right num font-semibold ${r.baseComparacao === 'cliente' && r.valorRessarcir > 0.005 ? 'text-emerald-600' : 'text-red-600'}">${fmtBRL(r.valorRessarcir)}</td>
               <td class="px-4 py-3 text-ink-500 text-xs max-w-[260px] truncate cursor-help" title="${escapeHtml((r.detalhamentoErros||'') + (r.observacao ? '\n\nObservação: '+r.observacao : ''))}">${escapeHtml(r.detalhamentoErros || '—')}</td>
               <td class="px-4 py-3">
                 <select onchange="atualizarStatusTratativa('${r.chave}', this.value)" class="text-xs border rounded-full px-2 py-1 ${(STATUS_TRATATIVA.find(s=>s.valor===(r.statusTratativa||'pendente'))||{}).cls}">
@@ -5878,7 +5891,7 @@ function exportarTratativasXlsx() {
   }
   if (todas.length === 0) { toast(`Nenhuma análise "${infoStatus ? infoStatus.label : 'Todos'}" pra exportar.`, 'warn'); return; }
 
-  const header = ['Nº CTe', 'Fatura', 'Nota Fiscal', 'Canal', 'Parceiro', 'Emissão', 'Destino', 'UF', 'Valor Cobrado (R$)', 'Valor Calculado (R$)', 'Diferença (R$)', 'Status', 'Data Pendente', 'Data Em Tratativa', 'Data Resolvido', 'Detalhamento dos Erros de Cálculo (Subtotal)', 'Observação'];
+  const header = ['Nº CTe', 'Fatura', 'Nota Fiscal', 'Canal', 'Parceiro', 'Emissão', 'Destino', 'UF', 'Valor Cobrado (R$)', 'Valor Calculado / Frete Cliente (R$)', 'Diferença (R$)', 'Base da comparação', 'Status', 'Data Pendente', 'Data Em Tratativa', 'Data Resolvido', 'Detalhamento dos Erros de Cálculo (Subtotal)', 'Observação'];
   const wb = XLSX.utils.book_new();
 
   // uma aba por tipo de erro — pra acompanhar onde está concentrado o problema
@@ -5892,6 +5905,7 @@ function exportarTratativasXlsx() {
       linhas.push([
         r.nCT, r.numeroFatura || '', r.notaFiscal, r.canal || '', r.parceiroNome, r.dhEmi ? fmtDia(r.dhEmi) : '', r.destMun, r.destUF,
         r.valorCobradoSubtotal, r.valorRealSubtotal, r.valorRessarcir,
+        r.baseComparacao === 'cliente' ? 'Frete cobrado × frete do cliente' : 'Subtotal cobrado × tabela',
         (STATUS_TRATATIVA.find(s=>s.valor===(r.statusTratativa||'pendente'))||{}).label,
         datas.pendente ? fmtDate(datas.pendente) : '', datas.em_tratativa ? fmtDate(datas.em_tratativa) : '', datas.resolvido ? fmtDate(datas.resolvido) : '',
         r.detalhamentoErros || '', r.observacao || '',
