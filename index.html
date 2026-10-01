@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-01-cores-prejuizo';
+const APP_VERSION = '2026-10-01-cores-negativos';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -3516,7 +3516,7 @@ function renderTabelaResultados(lista, filtro) {
                   ? `<td class="px-4 py-3 text-right num text-ink-300">—</td>`
                   : analisadoSemErro(r) && Math.abs(r.divergencia) > 0.05
                     ? `<td class="px-4 py-3 text-right num font-semibold text-emerald-600" title="Analisado como Sem erro — diferença original ${fmtBRL(r.divergencia)} considerada R$ 0,00">${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(r.divergencia)}</span></td>`
-                    : `<td class="px-4 py-3 text-right num font-semibold ${Math.abs(r.divergencia) <= 0.05 ? 'text-emerald-600' : 'text-red-600'}">${r.divergencia>0.05?'+':''}${fmtBRL(r.divergencia)}</td>`
+                    : `<td class="px-4 py-3 text-right num font-semibold ${r.divergencia < -0.005 || r.divergencia > 0.05 ? 'text-red-600' : 'text-emerald-600'}" ${Math.abs(r.divergencia) <= 0.05 && Math.abs(r.divergencia) >= 0.005 ? 'title="Diferença de centavos, dentro da tolerância de R$ 0,05 — o CT-e conta como conferido"' : ''}>${r.divergencia>0.05?'+':''}${fmtBRL(r.divergencia)}</td>`
               ) : ''}
               ${mostrarMargem ? `
                 <td class="px-4 py-3 text-right num text-ink-700">${r.valorFreteCliente != null ? fmtBRL(r.valorFreteCliente) : '<span class="text-ink-300">sem NF-e</span>'}</td>
