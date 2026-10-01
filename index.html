@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-01-plataforma-frete-cliente';
+const APP_VERSION = '2026-10-01-transp-diferente-cotada';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -3406,6 +3406,7 @@ function filtroCard(key, label, count, sub, color) {
 
 const LABEL_CLASSIFICACAO = {
   plataforma: { label: 'Plataforma', cls: 'bg-purple-50 text-purple-700 border-purple-200' },
+  transp_diferente: { label: 'Transp. diferente da cotada', cls: 'bg-orange-50 text-orange-700 border-orange-200' },
   intelipost: { label: 'Intelipost', cls: 'bg-blue-50 text-blue-700 border-blue-200' },
   tabela: { label: 'Tabela', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
   transportadora: { label: 'Transportadora', cls: 'bg-red-50 text-red-700 border-red-200' },
@@ -3679,8 +3680,12 @@ const CLASSIFICACOES_DIVERGENCIA = [
   { valor: 'intelipost', label: 'Erro de cálculo — Intelipost', labelCurta: 'Intelipost' },
   { valor: 'tabela', label: 'Erro de tabela negociada (tabela desatualizada/incompleta)', labelCurta: 'Tabela negociada' },
   { valor: 'transportadora', label: 'Erro da transportadora (cobrança indevida)', labelCurta: 'Transportadora' },
+  { valor: 'transp_diferente', label: 'Transportadora despachada diferente da cotada', labelCurta: 'Transp. diferente da cotada' },
   { valor: 'sem_erro', label: 'Sem erro — divergência explicada/aceitável', labelCurta: 'Sem erro' },
 ];
+// classificações em que a diferença é FRETE COBRADO pela transportadora × FRETE COBRADO DO CLIENTE
+// (não contra a tabela negociada)
+const CLASSIF_BASE_CLIENTE = ['plataforma', 'transp_diferente'];
 
 function renderSecaoAnalise(idx, revisao, subtotalCobrado, subtotalCalculado, valorRessarcirPreview) {
   const classificacaoAtual = revisao?.classificacao || '';
@@ -3816,14 +3821,14 @@ function montarRevisao(r, classificacao, observacao) {
   if (classificacao === 'sem_erro' && !revisao.datasStatus.resolvido) revisao.datasStatus.resolvido = new Date().toISOString();
   // Erro de plataforma (bug do site/e-commerce no frete cobrado do cliente): a diferença que importa
   // é FRETE COBRADO pela transportadora × FRETE COBRADO DO CLIENTE na nota (negativa = prejuízo)
-  if (classificacao === 'plataforma') {
+  if (CLASSIF_BASE_CLIENTE.includes(classificacao)) {
     const freteCliente = r.valorFreteCliente != null ? r.valorFreteCliente : null;
     revisao.baseComparacao = 'cliente';
     revisao.valorCobradoSubtotal = r.cobrado ?? null;
     revisao.valorRealSubtotal = freteCliente;
     revisao.valorRessarcir = (freteCliente != null && r.cobrado != null) ? clamp2(freteCliente - r.cobrado) : null;
     revisao.detalhamentoErros = freteCliente != null
-      ? `Frete cobrado pela transportadora ${fmtBRL(r.cobrado)} × frete cobrado do cliente ${fmtBRL(freteCliente)}${r.nfeVinculada?.nNF ? ` (NF ${r.nfeVinculada.nNF})` : ''}${ehReposicao(r) ? ' — reposição, cliente não paga' : ''} = diferença ${fmtBRL(revisao.valorRessarcir)}.`
+      ? `${classificacao === 'transp_diferente' ? `Despachado por ${r.parceiro.nome}, diferente da transportadora cotada. ` : ''}Frete cobrado pela transportadora ${fmtBRL(r.cobrado)} × frete cobrado do cliente ${fmtBRL(freteCliente)}${r.nfeVinculada?.nNF ? ` (NF ${r.nfeVinculada.nNF})` : ''}${ehReposicao(r) ? ' — reposição, cliente não paga' : ''} = diferença ${fmtBRL(revisao.valorRessarcir)}.`
       : `Sem frete do cliente casado (importe o XML da NF-e ou a planilha) — não dá pra calcular a diferença frete cobrado × frete do cliente.`;
   }
   return revisao;
@@ -5741,7 +5746,7 @@ async function renderTratativas() {
       </select>
       ${filtroCanal ? `<span class="text-ink-400">${analisadas.length} de ${analisadasTodas.length} análise(s)</span>` : ''}
     </div>
-    <div class="grid grid-cols-5 gap-4 mb-6">
+    <div class="grid grid-cols-6 gap-4 mb-6">
       ${resumoPorTipo.map(c => `
         <button onclick="mudarAbaTratativa('${c.valor}')" class="text-left rounded-2xl border p-4 transition-all ${STATE._abaTratativaAtiva===c.valor ? 'bg-ink-900 border-ink-900 text-white' : 'bg-white border-ink-100 hover:border-ink-200 text-ink-900'}">
           <div class="text-xs font-medium mb-1 ${STATE._abaTratativaAtiva===c.valor?'text-ink-300':'text-ink-400'}">${c.labelCurta || c.label}</div>
@@ -5785,7 +5790,7 @@ function renderTabelaTratativa(analisadas) {
   const infoAba = aba === 'todos' ? { label: 'Todos os tipos' } : CLASSIFICACOES_DIVERGENCIA.find(c => c.valor === aba);
   const doTipo = (aba === 'todos' ? analisadas.filter(r => r.classificacao !== 'sem_erro') : analisadas.filter(r => r.classificacao === aba)).sort((a, b) => (b.atualizadoEm || '').localeCompare(a.atualizadoEm || ''));
   const box = $('#tabelaTratativaAtiva');
-  const labelValor = aba === 'transportadora' ? 'A ressarcir' : aba === 'plataforma' ? 'Diferença (cliente − cobrado)' : 'Diferença';
+  const labelValor = aba === 'transportadora' ? 'A ressarcir' : CLASSIF_BASE_CLIENTE.includes(aba) ? 'Diferença (cliente − cobrado)' : 'Diferença';
 
   if (doTipo.length === 0) {
     box.innerHTML = emptyState(`Nenhum caso em "${infoAba?.label}"`, 'Nada classificado nessa categoria ainda.');
@@ -5824,8 +5829,8 @@ function renderTabelaTratativa(analisadas) {
             ${aba === 'todos' ? '<th class="text-left font-semibold px-4 py-3">Tipo de erro</th>' : ''}
             <th class="text-left font-semibold px-4 py-3">Parceiro</th>
             <th class="text-left font-semibold px-4 py-3">Destino</th>
-            <th class="text-right font-semibold px-4 py-3">${aba === 'plataforma' ? 'Frete cobrado' : 'Cobrado'}</th>
-            <th class="text-right font-semibold px-4 py-3">${aba === 'plataforma' ? 'Frete do cliente' : aba === 'todos' ? 'Calculado / frete cliente' : 'Calculado'}</th>
+            <th class="text-right font-semibold px-4 py-3">${CLASSIF_BASE_CLIENTE.includes(aba) ? 'Frete cobrado' : 'Cobrado'}</th>
+            <th class="text-right font-semibold px-4 py-3">${CLASSIF_BASE_CLIENTE.includes(aba) ? 'Frete do cliente' : aba === 'todos' ? 'Calculado / frete cliente' : 'Calculado'}</th>
             <th class="text-right font-semibold px-4 py-3">${labelValor}</th>
             <th class="text-left font-semibold px-4 py-3">Detalhamento dos erros</th>
             <th class="text-left font-semibold px-4 py-3">Status</th>
