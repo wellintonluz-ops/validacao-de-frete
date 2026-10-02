@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-01-transp-diferente-cotada';
+const APP_VERSION = '2026-10-01-full-redespacho-uso-consumo';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -308,7 +308,7 @@ function aplicarRegraReposicao(r) {
   r.divergenciaCliente = clamp2(0 - (r.cobrado || 0));
 }
 // Devolução e reposição: prejuízo total (a TBX paga o frete inteiro, o cliente não paga nada)
-function ehPrejuizoTotal(r) { return r.tipoOperacao === 'devolucao' || !!r.reposicao; }
+function ehPrejuizoTotal(r) { return r.tipoOperacao === 'devolucao' || !!r.reposicao || (typeof classifPrejuizoTotal === 'function' && classifPrejuizoTotal(r)); }
 function ehReposicao(r) { return !!r.reposicao && r.tipoOperacao !== 'devolucao'; }
 
 function fmtDate(iso) {
@@ -1471,7 +1471,7 @@ function calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFlu
       temAlgumaNfe = true;
     }
     if (typeof analisadoSemErro === 'function' && analisadoSemErro(r)) {
-      if (ehReposicao(r)) { /* reposição é sempre prejuízo — "Sem erro" não neutraliza */ }
+      if (ehReposicao(r) || classifPrejuizoTotal(r)) { /* sempre prejuízo — não neutraliza */ }
       else if (ehPrejuizoTotal(r)) { ajusteSemErro += r.cobrado || 0; qtdSemErro++; }
       else if (r.valorFreteCliente != null) { ajusteSemErro += (r.cobrado || 0) - r.valorFreteCliente; qtdSemErro++; }
     }
@@ -3102,12 +3102,15 @@ function renderResumoFinanceiro(r) {
 
 // CT-e analisado como "Sem erro": a diferença (e a margem do cliente) contam como ZERO nos
 // cards e na tabela — a diferença original continua no detalhe/tooltip só como referência.
-function analisadoSemErro(r) {
+function classificacaoDe(r) {
   const rev = r && r.cte && STATE.revisoes ? STATE.revisoes[r.cte.chave] : null;
-  return !!(rev && rev.classificacao === 'sem_erro');
+  return rev ? rev.classificacao : null;
 }
+function analisadoSemErro(r) { return CLASSIF_ZERADA.includes(classificacaoDe(r)); } // "Sem erro" ou "Full"
+function classifPrejuizoTotal(r) { return CLASSIF_PREJUIZO_TOTAL.includes(classificacaoDe(r)); } // Redespacho / Uso e Consumo
+function rotuloClassif(r) { const c = classificacaoDe(r); return (LABEL_CLASSIFICACAO[c] || {}).label || c || ''; }
 function divergenciaEfetiva(r) { return analisadoSemErro(r) && r.divergencia !== null && r.divergencia !== undefined ? 0 : r.divergencia; }
-function margemClienteEfetiva(r) { if (ehReposicao(r)) return r.divergenciaCliente; return analisadoSemErro(r) && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined ? 0 : r.divergenciaCliente; }
+function margemClienteEfetiva(r) { if (ehReposicao(r)) return r.divergenciaCliente; if (classifPrejuizoTotal(r)) return -(r.cobrado || 0); return analisadoSemErro(r) && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined ? 0 : r.divergenciaCliente; }
 
 // ----- Filtros da tela de resultados (canal, parceiro, UF, busca livre) -----
 function normBusca(s) { return (s ?? '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase(); }
@@ -3185,6 +3188,7 @@ function renderResultadosValidacao() {
   const ok = resultados.filter(r => !ehPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && Math.abs(divergenciaEfetiva(r)) <= tol && (r.calc.status === 'OK' || analisadoSemErro(r)));
   const devolucoes = resultados.filter(r => r.tipoOperacao === 'devolucao');
   const reposicoes = resultados.filter(ehReposicao);
+  const prejuizoClassif = resultados.filter(r => classifPrejuizoTotal(r) && r.tipoOperacao !== 'devolucao' && !ehReposicao(r));
   const nfeImportada = resultados.some(r => r.valorFreteCliente !== undefined);
   const margemNegativa = resultados.filter(r => !ehPrejuizoTotal(r) && margemClienteEfetiva(r) !== null && margemClienteEfetiva(r) !== undefined && margemClienteEfetiva(r) < -tol);
   const comNfe = resultados.filter(r => r.valorFreteCliente !== null && r.valorFreteCliente !== undefined);
@@ -3245,9 +3249,10 @@ function renderResultadosValidacao() {
       ${filtroCard('ok', 'Conferem / analisados sem erro', ok.length, (() => { const q = resultados.filter(analisadoSemErro).length; return q ? `${q} analisado(s) sem erro` : ''; })(), 'emerald')}
       ${filtroCard('revisao', 'Revisão manual / sem cobertura', revisao.length, '', 'ink')}
     </div>
-    <div class="grid ${nfeImportada ? 'grid-cols-4' : 'grid-cols-3'} gap-3 mb-5">
+    <div class="grid ${nfeImportada ? 'grid-cols-5' : 'grid-cols-4'} gap-3 mb-5">
       ${filtroCard('devolucao', 'Devolução (prejuízo total)', devolucoes.length, fmtBRL(devolucoes.reduce((a,r)=>a+(r.cobrado||0),0)), 'brand')}
       ${filtroCard('reposicao', 'Reposição (prejuízo total)', reposicoes.length, fmtBRL(reposicoes.reduce((a,r)=>a+(r.cobrado||0),0)), 'amber')}
+      ${filtroCard('prejuizo_classif', 'Redespacho / Uso e Consumo', prejuizoClassif.length, fmtBRL(-prejuizoClassif.reduce((a,r)=>a+(r.cobrado||0),0)), 'red')}
       ${filtroCard('reentrega', 'Reentrega (prejuízo total)', reentregas.length, fmtBRL(reentregas.reduce((a,x)=>a+(x.cte.vTPrest||0),0)), 'purple')}
       ${nfeImportada ? filtroCard('margem_negativa', 'Cliente pagou menos que o frete', margemNegativa.length, fmtBRL(margemNegativa.reduce((a,r)=>a+margemClienteEfetiva(r),0)), 'red') : ''}
     </div>
@@ -3327,7 +3332,7 @@ function renderResultadosValidacao() {
     renderResultadosValidacao();
   }));
 
-  const grupos = { todos: resultados, maior, menor, ok, revisao, devolucao: devolucoes, reposicao: reposicoes, margem_negativa: margemNegativa };
+  const grupos = { todos: resultados, maior, menor, ok, revisao, devolucao: devolucoes, reposicao: reposicoes, prejuizo_classif: prejuizoClassif, margem_negativa: margemNegativa };
   if (STATE._filtroAtual === 'reentrega') {
     renderTabelaInformativa(reentregas, 'reentrega');
   } else {
@@ -3407,6 +3412,10 @@ function filtroCard(key, label, count, sub, color) {
 const LABEL_CLASSIFICACAO = {
   plataforma: { label: 'Plataforma', cls: 'bg-purple-50 text-purple-700 border-purple-200' },
   transp_diferente: { label: 'Transp. diferente da cotada', cls: 'bg-orange-50 text-orange-700 border-orange-200' },
+  proposta_comercial: { label: 'Proposta Comercial', cls: 'bg-teal-50 text-teal-700 border-teal-200' },
+  full: { label: 'Full', cls: 'bg-sky-50 text-sky-700 border-sky-200' },
+  redespacho: { label: 'Redespacho', cls: 'bg-rose-50 text-rose-700 border-rose-200' },
+  uso_consumo: { label: 'Uso e Consumo', cls: 'bg-rose-50 text-rose-700 border-rose-200' },
   intelipost: { label: 'Intelipost', cls: 'bg-blue-50 text-blue-700 border-blue-200' },
   tabela: { label: 'Tabela', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
   transportadora: { label: 'Transportadora', cls: 'bg-red-50 text-red-700 border-red-200' },
@@ -3439,7 +3448,7 @@ function renderTabelaResultados(lista, filtro) {
     el.innerHTML = emptyState('Nada por aqui', 'Nenhum CT-e nesta categoria.');
     return;
   }
-  const ehDevolucao = filtro === 'devolucao' || filtro === 'reposicao';
+  const ehDevolucao = filtro === 'devolucao' || filtro === 'reposicao' || filtro === 'prejuizo_classif';
   const mostrarDivergencia = filtro === 'maior' || filtro === 'menor' || ehDevolucao || filtro === 'todos';
   const mostrarCanal = [...(STATE.ultimaValidacao?.resultados || []), ...(STATE.ultimaValidacao?.reentregas || [])].some(x => x.canal);
   const mostrarMargem = filtro === 'margem_negativa' || lista.some(r => r.valorFreteCliente !== null && r.valorFreteCliente !== undefined);
@@ -3512,17 +3521,19 @@ function renderTabelaResultados(lista, filtro) {
               <td class="px-4 py-3 text-right num text-ink-700">${fmtBRL(r.cobrado)}</td>
               <td class="px-4 py-3 text-right num text-ink-700">${r.calculado !== null ? fmtBRL(r.calculado) : '—'}</td>
               ${mostrarDivergencia ? ((ehDevolucao || ehPrejuizoTotal(r))
-                ? `<td class="px-4 py-3 text-right num font-semibold text-red-600" title="${ehReposicao(r) ? 'Reposição' : 'Devolução'} — prejuízo total (valor cobrado inteiro)">${fmtBRL(-(r.cobrado || 0))}</td>`
+                ? `<td class="px-4 py-3 text-right num font-semibold text-red-600" title="${classifPrejuizoTotal(r) ? rotuloClassif(r) : ehReposicao(r) ? 'Reposição' : 'Devolução'} — prejuízo total (valor cobrado inteiro)">${fmtBRL(-(r.cobrado || 0))}</td>`
                 : r.divergencia === null || r.divergencia === undefined
                   ? `<td class="px-4 py-3 text-right num text-ink-300">—</td>`
                   : analisadoSemErro(r) && Math.abs(r.divergencia) > 0.05
-                    ? `<td class="px-4 py-3 text-right num font-semibold text-emerald-600" title="Analisado como Sem erro — diferença original ${fmtBRL(r.divergencia)} considerada R$ 0,00">${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(r.divergencia)}</span></td>`
+                    ? `<td class="px-4 py-3 text-right num font-semibold text-emerald-600" title="Analisado como ${rotuloClassif(r)} — diferença original ${fmtBRL(r.divergencia)} considerada R$ 0,00">${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(r.divergencia)}</span></td>`
                     : `<td class="px-4 py-3 text-right num font-semibold ${r.divergencia < -0.005 || r.divergencia > 0.05 ? 'text-red-600' : 'text-emerald-600'}" ${Math.abs(r.divergencia) <= 0.05 && Math.abs(r.divergencia) >= 0.005 ? 'title="Diferença de centavos, dentro da tolerância de R$ 0,05 — o CT-e conta como conferido"' : ''}>${r.divergencia>0.05?'+':''}${fmtBRL(r.divergencia)}</td>`
               ) : ''}
-              ${mostrarMargem ? `
+              ${mostrarMargem ? (classifPrejuizoTotal(r) ? `
+                <td class="px-4 py-3 text-right num text-ink-700" title="${rotuloClassif(r)}: o cliente não paga esse frete">${fmtBRL(0)}</td>
+                <td class="px-4 py-3 text-right num font-semibold text-red-600" title="${rotuloClassif(r)} — prejuízo total">${fmtBRL(-(r.cobrado || 0))}</td>` : `
                 <td class="px-4 py-3 text-right num text-ink-700">${r.valorFreteCliente != null ? fmtBRL(r.valorFreteCliente) : '<span class="text-ink-300">sem NF-e</span>'}</td>
-                <td class="px-4 py-3 text-right num font-semibold ${r.divergenciaCliente == null ? 'text-ink-300' : margemClienteEfetiva(r) < 0 ? 'text-red-600' : 'text-emerald-600'}" ${analisadoSemErro(r) && r.divergenciaCliente ? `title="Analisado como Sem erro — margem original ${fmtBRL(r.divergenciaCliente)} considerada R$ 0,00"` : ''}>${r.divergenciaCliente != null ? (analisadoSemErro(r) && r.divergenciaCliente ? `${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(r.divergenciaCliente)}</span>` : (r.divergenciaCliente>0?'+':'') + fmtBRL(r.divergenciaCliente)) : '—'}</td>
-              ` : ''}
+                <td class="px-4 py-3 text-right num font-semibold ${r.divergenciaCliente == null ? 'text-ink-300' : margemClienteEfetiva(r) < 0 ? 'text-red-600' : 'text-emerald-600'}" ${analisadoSemErro(r) && r.divergenciaCliente ? `title="Analisado como ${rotuloClassif(r)} — margem original ${fmtBRL(r.divergenciaCliente)} considerada R$ 0,00"` : ''}>${r.divergenciaCliente != null ? (analisadoSemErro(r) && r.divergenciaCliente ? `${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(r.divergenciaCliente)}</span>` : (r.divergenciaCliente>0?'+':'') + fmtBRL(r.divergenciaCliente)) : '—'}</td>
+              `) : ''}
               <td class="px-4 py-3">${r.tabelaAlternativa ? `<span title="Calculado com a tabela em rascunho: ${escapeHtml(r.tabelaAlternativa.nome)}" class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full border bg-amber-50 text-amber-700 border-amber-200 mr-1">TABELA ANTIGA</span>` : ''}${statusBadge(r.calc.status)}${calcularReconciliacaoXml(r).temPendencia ? ' <span title="Existe cobrança no XML que nenhuma regra cadastrada reconhece" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border bg-red-50 text-red-700 border-red-200">$ não cadastrado</span>' : ''}${badgeAnalise(r)}</td>
               <td class="px-4 py-3 text-right">
                 <button onclick="abrirDetalheCte(${resultadoIndexGlobal(r)})" class="text-xs text-brand-600 hover:text-brand-700 font-medium">Detalhes</button>
@@ -3681,11 +3692,19 @@ const CLASSIFICACOES_DIVERGENCIA = [
   { valor: 'tabela', label: 'Erro de tabela negociada (tabela desatualizada/incompleta)', labelCurta: 'Tabela negociada' },
   { valor: 'transportadora', label: 'Erro da transportadora (cobrança indevida)', labelCurta: 'Transportadora' },
   { valor: 'transp_diferente', label: 'Transportadora despachada diferente da cotada', labelCurta: 'Transp. diferente da cotada' },
+  { valor: 'proposta_comercial', label: 'Proposta Comercial', labelCurta: 'Proposta Comercial' },
+  { valor: 'full', label: 'Full (sem prejuízo e sem ganho — diferença zerada)', labelCurta: 'Full' },
+  { valor: 'redespacho', label: 'Redespacho (prejuízo total)', labelCurta: 'Redespacho' },
+  { valor: 'uso_consumo', label: 'Uso e Consumo (prejuízo total)', labelCurta: 'Uso e Consumo' },
   { valor: 'sem_erro', label: 'Sem erro — divergência explicada/aceitável', labelCurta: 'Sem erro' },
 ];
 // classificações em que a diferença é FRETE COBRADO pela transportadora × FRETE COBRADO DO CLIENTE
 // (não contra a tabela negociada)
-const CLASSIF_BASE_CLIENTE = ['plataforma', 'transp_diferente'];
+const CLASSIF_BASE_CLIENTE = ['plataforma', 'intelipost', 'transp_diferente'];
+// diferença sempre zerada (não é prejuízo nem ganho) — mesmo efeito do "Sem erro"
+const CLASSIF_ZERADA = ['sem_erro', 'full'];
+// sempre prejuízo total (o valor cobrado inteiro), igual devolução/reposição
+const CLASSIF_PREJUIZO_TOTAL = ['redespacho', 'uso_consumo'];
 
 function renderSecaoAnalise(idx, revisao, subtotalCobrado, subtotalCalculado, valorRessarcirPreview) {
   const classificacaoAtual = revisao?.classificacao || '';
@@ -3786,7 +3805,7 @@ function montarRevisao(r, classificacao, observacao) {
     ? clamp2(subtotalCobrado - subtotalCalculado) : null;
   // "Sem erro" = diferença já explicada (desconto, custo já considerado...) -> conta como ZERO,
   // seja positiva ou negativa. A diferença original fica guardada só como referência.
-  const valorRessarcir = classificacao === 'sem_erro' ? 0 : diferencaApurada;
+  const valorRessarcir = CLASSIF_ZERADA.includes(classificacao) ? 0 : diferencaApurada;
 
   const existente = STATE.revisoes[r.cte.chave];
   const statusAtual = existente?.statusTratativa || 'pendente';
@@ -3815,10 +3834,22 @@ function montarRevisao(r, classificacao, observacao) {
     margemClienteApurada: r.divergenciaCliente ?? null,
     analisado: true,
     baseComparacao: 'tabela',
-    statusTratativa: classificacao === 'sem_erro' ? 'resolvido' : statusAtual,
+    statusTratativa: CLASSIF_ZERADA.includes(classificacao) ? 'resolvido' : statusAtual,
     datasStatus,
   };
-  if (classificacao === 'sem_erro' && !revisao.datasStatus.resolvido) revisao.datasStatus.resolvido = new Date().toISOString();
+  if (CLASSIF_ZERADA.includes(classificacao) && !revisao.datasStatus.resolvido) revisao.datasStatus.resolvido = new Date().toISOString();
+  if (classificacao === 'full') {
+    revisao.baseComparacao = 'zerada';
+    revisao.detalhamentoErros = `Full — sem prejuízo e sem ganho: diferença considerada R$ 0,00${diferencaApurada ? ` (diferença apurada contra a tabela: ${fmtBRL(diferencaApurada)})` : ''}.`;
+  }
+  if (CLASSIF_PREJUIZO_TOTAL.includes(classificacao)) {
+    const rot = classificacao === 'redespacho' ? 'Redespacho' : 'Uso e Consumo';
+    revisao.baseComparacao = 'prejuizo';
+    revisao.valorCobradoSubtotal = r.cobrado ?? null;
+    revisao.valorRealSubtotal = 0;
+    revisao.valorRessarcir = r.cobrado != null ? clamp2(-r.cobrado) : null;
+    revisao.detalhamentoErros = `${rot} — prejuízo total: o valor cobrado inteiro (${fmtBRL(r.cobrado)}) é prejuízo, o cliente não paga esse frete.`;
+  }
   // Erro de plataforma (bug do site/e-commerce no frete cobrado do cliente): a diferença que importa
   // é FRETE COBRADO pela transportadora × FRETE COBRADO DO CLIENTE na nota (negativa = prejuízo)
   if (CLASSIF_BASE_CLIENTE.includes(classificacao)) {
@@ -3848,7 +3879,7 @@ async function salvarAnaliseAtual(idx) {
     await DataLayer.saveRevisao(revisao);
     STATE.revisoes[revisao.chave] = revisao;
     atualizarBadgeTratativas();
-    toast(classificacao === 'sem_erro' ? 'Análise salva — marcado como analisado, diferença considerada R$ 0,00 (inclusive no Faturado).' : 'Análise salva.', 'success');
+    toast(CLASSIF_ZERADA.includes(classificacao) ? 'Análise salva — marcado como analisado, diferença considerada R$ 0,00 (inclusive no Faturado).' : CLASSIF_PREJUIZO_TOTAL.includes(classificacao) ? 'Análise salva — valor cobrado inteiro considerado prejuízo (inclusive no Faturado).' : 'Análise salva.', 'success');
     if (STATE.ultimaValidacao) {
       renderResultadosValidacao();
       atualizarResumoDoLoteNoHistorico();
@@ -3901,7 +3932,7 @@ async function aplicarClassificacaoEmMassa() {
     sel.clear();
     renderResultadosValidacao();
     atualizarResumoDoLoteNoHistorico();
-    toast(`${revisoes.length} CT-e(s) classificado(s) como "${info ? info.labelCurta : classificacao}"${classificacao === 'sem_erro' ? ' — diferença considerada R$ 0,00 (inclusive no Faturado)' : ''}.`, 'success');
+    toast(`${revisoes.length} CT-e(s) classificado(s) como "${info ? info.labelCurta : classificacao}"${CLASSIF_ZERADA.includes(classificacao) ? ' — diferença considerada R$ 0,00 (inclusive no Faturado)' : CLASSIF_PREJUIZO_TOTAL.includes(classificacao) ? ' — valor cobrado inteiro como prejuízo (inclusive no Faturado)' : ''}.`, 'success');
   } catch (e) {
     console.error(e);
     toast(mensagemErroFirebase(e, 'salvar as análises'), 'error');
@@ -5746,7 +5777,7 @@ async function renderTratativas() {
       </select>
       ${filtroCanal ? `<span class="text-ink-400">${analisadas.length} de ${analisadasTodas.length} análise(s)</span>` : ''}
     </div>
-    <div class="grid grid-cols-6 gap-4 mb-6">
+    <div class="grid grid-cols-3 lg:grid-cols-5 gap-4 mb-6">
       ${resumoPorTipo.map(c => `
         <button onclick="mudarAbaTratativa('${c.valor}')" class="text-left rounded-2xl border p-4 transition-all ${STATE._abaTratativaAtiva===c.valor ? 'bg-ink-900 border-ink-900 text-white' : 'bg-white border-ink-100 hover:border-ink-200 text-ink-900'}">
           <div class="text-xs font-medium mb-1 ${STATE._abaTratativaAtiva===c.valor?'text-ink-300':'text-ink-400'}">${c.labelCurta || c.label}</div>
@@ -5790,7 +5821,7 @@ function renderTabelaTratativa(analisadas) {
   const infoAba = aba === 'todos' ? { label: 'Todos os tipos' } : CLASSIFICACOES_DIVERGENCIA.find(c => c.valor === aba);
   const doTipo = (aba === 'todos' ? analisadas.filter(r => r.classificacao !== 'sem_erro') : analisadas.filter(r => r.classificacao === aba)).sort((a, b) => (b.atualizadoEm || '').localeCompare(a.atualizadoEm || ''));
   const box = $('#tabelaTratativaAtiva');
-  const labelValor = aba === 'transportadora' ? 'A ressarcir' : CLASSIF_BASE_CLIENTE.includes(aba) ? 'Diferença (cliente − cobrado)' : 'Diferença';
+  const labelValor = aba === 'transportadora' ? 'A ressarcir' : CLASSIF_BASE_CLIENTE.includes(aba) ? 'Diferença (cliente − cobrado)' : CLASSIF_PREJUIZO_TOTAL.includes(aba) ? 'Prejuízo' : 'Diferença';
 
   if (doTipo.length === 0) {
     box.innerHTML = emptyState(`Nenhum caso em "${infoAba?.label}"`, 'Nada classificado nessa categoria ainda.');
@@ -5829,8 +5860,8 @@ function renderTabelaTratativa(analisadas) {
             ${aba === 'todos' ? '<th class="text-left font-semibold px-4 py-3">Tipo de erro</th>' : ''}
             <th class="text-left font-semibold px-4 py-3">Parceiro</th>
             <th class="text-left font-semibold px-4 py-3">Destino</th>
-            <th class="text-right font-semibold px-4 py-3">${CLASSIF_BASE_CLIENTE.includes(aba) ? 'Frete cobrado' : 'Cobrado'}</th>
-            <th class="text-right font-semibold px-4 py-3">${CLASSIF_BASE_CLIENTE.includes(aba) ? 'Frete do cliente' : aba === 'todos' ? 'Calculado / frete cliente' : 'Calculado'}</th>
+            <th class="text-right font-semibold px-4 py-3">${CLASSIF_BASE_CLIENTE.includes(aba) || CLASSIF_PREJUIZO_TOTAL.includes(aba) ? 'Frete cobrado' : 'Cobrado'}</th>
+            <th class="text-right font-semibold px-4 py-3">${CLASSIF_BASE_CLIENTE.includes(aba) ? 'Frete do cliente' : CLASSIF_PREJUIZO_TOTAL.includes(aba) ? 'Cliente paga' : aba === 'todos' ? 'Calculado / frete cliente' : 'Calculado'}</th>
             <th class="text-right font-semibold px-4 py-3">${labelValor}</th>
             <th class="text-left font-semibold px-4 py-3">Detalhamento dos erros</th>
             <th class="text-left font-semibold px-4 py-3">Status</th>
@@ -5910,7 +5941,7 @@ function exportarTratativasXlsx() {
       linhas.push([
         r.nCT, r.numeroFatura || '', r.notaFiscal, r.canal || '', r.parceiroNome, r.dhEmi ? fmtDia(r.dhEmi) : '', r.destMun, r.destUF,
         r.valorCobradoSubtotal, r.valorRealSubtotal, r.valorRessarcir,
-        r.baseComparacao === 'cliente' ? 'Frete cobrado × frete do cliente' : 'Subtotal cobrado × tabela',
+        r.baseComparacao === 'cliente' ? 'Frete cobrado × frete do cliente' : r.baseComparacao === 'prejuizo' ? 'Prejuízo total (valor cobrado)' : r.baseComparacao === 'zerada' ? 'Zerado (Full)' : 'Subtotal cobrado × tabela',
         (STATUS_TRATATIVA.find(s=>s.valor===(r.statusTratativa||'pendente'))||{}).label,
         datas.pendente ? fmtDate(datas.pendente) : '', datas.em_tratativa ? fmtDate(datas.em_tratativa) : '', datas.resolvido ? fmtDate(datas.resolvido) : '',
         r.detalhamentoErros || '', r.observacao || '',
