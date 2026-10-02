@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-01-full-redespacho-uso-consumo';
+const APP_VERSION = '2026-10-02-analises-filtros-status';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -255,6 +255,11 @@ function fmtBRL(n) {
 function fmtNum(n, dec=2) {
   if (n === null || n === undefined || isNaN(n)) return '—';
   return n.toLocaleString('pt-BR', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+}
+function fmtDataCurtaISO(d) {
+  if (!d) return '—';
+  const m = String(d).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : fmtDia(d);
 }
 function fmtDia(iso) {
   if (!iso) return '—';
@@ -660,7 +665,7 @@ const DataLayer = {
       localDB_write(data);
       return;
     }
-    await db.collection('registroChaves').doc(idLote).set({ chaves: unicas, qtd: unicas.length, nomeArquivo: nomeLote, numeroFatura: (STATE.ultimaValidacao && STATE.ultimaValidacao.numeroFatura) || null, criadoEm: new Date().toISOString(), criadoPor: currentUser ? currentUser.email : '' });
+    await db.collection('registroChaves').doc(idLote).set({ chaves: unicas, qtd: unicas.length, nomeArquivo: nomeLote, numeroFatura: (STATE.ultimaValidacao && STATE.ultimaValidacao.numeroFatura) || null, vencimentoFatura: (STATE.ultimaValidacao && STATE.ultimaValidacao.vencimentoFatura) || null, criadoEm: new Date().toISOString(), criadoPor: currentUser ? currentUser.email : '' });
   },
   async listChavesCtes() {
     if (OFFLINE_MODE) return new Set(Object.keys(localDB_read().ctes || {}));
@@ -2324,7 +2329,7 @@ async function carregarRevisoes() {
 function atualizarBadgeTratativas() {
   const badge = $('#badgeTratativas');
   if (!badge) return;
-  const pendentes = Object.values(STATE.revisoes).filter(r => r.classificacao && r.classificacao !== 'sem_erro' && (r.statusTratativa || 'pendente') !== 'resolvido').length;
+  const pendentes = Object.values(STATE.revisoes).filter(r => r.classificacao && r.classificacao !== 'sem_erro' && !statusEhResolvido(r.statusTratativa || 'pendente')).length;
   if (pendentes > 0) {
     badge.textContent = pendentes;
     badge.classList.remove('hidden');
@@ -2471,7 +2476,9 @@ function renderValidar() {
   const el = $('#validarContent');
   el.innerHTML = `
     <h1 class="text-2xl font-bold text-ink-900">Validar Fretes</h1>
-    <p class="text-sm text-ink-400 mt-0.5 mb-6">Envie os XMLs dos CT-es recebidos na fatura do parceiro — pode ser o .zip, os XMLs soltos ou a pasta inteira.</p>
+    <p class="text-sm text-ink-400 mt-0.5 mb-6">Informe a fatura e depois envie os XMLs dos CT-es recebidos nela — pode ser o .zip, os XMLs soltos ou a pasta inteira.</p>
+
+    <div id="boxFatura" class="mb-4"></div>
 
     <div class="grid grid-cols-2 gap-4">
       <div>
@@ -2480,6 +2487,7 @@ function renderValidar() {
           <input type="file" id="folderCte" webkitdirectory directory multiple class="hidden">
           <svg class="w-9 h-9 mx-auto text-ink-300 mb-2" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M12 12v9m0-9l-3 3m3-3l3 3"/></svg>
           <div class="text-sm font-medium text-ink-700">CT-es (fatura do parceiro)</div>
+          <div id="avisoFaturaZona" class="hidden mt-1 text-xs font-semibold text-amber-700">🔒 Preencha o Nº e o vencimento da fatura acima e clique em OK pra liberar</div>
           <div class="text-xs text-ink-400 mt-1">Arraste aqui o .zip, os XMLs ou a pasta inteira (subpastas também são lidas)</div>
           <div class="flex items-center justify-center gap-2 mt-4">
             <button type="button" data-acao="arquivos" data-alvo="cte" class="btn-upload px-3 py-1.5 rounded-lg border border-ink-200 bg-white text-xs font-medium text-ink-700 hover:border-brand-400 hover:text-brand-700">Selecionar arquivos (.zip ou .xml)</button>
@@ -2539,6 +2547,9 @@ function renderValidar() {
   }
 
   ligarZonaUpload($('#uploadZone'), $('#fileZip'), $('#folderCte'), ['border-brand-400','bg-brand-50/30'], (arqs) => processarZip(arqs));
+  // o clique na zona de CT-es só abre o seletor depois que a fatura foi confirmada
+  $('#uploadZone').addEventListener('click', (e) => { if (!STATE._faturaAtual) { e.stopImmediatePropagation(); exigirFatura(); } }, true);
+  renderBoxFatura();
   ligarZonaUpload($('#uploadZoneNFe'), $('#fileZipNFe'), $('#folderNFe'), ['border-purple-400','bg-purple-50/30'], (arqs) => processarArquivosNotas(arqs, 'progressNFeBoxInicial'));
 }
 
@@ -2627,7 +2638,7 @@ function montarRegistroHistorico(nomeLote, v) {
     faturado: resumoFin.faturado,
   };
   return {
-    nomeArquivo: nomeLote, numeroFatura: v.numeroFatura || null, resumo,
+    nomeArquivo: nomeLote, numeroFatura: v.numeroFatura || null, vencimentoFatura: v.vencimentoFatura || null, resumo,
     resultados: resultados.map(trimResultadoParaHistorico),
     semParceiro: semParceiro.map(trimSemParceiroParaHistorico),
     outrosFluxos: outrosFluxos.map(trimForaFluxoParaHistorico),
@@ -2717,6 +2728,105 @@ async function recalcularLoteAtual() {
   }
 }
 
+// ----- Fatura: obrigatória ANTES de importar os CT-es (Nº + vencimento + OK) -----
+function exigirFatura() {
+  toast('Primeiro informe o Nº da fatura e a data de vencimento e clique em OK.', 'warn');
+  const inp = $('#faturaNumeroIni');
+  if (inp) { inp.focus(); inp.classList.add('ring-2', 'ring-red-300'); }
+}
+function renderBoxFatura() {
+  const box = $('#boxFatura');
+  if (!box) return;
+  const f = STATE._faturaAtual;
+  const zona = $('#uploadZone');
+  if (zona) zona.classList.toggle('opacity-50', !f);
+  const aviso = $('#avisoFaturaZona');
+  if (aviso) aviso.classList.toggle('hidden', !!f);
+  if (f) {
+    box.innerHTML = `
+      <div class="bg-emerald-50 border border-emerald-200 rounded-2xl px-5 py-3 flex flex-wrap items-center gap-4 text-sm">
+        <span class="text-emerald-800">✓ Fatura <strong>${escapeHtml(f.numero)}</strong> · vencimento <strong>${fmtDataCurtaISO(f.vencimento)}</strong></span>
+        <span class="text-xs text-emerald-700">Importação de CT-es liberada.</span>
+        <button id="btnAlterarFatura" class="ml-auto text-xs font-medium text-emerald-800 underline">Alterar</button>
+      </div>`;
+    $('#btnAlterarFatura').addEventListener('click', () => {
+      if (temValidacaoNaoSalva()) { toast('Já existe um lote importado com essa fatura — altere pelo botão "Alterar fatura" nos resultados.', 'warn'); return; }
+      STATE._faturaRascunho = { ...f }; STATE._faturaAtual = null; renderBoxFatura();
+    });
+    return;
+  }
+  const r = STATE._faturaRascunho || {};
+  box.innerHTML = `
+    <div class="bg-white border-2 border-amber-300 rounded-2xl px-5 py-4">
+      <div class="text-sm font-semibold text-ink-800 mb-0.5">1. Dados da fatura</div>
+      <p class="text-xs text-ink-400 mb-3">Obrigatório antes de importar os CT-es.</p>
+      <div class="flex flex-wrap items-end gap-3">
+        <label class="text-xs text-ink-500">Nº da fatura *
+          <input id="faturaNumeroIni" value="${escapeHtml(r.numero || '')}" placeholder="ex: TRX 3819" class="block mt-1 border border-ink-200 rounded-lg px-3 py-2 text-sm w-48">
+        </label>
+        <label class="text-xs text-ink-500">Data de vencimento *
+          <input id="faturaVencIni" type="date" value="${escapeHtml(r.vencimento || '')}" class="block mt-1 border border-ink-200 rounded-lg px-3 py-2 text-sm">
+        </label>
+        <button id="btnOkFatura" class="bg-ink-900 hover:bg-ink-800 text-white text-sm font-semibold rounded-lg px-5 py-2">OK</button>
+      </div>
+    </div>`;
+  const confirmar = () => {
+    const numero = $('#faturaNumeroIni').value.trim();
+    const vencimento = $('#faturaVencIni').value;
+    $('#faturaNumeroIni').classList.toggle('ring-2', !numero); $('#faturaNumeroIni').classList.toggle('ring-red-300', !numero);
+    $('#faturaVencIni').classList.toggle('ring-2', !vencimento); $('#faturaVencIni').classList.toggle('ring-red-300', !vencimento);
+    if (!numero || !vencimento) { toast('Preencha o Nº da fatura e a data de vencimento.', 'error'); return; }
+    STATE._faturaAtual = { numero, vencimento };
+    STATE._faturaRascunho = null;
+    renderBoxFatura();
+    toast(`Fatura ${numero} confirmada — agora importe os CT-es.`, 'success');
+  };
+  $('#btnOkFatura').addEventListener('click', confirmar);
+  ['#faturaNumeroIni', '#faturaVencIni'].forEach(sel => $(sel).addEventListener('keydown', (e) => { if (e.key === 'Enter') confirmar(); }));
+}
+
+// Alterar a fatura de um lote já importado (antes de salvar, ou já salvo — atualiza o Histórico)
+function perguntarFatura(atual) {
+  return new Promise(resolve => {
+    const wrap = document.createElement('div');
+    wrap.className = 'fixed inset-0 z-[60] bg-ink-900/40 flex items-center justify-center p-4';
+    wrap.innerHTML = `
+      <div class="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6">
+        <div class="text-base font-semibold text-ink-900 mb-3">Dados da fatura</div>
+        <label class="text-xs text-ink-500 block mb-3">Nº da fatura *<input id="pfNum" value="${escapeHtml(atual.numero || '')}" class="block mt-1 w-full border border-ink-200 rounded-lg px-3 py-2 text-sm"></label>
+        <label class="text-xs text-ink-500 block mb-5">Data de vencimento *<input id="pfVenc" type="date" value="${escapeHtml(atual.vencimento || '')}" class="block mt-1 w-full border border-ink-200 rounded-lg px-3 py-2 text-sm"></label>
+        <div class="flex justify-end gap-2">
+          <button data-r="cancelar" class="px-3 py-2 rounded-lg text-sm text-ink-600 hover:bg-ink-50">Cancelar</button>
+          <button data-r="ok" class="px-4 py-2 rounded-lg text-sm font-semibold text-white bg-ink-900 hover:bg-ink-800">OK</button>
+        </div>
+      </div>`;
+    document.body.appendChild(wrap);
+    wrap.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-r]');
+      if (!b) { if (e.target === wrap) { wrap.remove(); resolve(null); } return; }
+      if (b.dataset.r === 'cancelar') { wrap.remove(); resolve(null); return; }
+      const numero = wrap.querySelector('#pfNum').value.trim(), vencimento = wrap.querySelector('#pfVenc').value;
+      if (!numero || !vencimento) { toast('Preencha o Nº da fatura e a data de vencimento.', 'error'); return; }
+      wrap.remove(); resolve({ numero, vencimento });
+    });
+  });
+}
+async function alterarFaturaDoLote() {
+  const v = STATE.ultimaValidacao;
+  if (!v) return;
+  const nova = await perguntarFatura({ numero: v.numeroFatura, vencimento: v.vencimentoFatura });
+  if (!nova) return;
+  v.numeroFatura = nova.numero; v.vencimentoFatura = nova.vencimento;
+  if (!v.historicoId) STATE._faturaAtual = { ...nova };
+  renderResultadosValidacao();
+  if (v.historicoId) {
+    try {
+      await comTimeout(db.collection('validacoes').doc(v.historicoId).update({ numeroFatura: nova.numero, vencimentoFatura: nova.vencimento }), 20000, 'atualizar a fatura');
+      toast('Fatura atualizada no Histórico.', 'success');
+    } catch (e) { console.error(e); toast(mensagemErroFirebase(e, 'atualizar a fatura no Histórico'), 'error'); }
+  }
+}
+
 // ----- Salvar a validação manualmente -----
 function temValidacaoNaoSalva() {
   const v = STATE.ultimaValidacao;
@@ -2727,12 +2837,10 @@ async function salvarValidacaoAtual() {
   const v = STATE.ultimaValidacao;
   if (!v) return false;
   if (v.historicoId) { toast('Essa validação já está salva no Histórico.', 'info'); return true; }
-  const inpF = $('#numeroFatura');
-  if (inpF) v.numeroFatura = inpF.value.trim();
-  if (!v.numeroFatura) {
-    toast('Preencha o Nº da fatura antes de salvar a validação.', 'error');
-    if (inpF) { inpF.focus(); inpF.classList.add('ring-2', 'ring-red-300'); }
-    return false;
+  if (!v.numeroFatura || !v.vencimentoFatura) {
+    const f = await perguntarFatura({ numero: v.numeroFatura, vencimento: v.vencimentoFatura });
+    if (!f) { toast('Informe o Nº e o vencimento da fatura pra salvar.', 'error'); return false; }
+    v.numeroFatura = f.numero; v.vencimentoFatura = f.vencimento;
   }
   if (STATE._salvandoValidacao) return false;
   STATE._salvandoValidacao = true;
@@ -2763,11 +2871,13 @@ async function salvarValidacaoAtual() {
       console.error(e);
       if (/resource-exhausted|quota|timeout|permission/i.test((e.code || '') + (e.message || ''))) throw e;
       // falha por outro motivo (ex: tamanho) — tenta só com o resumo
-      salvo = await comTimeout(DataLayer.saveValidacao({ _idFixo: v._idHistorico, nomeArquivo: nomeLote, numeroFatura: v.numeroFatura, resumo: registro.resumo, detalheDisponivel: false }), 30000, 'salvar no Histórico');
+      salvo = await comTimeout(DataLayer.saveValidacao({ _idFixo: v._idHistorico, nomeArquivo: nomeLote, numeroFatura: v.numeroFatura, vencimentoFatura: v.vencimentoFatura || null, resumo: registro.resumo, detalheDisponivel: false }), 30000, 'salvar no Histórico');
       toast('Salvo no Histórico só com o resumo (o detalhe linha a linha não coube). Detalhe no console (F12).', 'warn');
     }
     v.historicoId = salvo?.id || null;
     v.naoSalvo = false;
+    STATE._faturaAtual = null; // próxima importação pede uma fatura nova
+    if (typeof renderBoxFatura === 'function') renderBoxFatura();
     v._resumoGravado = { ...registro.resumo };
     const ignorados = todasChaves.filter(Boolean).length - paraSalvarGlobal.length;
     try {
@@ -2830,6 +2940,7 @@ window.addEventListener('beforeunload', (e) => {
 
 async function processarZip(entrada) {
   const nomeLote = nomeDoLote(entrada);
+  if (!STATE._faturaAtual) { exigirFatura(); return; }
   if (!(await podeSairDaValidacao('Existe uma validação que ainda não foi salva. Deseja descartá-la e importar os novos arquivos?', 'Descartar e importar'))) return;
   if (STATE.parceiros.length === 0) {
     toast('Cadastre pelo menos um parceiro antes de validar.', 'warn');
@@ -2888,7 +2999,8 @@ async function processarZip(entrada) {
     }
     $('#progressBox').classList.add('hidden');
 
-    STATE.ultimaValidacao = { nomeArquivo: nomeLote, resultados, semParceiro, outrosFluxos, reentregas, duplicadosIgnorados: ctesDuplicados.length };
+    STATE.ultimaValidacao = { nomeArquivo: nomeLote, resultados, semParceiro, outrosFluxos, reentregas, duplicadosIgnorados: ctesDuplicados.length,
+      numeroFatura: STATE._faturaAtual ? STATE._faturaAtual.numero : null, vencimentoFatura: STATE._faturaAtual ? STATE._faturaAtual.vencimento : null };
     STATE._filtrosRes = {}; STATE._filtroAtual = 'todos'; STATE._selecionados = new Set();
     renderResultadosValidacao();
     if ((resumoMatchAutomatico && resumoMatchAutomatico.casados > 0) || (resumoPlanilha && resumoPlanilha.comCanal > 0)) {
@@ -3205,9 +3317,9 @@ function renderResultadosValidacao() {
       </div>
       <div class="flex items-center gap-4">
         ${vAtual.historicoId
-          ? `<span class="text-sm font-medium text-emerald-700 flex items-center gap-1" title="Esta validação está no Histórico — análises, notas e recálculos feitos agora atualizam o registro salvo">✓ Salvo no Histórico${vAtual.numeroFatura ? ` · fatura <strong>${escapeHtml(vAtual.numeroFatura)}</strong>` : ''}</span>`
+          ? `<span class="text-sm font-medium text-emerald-700 flex items-center gap-1" title="Esta validação está no Histórico — análises, notas e recálculos feitos agora atualizam o registro salvo">✓ Salvo no Histórico${vAtual.numeroFatura ? ` · fatura <strong>${escapeHtml(vAtual.numeroFatura)}</strong>` : ''}${vAtual.vencimentoFatura ? ` · venc. ${fmtDataCurtaISO(vAtual.vencimentoFatura)}` : ''}</span> <button id="btnAlterarFaturaLote" class="text-xs text-brand-600 underline">alterar fatura</button>`
           : vAtual.naoSalvo
-            ? `<input id="numeroFatura" value="${escapeHtml(vAtual.numeroFatura || '')}" placeholder="Nº da fatura *" title="Obrigatório pra salvar a validação" class="text-sm border ${vAtual.numeroFatura ? 'border-ink-200' : 'border-amber-300 bg-amber-50/50'} rounded-lg px-2.5 py-1.5 w-40">
+            ? `<span class="text-sm text-ink-600">Fatura <strong>${escapeHtml(vAtual.numeroFatura || '—')}</strong>${vAtual.vencimentoFatura ? ` · venc. ${fmtDataCurtaISO(vAtual.vencimentoFatura)}` : ''} <button id="btnAlterarFaturaLote" class="text-xs text-brand-600 underline ml-1">alterar</button></span>
                <button id="btnSalvarValidacao" class="text-sm font-semibold text-white bg-brand-600 hover:bg-brand-700 rounded-lg px-3 py-1.5 shadow-sm">Salvar validação</button>`
             : ''}
         <button id="btnImportarNFe" class="text-sm font-medium text-ink-600 hover:text-ink-800 flex items-center gap-1.5">
@@ -3304,16 +3416,8 @@ function renderResultadosValidacao() {
   });
   const btnSalvarVal = $('#btnSalvarValidacao');
   if (btnSalvarVal) btnSalvarVal.addEventListener('click', salvarValidacaoAtual);
-  const inpFatura = $('#numeroFatura');
-  if (inpFatura) {
-    inpFatura.addEventListener('input', () => {
-      vAtual.numeroFatura = inpFatura.value.trim();
-      inpFatura.classList.toggle('border-amber-300', !vAtual.numeroFatura);
-      inpFatura.classList.toggle('bg-amber-50/50', !vAtual.numeroFatura);
-      inpFatura.classList.remove('ring-2', 'ring-red-300');
-    });
-    inpFatura.addEventListener('keydown', (e) => { if (e.key === 'Enter') salvarValidacaoAtual(); });
-  }
+  const btnAltFat = $('#btnAlterarFaturaLote');
+  if (btnAltFat) btnAltFat.addEventListener('click', alterarFaturaDoLote);
   $('#btnExportar').addEventListener('click', () => {
     const blob = exportResultadosParaXlsx(resultados, semParceiro, STATE.parceiros, outrosFluxos, reentregas);
     downloadBlob(blob, `Validacao_Fretes_${String(nomeArquivo).replace(/\.zip$/i,'').replace(/[\\/:*?"<>|]+/g,'_')}.xlsx`);
@@ -3822,6 +3926,7 @@ function montarRevisao(r, classificacao, observacao) {
     notaFiscal: (r.cte.notasFiscais || [])[0]?.numero || null,
     canal: r.canal || null,
     numeroFatura: (STATE.ultimaValidacao && STATE.ultimaValidacao.numeroFatura) || null,
+    vencimentoFatura: (STATE.ultimaValidacao && STATE.ultimaValidacao.vencimentoFatura) || null,
     tabelaUsada: r.tabelaAlternativa ? r.tabelaAlternativa.nome : null,
     reposicao: !!r.reposicao,
     classificacao,
@@ -3834,10 +3939,10 @@ function montarRevisao(r, classificacao, observacao) {
     margemClienteApurada: r.divergenciaCliente ?? null,
     analisado: true,
     baseComparacao: 'tabela',
-    statusTratativa: CLASSIF_ZERADA.includes(classificacao) ? 'resolvido' : statusAtual,
+    statusTratativa: CLASSIF_ZERADA.includes(classificacao) ? 'resolvido_custo' : statusAtual,
     datasStatus,
   };
-  if (CLASSIF_ZERADA.includes(classificacao) && !revisao.datasStatus.resolvido) revisao.datasStatus.resolvido = new Date().toISOString();
+  if (CLASSIF_ZERADA.includes(classificacao) && !revisao.datasStatus.resolvido_custo) revisao.datasStatus.resolvido_custo = new Date().toISOString();
   if (classificacao === 'full') {
     revisao.baseComparacao = 'zerada';
     revisao.detalhamentoErros = `Full — sem prejuízo e sem ganho: diferença considerada R$ 0,00${diferencaApurada ? ` (diferença apurada contra a tabela: ${fmtBRL(diferencaApurada)})` : ''}.`;
@@ -5379,6 +5484,7 @@ async function abrirHistoricoDetalhe(indice) {
     historicoId: h.id || null,
     nomeArquivo: h.nomeArquivo,
     numeroFatura: h.numeroFatura || null,
+    vencimentoFatura: h.vencimentoFatura || null,
     duplicadosIgnorados: h.resumo?.duplicadosIgnorados || 0,
     resultados: h.resultados,
     semParceiro: h.semParceiro || [],
@@ -5415,6 +5521,7 @@ async function renderHistorico() {
           <tr class="bg-ink-50 text-ink-500 text-[11px] uppercase tracking-wide">
             <th class="text-left font-semibold px-5 py-3">Data</th>
             <th class="text-left font-semibold px-5 py-3">Fatura</th>
+            <th class="text-left font-semibold px-5 py-3">Vencimento</th>
             <th class="text-left font-semibold px-5 py-3">Arquivo</th>
             <th class="text-left font-semibold px-5 py-3">Parceiros</th>
             <th class="text-right font-semibold px-5 py-3">CT-es</th>
@@ -5433,6 +5540,7 @@ async function renderHistorico() {
             <tr class="${temDetalhe ? 'hover:bg-brand-50/60 cursor-pointer' : 'opacity-60'}" ${temDetalhe ? `onclick="abrirHistoricoDetalhe(${i})"` : `title="Detalhe linha a linha não disponível pra este lote — exporte o Excel na época ou rode a validação de novo com o mesmo .zip"`}>
               <td class="px-5 py-3 text-ink-500 text-xs">${fmtDate(h.criadoEm)}</td>
               <td class="px-5 py-3 text-ink-800 font-semibold num">${escapeHtml(h.numeroFatura||'—')}</td>
+              <td class="px-5 py-3 text-ink-600 text-xs num">${h.vencimentoFatura ? fmtDataCurtaISO(h.vencimentoFatura) : '—'}</td>
               <td class="px-5 py-3 text-ink-600">${escapeHtml(h.nomeArquivo||'—')}</td>
               <td class="px-5 py-3 text-ink-600 text-xs">${escapeHtml((h.resumo?.parceiros||[]).join(', '))}</td>
               <td class="px-5 py-3 text-right num">${h.resumo?.total ?? 0}</td>
@@ -5689,8 +5797,13 @@ async function carregarMapaProdutosAtivo() {
 const STATUS_TRATATIVA = [
   { valor: 'pendente', label: 'Pendente', cls: 'bg-red-50 text-red-700 border-red-200' },
   { valor: 'em_tratativa', label: 'Em tratativa', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
-  { valor: 'resolvido', label: 'Resolvido', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+  { valor: 'resolvido_pago', label: 'Resolvido - Pago', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+  { valor: 'resolvido_custo', label: 'Resolvido - Custo', cls: 'bg-sky-50 text-sky-700 border-sky-200' },
 ];
+// "Resolvido" antigo (antes de existir Pago/Custo) — continua aparecendo até ser reclassificado
+const STATUS_LEGADO = { valor: 'resolvido', label: 'Resolvido (antigo — definir Pago/Custo)', cls: 'bg-ink-100 text-ink-600 border-ink-200' };
+function infoStatusTratativa(v) { return STATUS_TRATATIVA.find(s => s.valor === v) || (v === 'resolvido' ? STATUS_LEGADO : STATUS_TRATATIVA[0]); }
+function statusEhResolvido(v) { return /^resolvido/.test(v || ''); }
 
 function fmtDataCurta(iso) {
   if (!iso) return '';
@@ -5701,10 +5814,25 @@ function fmtDataCurta(iso) {
 }
 function historicoStatusTexto(r) {
   const datas = r.datasStatus || {};
-  const linhas = STATUS_TRATATIVA
+  const linhas = [...STATUS_TRATATIVA, STATUS_LEGADO]
     .filter(s => datas[s.valor])
     .map(s => `${s.label}: ${fmtDate(datas[s.valor])}`);
   return linhas.length ? linhas.join('\n') : 'Sem histórico de datas ainda.';
+}
+
+function filtrarAnalises(lista, f) {
+  f = f || {};
+  return lista.filter(r => {
+    if (f.canal && (f.canal === '__sem__' ? !!r.canal : r.canal !== f.canal)) return false;
+    if (f.transp && r.parceiroNome !== f.transp) return false;
+    if (f.de || f.ate) {
+      const d = (r.dhEmi || '').slice(0, 10);
+      if (!d) return false;
+      if (f.de && d < f.de) return false;
+      if (f.ate && d > f.ate) return false;
+    }
+    return true;
+  });
 }
 
 async function renderTratativas() {
@@ -5748,11 +5876,13 @@ async function renderTratativas() {
     semCanal.forEach(r => { const n = mapa[normNumeroNF(r.notaFiscal)]; if (n && n.canal) r.canal = n.canal; });
   }
   const canaisAnalises = Array.from(new Set(analisadasTodas.map(r => r.canal).filter(Boolean))).sort();
-  const filtroCanal = STATE._filtroCanalTratativa || '';
-  const analisadas = filtroCanal ? analisadasTodas.filter(r => filtroCanal === '__sem__' ? !r.canal : r.canal === filtroCanal) : analisadasTodas;
+  const transpAnalises = Array.from(new Set(analisadasTodas.map(r => r.parceiroNome).filter(Boolean))).sort();
+  const fA = STATE._filtrosAnalise = STATE._filtrosAnalise || {};
+  const filtroAtivo = !!(fA.canal || fA.transp || fA.de || fA.ate);
+  const analisadas = filtrarAnalises(analisadasTodas, fA);
   const lista = $('#tratativasLista');
 
-  if (analisadas.length === 0) {
+  if (analisadasTodas.length === 0) {
     lista.innerHTML = emptyState('Nenhuma análise registrada ainda', 'Quando você classificar uma divergência no detalhe do CT-e (aba Validar Fretes), ela aparece aqui, separada por tipo de erro.');
     return;
   }
@@ -5763,19 +5893,36 @@ async function renderTratativas() {
   // resumo por tipo — pra ver de cara onde está concentrado o erro
   const resumoPorTipo = abas.map(c => {
     const doTipo = c.valor === 'todos' ? analisadas.filter(r => r.classificacao !== 'sem_erro') : analisadas.filter(r => r.classificacao === c.valor);
-    const pendentesDoTipo = doTipo.filter(r => (r.statusTratativa || 'pendente') !== 'resolvido');
+    const pendentesDoTipo = doTipo.filter(r => !statusEhResolvido(r.statusTratativa || 'pendente'));
     return { ...c, qtd: doTipo.length, qtdPendente: pendentesDoTipo.length, valorTotal: doTipo.reduce((a, r) => a + Math.abs(r.valorRessarcir || 0), 0) };
   });
 
+  const opt = (v, l, atual) => `<option value="${escapeHtml(v)}" ${atual === v ? 'selected' : ''}>${escapeHtml(l)}</option>`;
   lista.innerHTML = `
-    <div class="mb-4 flex items-center gap-3 text-xs">
-      <span class="font-semibold text-ink-500 uppercase tracking-wide text-[11px]">Canal</span>
-      <select id="filtroCanalTratativa" class="border border-ink-200 rounded-lg px-2 py-1.5">
-        <option value="">Todos os canais</option>
-        ${canaisAnalises.map(c => `<option value="${escapeHtml(c)}" ${filtroCanal === c ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('')}
-        <option value="__sem__" ${filtroCanal === '__sem__' ? 'selected' : ''}>Sem canal identificado</option>
-      </select>
-      ${filtroCanal ? `<span class="text-ink-400">${analisadas.length} de ${analisadasTodas.length} análise(s)</span>` : ''}
+    <div class="mb-4 bg-white rounded-2xl border border-ink-100 px-4 py-3 flex flex-wrap items-end gap-3 text-xs">
+      <span class="font-semibold text-ink-500 uppercase tracking-wide text-[11px] self-center">Filtros</span>
+      <label class="text-ink-500">Período (emissão do CT-e)
+        <span class="flex items-center gap-1 mt-1">
+          <input type="date" data-filtro-an="de" value="${escapeHtml(fA.de || '')}" class="border border-ink-200 rounded-lg px-2 py-1.5">
+          <span class="text-ink-300">até</span>
+          <input type="date" data-filtro-an="ate" value="${escapeHtml(fA.ate || '')}" class="border border-ink-200 rounded-lg px-2 py-1.5">
+        </span>
+      </label>
+      <label class="text-ink-500">Transportadora
+        <select data-filtro-an="transp" class="block mt-1 border border-ink-200 rounded-lg px-2 py-1.5 max-w-[220px]">
+          ${opt('', 'Todas', fA.transp || '')}
+          ${transpAnalises.map(t => opt(t, t, fA.transp)).join('')}
+        </select>
+      </label>
+      <label class="text-ink-500">Canal
+        <select data-filtro-an="canal" class="block mt-1 border border-ink-200 rounded-lg px-2 py-1.5 max-w-[200px]">
+          ${opt('', 'Todos os canais', fA.canal || '')}
+          ${canaisAnalises.map(c => opt(c, c, fA.canal)).join('')}
+          ${opt('__sem__', 'Sem canal identificado', fA.canal)}
+        </select>
+      </label>
+      ${filtroAtivo ? `<button id="btnLimparFiltrosAn" class="text-brand-600 hover:text-brand-700 font-medium self-center">Limpar filtros</button>` : ''}
+      <span class="ml-auto self-center text-ink-400">${filtroAtivo ? `Mostrando <strong class="text-ink-700">${analisadas.filter(r => r.classificacao !== 'sem_erro').length}</strong> de ${analisadasTodas.filter(r => r.classificacao !== 'sem_erro').length} análise(s) — o Excel sai com esse filtro` : `${analisadasTodas.filter(r => r.classificacao !== 'sem_erro').length} análise(s) — sem filtro, o Excel sai geral`}</span>
     </div>
     <div class="grid grid-cols-3 lg:grid-cols-5 gap-4 mb-6">
       ${resumoPorTipo.map(c => `
@@ -5789,8 +5936,10 @@ async function renderTratativas() {
     <div id="tabelaTratativaAtiva"></div>
     <p class="text-xs text-ink-300 mt-3">Os valores são sobre o subtotal (sem ICMS), conforme definido na análise de cada CT-e. CT-es classificados como "Sem erro" não aparecem aqui — servem só pra marcar que a divergência foi conferida e é aceitável.</p>
   `;
-  const selCanal = $('#filtroCanalTratativa');
-  if (selCanal) selCanal.addEventListener('change', () => { STATE._filtroCanalTratativa = selCanal.value; renderTratativas(); });
+  $$('[data-filtro-an]').forEach(el => el.addEventListener('change', () => { STATE._filtrosAnalise[el.dataset.filtroAn] = el.value; renderTratativas(); }));
+  const btnLimparAn = $('#btnLimparFiltrosAn');
+  if (btnLimparAn) btnLimparAn.addEventListener('click', () => { STATE._filtrosAnalise = {}; renderTratativas(); });
+  atualizarTextoExportar();
   renderTabelaTratativa(analisadas);
 }
 
@@ -5810,8 +5959,13 @@ function atualizarTextoExportar() {
   const el = $('#btnExportarTratativasTexto');
   if (!el) return;
   const subAba = STATE._subAbaTratativaAtiva || 'todos';
-  const info = STATUS_TRATATIVA.find(s => s.valor === subAba);
-  el.textContent = subAba === 'todos' ? 'Exportar Excel (todos)' : `Exportar Excel (${info ? info.label : subAba})`;
+  const aba = STATE._abaTratativaAtiva || 'todos';
+  const fA = STATE._filtrosAnalise || {};
+  const partes = [];
+  if (aba !== 'todos') { const c = CLASSIFICACOES_DIVERGENCIA.find(x => x.valor === aba); partes.push(c ? c.labelCurta : aba); }
+  if (subAba !== 'todos') partes.push(infoStatusTratativa(subAba).label);
+  if (fA.canal || fA.transp || fA.de || fA.ate) partes.push('com filtros');
+  el.textContent = partes.length ? `Exportar Excel (${partes.join(' · ')})` : 'Exportar Excel (geral)';
 }
 
 function renderTabelaTratativa(analisadas) {
@@ -5824,12 +5978,15 @@ function renderTabelaTratativa(analisadas) {
   const labelValor = aba === 'transportadora' ? 'A ressarcir' : CLASSIF_BASE_CLIENTE.includes(aba) ? 'Diferença (cliente − cobrado)' : CLASSIF_PREJUIZO_TOTAL.includes(aba) ? 'Prejuízo' : 'Diferença';
 
   if (doTipo.length === 0) {
-    box.innerHTML = emptyState(`Nenhum caso em "${infoAba?.label}"`, 'Nada classificado nessa categoria ainda.');
+    const fAt = STATE._filtrosAnalise || {};
+    const comFiltro = !!(fAt.canal || fAt.transp || fAt.de || fAt.ate);
+    box.innerHTML = emptyState(`Nenhum caso em "${infoAba?.label}"`, comFiltro ? 'Nenhum caso com os filtros aplicados — ajuste o período/transportadora ou clique em "Limpar filtros".' : 'Nada classificado nessa categoria ainda.');
     return;
   }
 
   // subabas por status — quantidade e valor dentro do tópico atual
-  const gruposStatus = STATUS_TRATATIVA.map(s => {
+  const temLegado = doTipo.some(r => r.statusTratativa === 'resolvido');
+  const gruposStatus = [...STATUS_TRATATIVA, ...(temLegado ? [STATUS_LEGADO] : [])].map(s => {
     const doStatus = doTipo.filter(r => (r.statusTratativa || 'pendente') === s.valor);
     return { ...s, qtd: doStatus.length, valorTotal: doStatus.reduce((a, r) => a + Math.abs(r.valorRessarcir || 0), 0) };
   });
@@ -5872,7 +6029,7 @@ function renderTabelaTratativa(analisadas) {
             <tr class="hover:bg-ink-50/60">
               <td class="px-4 py-3 num text-ink-700">${escapeHtml(r.nCT || '—')}</td>
               <td class="px-4 py-3 num text-ink-500 text-xs whitespace-nowrap">${fmtDia(r.dhEmi)}</td>
-              <td class="px-4 py-3 num text-ink-600 text-xs">${escapeHtml(r.numeroFatura || '—')}</td>
+              <td class="px-4 py-3 num text-ink-600 text-xs">${escapeHtml(r.numeroFatura || '—')}${r.vencimentoFatura ? `<div class="text-[10px] text-ink-400">venc. ${fmtDataCurtaISO(r.vencimentoFatura)}</div>` : ''}</td>
               <td class="px-4 py-3 num text-ink-600">${escapeHtml(r.notaFiscal || '—')}</td>
               <td class="px-4 py-3 text-ink-600 text-xs">${r.canal ? escapeHtml(r.canal) : '<span class="text-ink-300">—</span>'}</td>
               ${aba === 'todos' ? `<td class="px-4 py-3 text-xs"><span class="px-2 py-0.5 rounded-full border ${(LABEL_CLASSIFICACAO[r.classificacao] || {}).cls || ''}">${escapeHtml((LABEL_CLASSIFICACAO[r.classificacao] || {}).label || r.classificacao)}</span></td>` : ''}
@@ -5883,8 +6040,8 @@ function renderTabelaTratativa(analisadas) {
               <td class="px-4 py-3 text-right num font-semibold ${r.baseComparacao === 'cliente' && r.valorRessarcir > 0.005 ? 'text-emerald-600' : 'text-red-600'}">${fmtBRL(r.valorRessarcir)}</td>
               <td class="px-4 py-3 text-ink-500 text-xs max-w-[260px] truncate cursor-help" title="${escapeHtml((r.detalhamentoErros||'') + (r.observacao ? '\n\nObservação: '+r.observacao : ''))}">${escapeHtml(r.detalhamentoErros || '—')}</td>
               <td class="px-4 py-3">
-                <select onchange="atualizarStatusTratativa('${r.chave}', this.value)" class="text-xs border rounded-full px-2 py-1 ${(STATUS_TRATATIVA.find(s=>s.valor===(r.statusTratativa||'pendente'))||{}).cls}">
-                  ${STATUS_TRATATIVA.map(s => `<option value="${s.valor}" ${(r.statusTratativa||'pendente')===s.valor?'selected':''}>${s.label}</option>`).join('')}
+                <select onchange="atualizarStatusTratativa('${r.chave}', this.value)" class="text-xs border rounded-full px-2 py-1 ${infoStatusTratativa(r.statusTratativa||'pendente').cls}">
+                  ${[...STATUS_TRATATIVA, ...(r.statusTratativa === 'resolvido' ? [STATUS_LEGADO] : [])].map(s => `<option value="${s.valor}" ${(r.statusTratativa||'pendente')===s.valor?'selected':''}>${s.label}</option>`).join('')}
                 </select>
                 <div class="text-[10px] text-ink-300 mt-1 cursor-help" title="${escapeHtml(historicoStatusTexto(r))}">${fmtDataCurta((r.datasStatus||{})[r.statusTratativa||'pendente'])}</div>
               </td>
@@ -5917,17 +6074,17 @@ async function atualizarStatusTratativa(chave, novoStatus) {
 
 function exportarTratativasXlsx() {
   const subAba = STATE._subAbaTratativaAtiva || 'todos';
-  const infoStatus = STATUS_TRATATIVA.find(s => s.valor === subAba);
+  const infoStatus = subAba === 'todos' ? null : infoStatusTratativa(subAba);
+  const aba = STATE._abaTratativaAtiva || 'todos';
+  const fA = STATE._filtrosAnalise || {};
 
   let todas = Object.values(STATE.revisoes).filter(r => r.classificacao && r.classificacao !== 'sem_erro');
-  const filtroCanal = STATE._filtroCanalTratativa || '';
-  if (filtroCanal) todas = todas.filter(r => filtroCanal === '__sem__' ? !r.canal : r.canal === filtroCanal);
-  if (subAba !== 'todos') {
-    todas = todas.filter(r => (r.statusTratativa || 'pendente') === subAba);
-  }
-  if (todas.length === 0) { toast(`Nenhuma análise "${infoStatus ? infoStatus.label : 'Todos'}" pra exportar.`, 'warn'); return; }
+  todas = filtrarAnalises(todas, fA);                                   // filtros (período, transportadora, canal)
+  if (aba !== 'todos') todas = todas.filter(r => r.classificacao === aba); // aba (tipo de erro) selecionada
+  if (subAba !== 'todos') todas = todas.filter(r => (r.statusTratativa || 'pendente') === subAba); // status
+  if (todas.length === 0) { toast('Nenhuma análise com esses filtros pra exportar.', 'warn'); return; }
 
-  const header = ['Nº CTe', 'Fatura', 'Nota Fiscal', 'Canal', 'Parceiro', 'Emissão', 'Destino', 'UF', 'Valor Cobrado (R$)', 'Valor Calculado / Frete Cliente (R$)', 'Diferença (R$)', 'Base da comparação', 'Status', 'Data Pendente', 'Data Em Tratativa', 'Data Resolvido', 'Detalhamento dos Erros de Cálculo (Subtotal)', 'Observação'];
+  const header = ['Nº CTe', 'Fatura', 'Vencimento', 'Nota Fiscal', 'Canal', 'Parceiro', 'Emissão', 'Destino', 'UF', 'Valor Cobrado (R$)', 'Valor Calculado / Frete Cliente (R$)', 'Diferença (R$)', 'Base da comparação', 'Status', 'Data Pendente', 'Data Em Tratativa', 'Data Resolvido - Pago', 'Data Resolvido - Custo', 'Detalhamento dos Erros de Cálculo (Subtotal)', 'Observação'];
   const wb = XLSX.utils.book_new();
 
   // uma aba por tipo de erro — pra acompanhar onde está concentrado o problema
@@ -5939,11 +6096,12 @@ function exportarTratativasXlsx() {
     doTipo.forEach(r => {
       const datas = r.datasStatus || {};
       linhas.push([
-        r.nCT, r.numeroFatura || '', r.notaFiscal, r.canal || '', r.parceiroNome, r.dhEmi ? fmtDia(r.dhEmi) : '', r.destMun, r.destUF,
+        r.nCT, r.numeroFatura || '', r.vencimentoFatura ? fmtDataCurtaISO(r.vencimentoFatura) : '', r.notaFiscal, r.canal || '', r.parceiroNome, r.dhEmi ? fmtDia(r.dhEmi) : '', r.destMun, r.destUF,
         r.valorCobradoSubtotal, r.valorRealSubtotal, r.valorRessarcir,
         r.baseComparacao === 'cliente' ? 'Frete cobrado × frete do cliente' : r.baseComparacao === 'prejuizo' ? 'Prejuízo total (valor cobrado)' : r.baseComparacao === 'zerada' ? 'Zerado (Full)' : 'Subtotal cobrado × tabela',
-        (STATUS_TRATATIVA.find(s=>s.valor===(r.statusTratativa||'pendente'))||{}).label,
-        datas.pendente ? fmtDate(datas.pendente) : '', datas.em_tratativa ? fmtDate(datas.em_tratativa) : '', datas.resolvido ? fmtDate(datas.resolvido) : '',
+        infoStatusTratativa(r.statusTratativa || 'pendente').label,
+        datas.pendente ? fmtDate(datas.pendente) : '', datas.em_tratativa ? fmtDate(datas.em_tratativa) : '',
+        datas.resolvido_pago ? fmtDate(datas.resolvido_pago) : '', datas.resolvido_custo ? fmtDate(datas.resolvido_custo) : (datas.resolvido ? fmtDate(datas.resolvido) + ' (antigo)' : ''),
         r.detalhamentoErros || '', r.observacao || '',
       ]);
     });
@@ -5952,8 +6110,15 @@ function exportarTratativasXlsx() {
   });
 
   // aba de resumo, já refletindo o mesmo filtro de status
-  const resumoLinhas = [[`Resumo — filtro: ${infoStatus ? infoStatus.label : 'Todos'}`], [], ['Tipo de erro', 'Quantidade', 'Valor total (R$)']];
-  CLASSIFICACOES_DIVERGENCIA.filter(c => c.valor !== 'sem_erro').forEach(cat => {
+  const descFiltros = [
+    `Tipo de erro: ${aba === 'todos' ? 'todos' : (CLASSIFICACOES_DIVERGENCIA.find(c => c.valor === aba) || {}).label || aba}`,
+    `Status: ${infoStatus ? infoStatus.label : 'todos'}`,
+    `Período (emissão do CT-e): ${fA.de || fA.ate ? `${fA.de ? fmtDataCurtaISO(fA.de) : 'início'} a ${fA.ate ? fmtDataCurtaISO(fA.ate) : 'hoje'}` : 'todos'}`,
+    `Transportadora: ${fA.transp || 'todas'}`,
+    `Canal: ${fA.canal ? (fA.canal === '__sem__' ? 'sem canal identificado' : fA.canal) : 'todos'}`,
+  ];
+  const resumoLinhas = [['Relatório de Análises de Divergência'], ...descFiltros.map(t => [t]), [], ['Tipo de erro', 'Quantidade', 'Valor total (R$)']];
+  CLASSIFICACOES_DIVERGENCIA.filter(c => c.valor !== 'sem_erro' && (aba === 'todos' || c.valor === aba)).forEach(cat => {
     const doTipo = todas.filter(r => r.classificacao === cat.valor);
     resumoLinhas.push([cat.labelCurta || cat.label, doTipo.length, doTipo.reduce((a,r)=>a+Math.abs(r.valorRessarcir||0),0)]);
   });
@@ -5961,7 +6126,7 @@ function exportarTratativasXlsx() {
   XLSX.utils.book_append_sheet(wb, wsResumo, 'Resumo');
   wb.SheetNames.unshift(wb.SheetNames.pop()); // move Resumo pro início
 
-  const sufixo = subAba === 'todos' ? '' : '_' + (infoStatus ? infoStatus.label.replace(/\s+/g, '') : subAba);
+  const sufixo = [aba !== 'todos' ? aba : '', infoStatus ? infoStatus.label.replace(/[\s-]+/g, '') : '', fA.transp ? fA.transp.split(' ')[0] : '', fA.de || fA.ate ? `${fA.de || 'inicio'}_a_${fA.ate || 'hoje'}` : ''].filter(Boolean).map(x => '_' + x).join('');
   const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
   downloadBlob(new Blob([out], { type: 'application/octet-stream' }), `Analises_Divergencia${sufixo}.xlsx`);
 }
