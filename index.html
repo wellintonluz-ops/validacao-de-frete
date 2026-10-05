@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-02-analises-filtros-status';
+const APP_VERSION = '2026-10-05-transp-sem-icms';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -561,10 +561,10 @@ const DataLayer = {
     const snap = await db.collection('revisoes').get();
     return snap.docs.map(d => ({ chave: d.id, ...d.data() }));
   },
-  async saveRevisoesEmLote(lista) {
+  async saveRevisoesEmLote(lista, opts) {
     const agora = new Date().toISOString();
     const quem = currentUser ? currentUser.email : 'offline';
-    lista.forEach(r => { r.atualizadoEm = agora; r.atualizadoPor = quem; });
+    if (!(opts && opts.manterCarimbo)) lista.forEach(r => { r.atualizadoEm = agora; r.atualizadoPor = quem; });
     if (OFFLINE_MODE) {
       const data = localDB_read();
       data.revisoes = data.revisoes || {};
@@ -2171,7 +2171,7 @@ function exportResultadosParaXlsx(resultados, semParceiro, parceirosEnvolvidos, 
   resultados.forEach(r => r.calc.componentes.forEach(c => nomesRegras.add(c.nome)));
   const listaRegras = Array.from(nomesRegras);
   listaRegras.forEach(n => { headerDetalhe.push(`${n} Cobrado`, `${n} Calculado`); });
-  headerDetalhe.push('TOTAL Cobrado (R$)', 'TOTAL Calculado (R$)', 'Divergência (R$)', 'Status', 'Frete Cliente (NF-e) (R$)', 'Margem Cliente x Transportadora (R$)');
+  headerDetalhe.push('TOTAL Cobrado (R$)', 'TOTAL Calculado (R$)', 'Divergência (calculado − cobrado) (R$)', 'Status', 'Frete Cliente (NF-e) (R$)', 'Margem Cliente x Transportadora (R$)');
 
   const linhasDetalhe = [headerDetalhe];
   resultados
@@ -2190,7 +2190,7 @@ function exportResultadosParaXlsx(resultados, semParceiro, parceirosEnvolvidos, 
         row.push(achado.valor !== undefined ? achado.valor : '');
         row.push(comp && comp.aplicavel ? comp.valor : (comp && comp.manual ? 'manual' : ''));
       });
-      row.push(r.cobrado, r.calculado, r.divergencia, r.calc.status, r.valorFreteCliente ?? '', r.divergenciaCliente ?? '');
+      row.push(r.cobrado, r.calculado, difExibida(r.divergencia) ?? '', r.calc.status, r.valorFreteCliente ?? '', r.divergenciaCliente ?? '');
       linhasDetalhe.push(row);
     });
 
@@ -3221,6 +3221,9 @@ function classificacaoDe(r) {
 function analisadoSemErro(r) { return CLASSIF_ZERADA.includes(classificacaoDe(r)); } // "Sem erro" ou "Full"
 function classifPrejuizoTotal(r) { return CLASSIF_PREJUIZO_TOTAL.includes(classificacaoDe(r)); } // Redespacho / Uso e Consumo
 function rotuloClassif(r) { const c = classificacaoDe(r); return (LABEL_CLASSIFICACAO[c] || {}).label || c || ''; }
+// Convenção de exibição: Divergência/Prejuízo = CALCULADO − COBRADO → negativo = cobrado a maior (prejuízo)
+function semZeroNeg(v) { return v === 0 ? 0 : v; }
+function difExibida(v) { return v === null || v === undefined ? v : semZeroNeg(clamp2(-v)); }
 function divergenciaEfetiva(r) { return analisadoSemErro(r) && r.divergencia !== null && r.divergencia !== undefined ? 0 : r.divergencia; }
 function margemClienteEfetiva(r) { if (ehReposicao(r)) return r.divergenciaCliente; if (classifPrejuizoTotal(r)) return -(r.cobrado || 0); return analisadoSemErro(r) && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined ? 0 : r.divergenciaCliente; }
 
@@ -3281,8 +3284,29 @@ function renderBarraFiltros(v, f, qtdFiltrada, qtdTotal) {
     </div>`;
 }
 
+// Análises gravadas antes da v2 (base 'tabela' = subtotal, sinal cobrado − calculado): ao abrir o
+// lote, regrava só essas com frete total e sinal novo, mantendo classificação, observação e status.
+async function atualizarRevisoesAntigasDoLote(v) {
+  if (!v || v._revisoesAtualizadas) return;
+  v._revisoesAtualizadas = true;
+  const alvos = (v.resultados || []).filter(r => { const rv = r.cte && STATE.revisoes[r.cte.chave]; return rv && rv.classificacao && (rv.versaoCalc || 0) < 3; });
+  if (!alvos.length) return;
+  const novas = alvos.map(r => {
+    const ant = STATE.revisoes[r.cte.chave];
+    const nv = montarRevisao(r, ant.classificacao, ant.observacao || '');
+    nv.atualizadoEm = ant.atualizadoEm || null; nv.atualizadoPor = ant.atualizadoPor || null;
+    return nv;
+  });
+  try {
+    await DataLayer.saveRevisoesEmLote(novas, { manterCarimbo: true });
+    novas.forEach(rv => { STATE.revisoes[rv.chave] = rv; });
+    renderResultadosValidacao();
+  } catch (e) { console.warn('Não deu pra atualizar as análises antigas deste lote agora', e); v._revisoesAtualizadas = false; }
+}
+
 function renderResultadosValidacao() {
   const vAtual = STATE.ultimaValidacao;
+  setTimeout(() => atualizarRevisoesAntigasDoLote(vAtual), 0);
   const { nomeArquivo, duplicadosIgnorados = 0 } = vAtual;
   STATE._filtrosRes = STATE._filtrosRes || {};
   const filtrosRes = STATE._filtrosRes;
@@ -3356,8 +3380,8 @@ function renderResultadosValidacao() {
 
     <div class="grid grid-cols-5 gap-3 mb-3">
       ${filtroCard('todos', 'Todos os CT-es', qtdFiltrada, fmtBRL(cobradoFiltrado) + ' cobrado', 'ink')}
-      ${filtroCard('maior', 'Cobrado a maior', maior.length, fmtBRL(maior.reduce((a,r)=>a+divergenciaEfetiva(r),0)), 'red')}
-      ${filtroCard('menor', 'Cobrado a menor', menor.length, fmtBRL(menor.reduce((a,r)=>a+divergenciaEfetiva(r),0)), 'amber')}
+      ${filtroCard('maior', 'Cobrado a maior', maior.length, fmtBRL(difExibida(maior.reduce((a,r)=>a+divergenciaEfetiva(r),0))), 'red')}
+      ${filtroCard('menor', 'Cobrado a menor', menor.length, fmtBRL(difExibida(menor.reduce((a,r)=>a+divergenciaEfetiva(r),0))), 'amber')}
       ${filtroCard('ok', 'Conferem / analisados sem erro', ok.length, (() => { const q = resultados.filter(analisadoSemErro).length; return q ? `${q} analisado(s) sem erro` : ''; })(), 'emerald')}
       ${filtroCard('revisao', 'Revisão manual / sem cobertura', revisao.length, '', 'ink')}
     </div>
@@ -3629,8 +3653,8 @@ function renderTabelaResultados(lista, filtro) {
                 : r.divergencia === null || r.divergencia === undefined
                   ? `<td class="px-4 py-3 text-right num text-ink-300">—</td>`
                   : analisadoSemErro(r) && Math.abs(r.divergencia) > 0.05
-                    ? `<td class="px-4 py-3 text-right num font-semibold text-emerald-600" title="Analisado como ${rotuloClassif(r)} — diferença original ${fmtBRL(r.divergencia)} considerada R$ 0,00">${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(r.divergencia)}</span></td>`
-                    : `<td class="px-4 py-3 text-right num font-semibold ${r.divergencia < -0.005 || r.divergencia > 0.05 ? 'text-red-600' : 'text-emerald-600'}" ${Math.abs(r.divergencia) <= 0.05 && Math.abs(r.divergencia) >= 0.005 ? 'title="Diferença de centavos, dentro da tolerância de R$ 0,05 — o CT-e conta como conferido"' : ''}>${r.divergencia>0.05?'+':''}${fmtBRL(r.divergencia)}</td>`
+                    ? `<td class="px-4 py-3 text-right num font-semibold text-emerald-600" title="Analisado como ${rotuloClassif(r)} — diferença original ${fmtBRL(difExibida(r.divergencia))} considerada R$ 0,00">${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(difExibida(r.divergencia))}</span></td>`
+                    : `<td class="px-4 py-3 text-right num font-semibold ${difExibida(r.divergencia) < -0.005 ? 'text-red-600' : 'text-emerald-600'}" ${Math.abs(r.divergencia) <= 0.05 && Math.abs(r.divergencia) >= 0.005 ? 'title="Diferença de centavos, dentro da tolerância de R$ 0,05 — o CT-e conta como conferido"' : ''}>${difExibida(r.divergencia)>0.005?'+':''}${fmtBRL(difExibida(r.divergencia))}</td>`
               ) : ''}
               ${mostrarMargem ? (classifPrejuizoTotal(r) ? `
                 <td class="px-4 py-3 text-right num text-ink-700" title="${rotuloClassif(r)}: o cliente não paga esse frete">${fmtBRL(0)}</td>
@@ -3826,18 +3850,18 @@ function renderSecaoAnalise(idx, revisao, subtotalCobrado, subtotalCalculado, va
         <textarea id="obsAnalise-${idx}" rows="2" placeholder="Observações da tratativa (opcional)" class="w-full border border-ink-200 rounded-lg px-3 py-2 text-sm">${escapeHtml(obsAtual)}</textarea>
         <div id="camposTransportadora-${idx}" class="${mostrarCamposTransportadora ? '' : 'hidden'} grid grid-cols-3 gap-2 bg-red-50 border border-red-200 rounded-lg p-3 text-xs">
           <div>
-            <div class="text-red-700 font-medium">Valor cobrado</div>
+            <div class="text-red-700 font-medium">Cobrado (sem ICMS)</div>
             <div class="num text-red-800 font-semibold">${subtotalCobrado != null ? fmtBRL(subtotalCobrado) : '—'}</div>
           </div>
           <div>
-            <div class="text-red-700 font-medium">Valor real (calculado)</div>
+            <div class="text-red-700 font-medium">Calculado (sem ICMS)</div>
             <div class="num text-red-800 font-semibold">${subtotalCalculado != null ? fmtBRL(subtotalCalculado) : '—'}</div>
           </div>
           <div>
-            <div class="text-red-700 font-medium">A ressarcir</div>
+            <div class="text-red-700 font-medium">Diferença (calculado − cobrado)</div>
             <div class="num text-red-800 font-bold">${valorRessarcirPreview != null ? fmtBRL(valorRessarcirPreview) : '—'}</div>
           </div>
-          <p class="col-span-3 text-red-600/80 mt-1">Valores sobre o subtotal (sem ICMS) — vai pra aba Tratativas assim que você salvar.</p>
+          <p class="col-span-3 text-red-600/80 mt-1">Subtotal cobrado × subtotal calculado, sem ICMS — negativo = cobrado a maior. Vai pra aba Análises assim que você salvar.</p>
         </div>
         <p id="avisoSemErro-${idx}" class="${classificacaoAtual === 'sem_erro' ? '' : 'hidden'} text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">Ao concluir como <strong>Sem erro</strong>, a diferença deste CT-e passa a contar como <strong>R$ 0,00</strong> (positiva ou negativa — já explicada por desconto, custo previsto etc.) e ele fica marcado como analisado.</p>
         <button id="btnSalvarAnalise-${idx}" onclick="salvarAnaliseAtual(${idx})" class="w-full bg-ink-900 hover:bg-ink-800 text-white text-sm font-medium py-2 rounded-lg">${revisao ? 'Atualizar análise' : 'Concluir análise'}</button>
@@ -3905,8 +3929,10 @@ function montarRevisao(r, classificacao, observacao) {
   const icmsCobrado = reconciliacao.componenteImposto ? reconciliacao.componenteImposto.valor : r.cte.vICMS;
   const subtotalCobrado = (r.cobrado != null && icmsCobrado != null) ? clamp2(r.cobrado - icmsCobrado) : null;
   const subtotalCalculado = r.calc.subtotalCalculado ?? null;
+  // SUBTOTAL calculado − SUBTOTAL cobrado (sem ICMS):
+  // negativo = transportadora cobrou a maior (prejuízo); positivo = cobrou a menor
   const diferencaApurada = (subtotalCobrado != null && subtotalCalculado != null)
-    ? clamp2(subtotalCobrado - subtotalCalculado) : null;
+    ? semZeroNeg(clamp2(subtotalCalculado - subtotalCobrado)) : null;
   // "Sem erro" = diferença já explicada (desconto, custo já considerado...) -> conta como ZERO,
   // seja positiva ou negativa. A diferença original fica guardada só como referência.
   const valorRessarcir = CLASSIF_ZERADA.includes(classificacao) ? 0 : diferencaApurada;
@@ -3925,16 +3951,18 @@ function montarRevisao(r, classificacao, observacao) {
     dhEmi: r.cte.dhEmi,
     notaFiscal: (r.cte.notasFiscais || [])[0]?.numero || null,
     canal: r.canal || null,
-    numeroFatura: (STATE.ultimaValidacao && STATE.ultimaValidacao.numeroFatura) || null,
-    vencimentoFatura: (STATE.ultimaValidacao && STATE.ultimaValidacao.vencimentoFatura) || null,
+    numeroFatura: (STATE.ultimaValidacao && STATE.ultimaValidacao.numeroFatura) || existente?.numeroFatura || null,
+    vencimentoFatura: (STATE.ultimaValidacao && STATE.ultimaValidacao.vencimentoFatura) || existente?.vencimentoFatura || null,
     tabelaUsada: r.tabelaAlternativa ? r.tabelaAlternativa.nome : null,
     reposicao: !!r.reposicao,
     classificacao,
     observacao,
     detalhamentoErros: montarDetalhamentoDivergencias(r),
-    valorCobradoSubtotal: subtotalCobrado,
-    valorRealSubtotal: subtotalCalculado,
+    valorCobradoSubtotal: subtotalCobrado,     // sem ICMS
+    valorRealSubtotal: subtotalCalculado,      // sem ICMS
+    freteTotalCobrado: r.cobrado ?? null, freteTotalCalculado: r.calculado ?? null, // só referência (com ICMS)
     valorRessarcir,
+    versaoCalc: 3,
     diferencaApurada,
     margemClienteApurada: r.divergenciaCliente ?? null,
     analisado: true,
@@ -3952,7 +3980,7 @@ function montarRevisao(r, classificacao, observacao) {
     revisao.baseComparacao = 'prejuizo';
     revisao.valorCobradoSubtotal = r.cobrado ?? null;
     revisao.valorRealSubtotal = 0;
-    revisao.valorRessarcir = r.cobrado != null ? clamp2(-r.cobrado) : null;
+    revisao.valorRessarcir = r.cobrado != null ? semZeroNeg(clamp2(-r.cobrado)) : null;
     revisao.detalhamentoErros = `${rot} — prejuízo total: o valor cobrado inteiro (${fmtBRL(r.cobrado)}) é prejuízo, o cliente não paga esse frete.`;
   }
   // Erro de plataforma (bug do site/e-commerce no frete cobrado do cliente): a diferença que importa
@@ -3962,7 +3990,7 @@ function montarRevisao(r, classificacao, observacao) {
     revisao.baseComparacao = 'cliente';
     revisao.valorCobradoSubtotal = r.cobrado ?? null;
     revisao.valorRealSubtotal = freteCliente;
-    revisao.valorRessarcir = (freteCliente != null && r.cobrado != null) ? clamp2(freteCliente - r.cobrado) : null;
+    revisao.valorRessarcir = (freteCliente != null && r.cobrado != null) ? semZeroNeg(clamp2(freteCliente - r.cobrado)) : null;
     revisao.detalhamentoErros = freteCliente != null
       ? `${classificacao === 'transp_diferente' ? `Despachado por ${r.parceiro.nome}, diferente da transportadora cotada. ` : ''}Frete cobrado pela transportadora ${fmtBRL(r.cobrado)} × frete cobrado do cliente ${fmtBRL(freteCliente)}${r.nfeVinculada?.nNF ? ` (NF ${r.nfeVinculada.nNF})` : ''}${ehReposicao(r) ? ' — reposição, cliente não paga' : ''} = diferença ${fmtBRL(revisao.valorRessarcir)}.`
       : `Sem frete do cliente casado (importe o XML da NF-e ou a planilha) — não dá pra calcular a diferença frete cobrado × frete do cliente.`;
@@ -4170,7 +4198,7 @@ function abrirDetalheCte(idx) {
   const chave = r.cte.chave;
   const revisaoExistente = STATE.revisoes[chave] || null;
   const valorRessarcirPreview = (subtotalCobrado != null && r.calc.subtotalCalculado != null)
-    ? clamp2(subtotalCobrado - r.calc.subtotalCalculado) : null;
+    ? semZeroNeg(clamp2(r.calc.subtotalCalculado - subtotalCobrado)) : null;
   const secaoAnalise = renderSecaoAnalise(idx, revisaoExistente, subtotalCobrado, r.calc.subtotalCalculado, valorRessarcirPreview);
 
   const modal = document.createElement('div');
@@ -5820,6 +5848,20 @@ function historicoStatusTexto(r) {
   return linhas.length ? linhas.join('\n') : 'Sem histórico de datas ainda.';
 }
 
+// valor da análise com a convenção atual (negativo = prejuízo). Registros gravados antes da
+// versão 2 com base 'tabela' guardavam cobrado − calculado (subtotal): inverte o sinal na tela
+// até o lote ser aberto de novo (aí é regravado com o frete total — ver atualizarRevisoesAntigasDoLote)
+function baseTabela(r) { return (!r.baseComparacao || r.baseComparacao === 'tabela') && !CLASSIF_ZERADA.includes(r.classificacao); }
+// sem versão: subtotal com sinal antigo (cobrado − calculado) → só inverte o sinal na tela
+function revisaoAntigaTabela(r) { return !r.versaoCalc && baseTabela(r); }
+// versão 2 (só em 05/10): gravou o frete total com ICMS → precisa reabrir o lote pra regravar sem ICMS
+function revisaoComIcms(r) { return r.versaoCalc === 2 && baseTabela(r); }
+function valorAnalise(r) {
+  if (r.valorRessarcir === null || r.valorRessarcir === undefined) return r.valorRessarcir;
+  return revisaoAntigaTabela(r) ? semZeroNeg(clamp2(-r.valorRessarcir)) : r.valorRessarcir;
+}
+function somaAnalise(lista) { return clamp2(lista.reduce((a, r) => a + (valorAnalise(r) || 0), 0)); }
+
 function filtrarAnalises(lista, f) {
   f = f || {};
   return lista.filter(r => {
@@ -5894,7 +5936,7 @@ async function renderTratativas() {
   const resumoPorTipo = abas.map(c => {
     const doTipo = c.valor === 'todos' ? analisadas.filter(r => r.classificacao !== 'sem_erro') : analisadas.filter(r => r.classificacao === c.valor);
     const pendentesDoTipo = doTipo.filter(r => !statusEhResolvido(r.statusTratativa || 'pendente'));
-    return { ...c, qtd: doTipo.length, qtdPendente: pendentesDoTipo.length, valorTotal: doTipo.reduce((a, r) => a + Math.abs(r.valorRessarcir || 0), 0) };
+    return { ...c, qtd: doTipo.length, qtdPendente: pendentesDoTipo.length, valorTotal: somaAnalise(doTipo) };
   });
 
   const opt = (v, l, atual) => `<option value="${escapeHtml(v)}" ${atual === v ? 'selected' : ''}>${escapeHtml(l)}</option>`;
@@ -5934,7 +5976,7 @@ async function renderTratativas() {
       `).join('')}
     </div>
     <div id="tabelaTratativaAtiva"></div>
-    <p class="text-xs text-ink-300 mt-3">Os valores são sobre o subtotal (sem ICMS), conforme definido na análise de cada CT-e. CT-es classificados como "Sem erro" não aparecem aqui — servem só pra marcar que a divergência foi conferida e é aceitável.</p>
+    <p class="text-xs text-ink-300 mt-3">Diferença: erro de tabela/transportadora/proposta = subtotal calculado − subtotal cobrado (sem ICMS); plataforma, Intelipost e transportadora diferente da cotada = frete do cliente − frete cobrado. Negativo = prejuízo. CT-es classificados como "Sem erro" não aparecem aqui — servem só pra marcar que a divergência foi conferida e é aceitável.</p>
   `;
   $$('[data-filtro-an]').forEach(el => el.addEventListener('change', () => { STATE._filtrosAnalise[el.dataset.filtroAn] = el.value; renderTratativas(); }));
   const btnLimparAn = $('#btnLimparFiltrosAn');
@@ -5975,7 +6017,7 @@ function renderTabelaTratativa(analisadas) {
   const infoAba = aba === 'todos' ? { label: 'Todos os tipos' } : CLASSIFICACOES_DIVERGENCIA.find(c => c.valor === aba);
   const doTipo = (aba === 'todos' ? analisadas.filter(r => r.classificacao !== 'sem_erro') : analisadas.filter(r => r.classificacao === aba)).sort((a, b) => (b.atualizadoEm || '').localeCompare(a.atualizadoEm || ''));
   const box = $('#tabelaTratativaAtiva');
-  const labelValor = aba === 'transportadora' ? 'A ressarcir' : CLASSIF_BASE_CLIENTE.includes(aba) ? 'Diferença (cliente − cobrado)' : CLASSIF_PREJUIZO_TOTAL.includes(aba) ? 'Prejuízo' : 'Diferença';
+  const labelValor = ['transportadora', 'tabela', 'proposta_comercial'].includes(aba) ? 'Diferença sem ICMS (calculado − cobrado)' : CLASSIF_BASE_CLIENTE.includes(aba) ? 'Diferença (cliente − cobrado)' : CLASSIF_PREJUIZO_TOTAL.includes(aba) ? 'Prejuízo' : 'Diferença';
 
   if (doTipo.length === 0) {
     const fAt = STATE._filtrosAnalise || {};
@@ -5988,10 +6030,10 @@ function renderTabelaTratativa(analisadas) {
   const temLegado = doTipo.some(r => r.statusTratativa === 'resolvido');
   const gruposStatus = [...STATUS_TRATATIVA, ...(temLegado ? [STATUS_LEGADO] : [])].map(s => {
     const doStatus = doTipo.filter(r => (r.statusTratativa || 'pendente') === s.valor);
-    return { ...s, qtd: doStatus.length, valorTotal: doStatus.reduce((a, r) => a + Math.abs(r.valorRessarcir || 0), 0) };
+    return { ...s, qtd: doStatus.length, valorTotal: somaAnalise(doStatus) };
   });
   const subabas = [
-    { valor: 'todos', label: 'Todos', qtd: doTipo.length, valorTotal: doTipo.reduce((a, r) => a + Math.abs(r.valorRessarcir || 0), 0), cls: 'bg-ink-100 text-ink-700 border-ink-200' },
+    { valor: 'todos', label: 'Todos', qtd: doTipo.length, valorTotal: somaAnalise(doTipo), cls: 'bg-ink-100 text-ink-700 border-ink-200' },
     ...gruposStatus,
   ];
   const filtrados = subAba === 'todos' ? doTipo : doTipo.filter(r => (r.statusTratativa || 'pendente') === subAba);
@@ -6035,9 +6077,9 @@ function renderTabelaTratativa(analisadas) {
               ${aba === 'todos' ? `<td class="px-4 py-3 text-xs"><span class="px-2 py-0.5 rounded-full border ${(LABEL_CLASSIFICACAO[r.classificacao] || {}).cls || ''}">${escapeHtml((LABEL_CLASSIFICACAO[r.classificacao] || {}).label || r.classificacao)}</span></td>` : ''}
               <td class="px-4 py-3 text-ink-700">${escapeHtml(r.parceiroNome || '—')}</td>
               <td class="px-4 py-3 text-ink-600">${escapeHtml(r.destMun || '')} / ${escapeHtml(r.destUF || '')}</td>
-              <td class="px-4 py-3 text-right num text-ink-700" title="${r.baseComparacao === 'cliente' ? 'Frete total cobrado pela transportadora' : 'Subtotal cobrado (sem ICMS)'}">${fmtBRL(r.valorCobradoSubtotal)}</td>
-              <td class="px-4 py-3 text-right num text-ink-700" title="${r.baseComparacao === 'cliente' ? 'Frete cobrado do cliente na nota fiscal' : 'Subtotal calculado pela tabela (sem ICMS)'}">${fmtBRL(r.valorRealSubtotal)}${r.baseComparacao === 'cliente' && aba === 'todos' ? '<div class="text-[10px] text-ink-400">frete do cliente</div>' : ''}</td>
-              <td class="px-4 py-3 text-right num font-semibold ${r.baseComparacao === 'cliente' && r.valorRessarcir > 0.005 ? 'text-emerald-600' : 'text-red-600'}">${fmtBRL(r.valorRessarcir)}</td>
+              <td class="px-4 py-3 text-right num text-ink-700" title="${r.baseComparacao === 'cliente' ? 'Frete total cobrado pela transportadora' : revisaoComIcms(r) ? 'Frete total COM ICMS (gravado na versão de 05/10) — abra o lote no Histórico pra regravar sem ICMS' : 'Subtotal cobrado (sem ICMS)'}">${fmtBRL(r.valorCobradoSubtotal)}</td>
+              <td class="px-4 py-3 text-right num text-ink-700" title="${r.baseComparacao === 'cliente' ? 'Frete cobrado do cliente na nota fiscal' : revisaoComIcms(r) ? 'Frete total COM ICMS (gravado na versão de 05/10) — abra o lote no Histórico pra regravar sem ICMS' : 'Subtotal calculado pela tabela (sem ICMS)'}">${fmtBRL(r.valorRealSubtotal)}${r.baseComparacao === 'cliente' && aba === 'todos' ? '<div class="text-[10px] text-ink-400">frete do cliente</div>' : ''}</td>
+              <td class="px-4 py-3 text-right num font-semibold ${valorAnalise(r) < -0.005 ? 'text-red-600' : valorAnalise(r) > 0.005 ? 'text-emerald-600' : 'text-ink-500'}">${valorAnalise(r) > 0.005 ? '+' : ''}${fmtBRL(valorAnalise(r))}</td>
               <td class="px-4 py-3 text-ink-500 text-xs max-w-[260px] truncate cursor-help" title="${escapeHtml((r.detalhamentoErros||'') + (r.observacao ? '\n\nObservação: '+r.observacao : ''))}">${escapeHtml(r.detalhamentoErros || '—')}</td>
               <td class="px-4 py-3">
                 <select onchange="atualizarStatusTratativa('${r.chave}', this.value)" class="text-xs border rounded-full px-2 py-1 ${infoStatusTratativa(r.statusTratativa||'pendente').cls}">
@@ -6084,7 +6126,7 @@ function exportarTratativasXlsx() {
   if (subAba !== 'todos') todas = todas.filter(r => (r.statusTratativa || 'pendente') === subAba); // status
   if (todas.length === 0) { toast('Nenhuma análise com esses filtros pra exportar.', 'warn'); return; }
 
-  const header = ['Nº CTe', 'Fatura', 'Vencimento', 'Nota Fiscal', 'Canal', 'Parceiro', 'Emissão', 'Destino', 'UF', 'Valor Cobrado (R$)', 'Valor Calculado / Frete Cliente (R$)', 'Diferença (R$)', 'Base da comparação', 'Status', 'Data Pendente', 'Data Em Tratativa', 'Data Resolvido - Pago', 'Data Resolvido - Custo', 'Detalhamento dos Erros de Cálculo (Subtotal)', 'Observação'];
+  const header = ['Nº CTe', 'Fatura', 'Vencimento', 'Nota Fiscal', 'Canal', 'Parceiro', 'Emissão', 'Destino', 'UF', 'Valor Cobrado (R$)', 'Valor Calculado / Frete Cliente (R$)', 'Diferença (R$) — negativo = prejuízo', 'Base da comparação', 'Status', 'Data Pendente', 'Data Em Tratativa', 'Data Resolvido - Pago', 'Data Resolvido - Custo', 'Detalhamento dos Erros de Cálculo (Subtotal)', 'Observação'];
   const wb = XLSX.utils.book_new();
 
   // uma aba por tipo de erro — pra acompanhar onde está concentrado o problema
@@ -6097,8 +6139,8 @@ function exportarTratativasXlsx() {
       const datas = r.datasStatus || {};
       linhas.push([
         r.nCT, r.numeroFatura || '', r.vencimentoFatura ? fmtDataCurtaISO(r.vencimentoFatura) : '', r.notaFiscal, r.canal || '', r.parceiroNome, r.dhEmi ? fmtDia(r.dhEmi) : '', r.destMun, r.destUF,
-        r.valorCobradoSubtotal, r.valorRealSubtotal, r.valorRessarcir,
-        r.baseComparacao === 'cliente' ? 'Frete cobrado × frete do cliente' : r.baseComparacao === 'prejuizo' ? 'Prejuízo total (valor cobrado)' : r.baseComparacao === 'zerada' ? 'Zerado (Full)' : 'Subtotal cobrado × tabela',
+        r.valorCobradoSubtotal, r.valorRealSubtotal, valorAnalise(r),
+        r.baseComparacao === 'cliente' ? 'Frete do cliente − frete cobrado' : r.baseComparacao === 'prejuizo' ? 'Prejuízo total (valor cobrado)' : r.baseComparacao === 'zerada' ? 'Zerado (Full)' : revisaoComIcms(r) ? 'Calculado − cobrado (com ICMS — reabrir o lote pra corrigir)' : 'Subtotal calculado − subtotal cobrado (sem ICMS)',
         infoStatusTratativa(r.statusTratativa || 'pendente').label,
         datas.pendente ? fmtDate(datas.pendente) : '', datas.em_tratativa ? fmtDate(datas.em_tratativa) : '',
         datas.resolvido_pago ? fmtDate(datas.resolvido_pago) : '', datas.resolvido_custo ? fmtDate(datas.resolvido_custo) : (datas.resolvido ? fmtDate(datas.resolvido) + ' (antigo)' : ''),
@@ -6120,7 +6162,7 @@ function exportarTratativasXlsx() {
   const resumoLinhas = [['Relatório de Análises de Divergência'], ...descFiltros.map(t => [t]), [], ['Tipo de erro', 'Quantidade', 'Valor total (R$)']];
   CLASSIFICACOES_DIVERGENCIA.filter(c => c.valor !== 'sem_erro' && (aba === 'todos' || c.valor === aba)).forEach(cat => {
     const doTipo = todas.filter(r => r.classificacao === cat.valor);
-    resumoLinhas.push([cat.labelCurta || cat.label, doTipo.length, doTipo.reduce((a,r)=>a+Math.abs(r.valorRessarcir||0),0)]);
+    resumoLinhas.push([cat.labelCurta || cat.label, doTipo.length, somaAnalise(doTipo)]);
   });
   const wsResumo = XLSX.utils.aoa_to_sheet(resumoLinhas);
   XLSX.utils.book_append_sheet(wb, wsResumo, 'Resumo');
