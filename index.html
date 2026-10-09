@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-09-analises-status-massa';
+const APP_VERSION = '2026-10-09-desconsiderar-componente';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -3957,10 +3957,10 @@ function renderSecaoAnalise(idx, revisao, subtotalCobrado, subtotalCalculado, va
           ${atuais.filter(c => CLASSIF_LEGADAS.some(l => l.valor === c)).map(c => `<div><div class="text-[10px] font-semibold uppercase tracking-wide text-ink-400 mb-0.5">Antiga</div>${chk(c)}</div>`).join('')}
         </div>
         <textarea id="obsAnalise-${idx}" rows="2" placeholder="Observações da tratativa (opcional)" class="w-full border border-ink-200 rounded-lg px-3 py-2 text-sm">${escapeHtml(obsAtual)}</textarea>
-        <div id="camposTransportadora-${idx}" class="${mostrarCamposTransportadora ? '' : 'hidden'} grid grid-cols-3 gap-2 bg-red-50 border border-red-200 rounded-lg p-3 text-xs">
+        <div id="camposTransportadora-${idx}" data-base-cob="${subtotalCobrado ?? ''}" data-calc="${subtotalCalculado ?? ''}" class="${mostrarCamposTransportadora ? '' : 'hidden'} grid grid-cols-3 gap-2 bg-red-50 border border-red-200 rounded-lg p-3 text-xs">
           <div>
             <div class="text-red-700 font-medium">Cobrado (sem ICMS)</div>
-            <div class="num text-red-800 font-semibold">${subtotalCobrado != null ? fmtBRL(subtotalCobrado) : '—'}</div>
+            <div id="prevCob-${idx}" class="num text-red-800 font-semibold">${subtotalCobrado != null ? fmtBRL(subtotalCobrado) : '—'}</div>
           </div>
           <div>
             <div class="text-red-700 font-medium">Calculado (sem ICMS)</div>
@@ -3968,8 +3968,9 @@ function renderSecaoAnalise(idx, revisao, subtotalCobrado, subtotalCalculado, va
           </div>
           <div>
             <div class="text-red-700 font-medium">Diferença (calculado − cobrado)</div>
-            <div class="num text-red-800 font-bold">${valorRessarcirPreview != null ? fmtBRL(valorRessarcirPreview) : '—'}</div>
+            <div id="prevDif-${idx}" class="num text-red-800 font-bold">${valorRessarcirPreview != null ? fmtBRL(valorRessarcirPreview) : '—'}</div>
           </div>
+          <p id="prevDesc-${idx}" class="col-span-3 hidden text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1"></p>
           <p class="col-span-3 text-red-600/80 mt-1">Subtotal cobrado × subtotal calculado, sem ICMS — negativo = cobrado a maior. Vai pra aba Análises assim que você salvar.</p>
         </div>
         <p id="avisoSemErro-${idx}" class="${atuais.some(c => CLASSIF_SEM_ANALISE.includes(c)) ? '' : 'hidden'} text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">${textoAvisoSemErro(atuais)}</p>
@@ -3997,7 +3998,7 @@ function atualizarCamposTratativa(idx) {
 
 // Monta um texto automático listando TODOS os componentes que divergem entre cobrado e
 // calculado (inclusive o ICMS), pra não depender só do que a pessoa escreveu na observação.
-function montarDetalhamentoDivergencias(r) {
+function montarDetalhamentoDivergencias(r, desconsiderados) {
   const partes = [];
 
   // todos os componentes: só entra no relatório quando é cobrado A MAIOR que o calculado —
@@ -4033,7 +4034,8 @@ function montarDetalhamentoDivergencias(r) {
 
   const reconciliacao = calcularReconciliacaoXml(r);
   reconciliacao.residuais.forEach(c => {
-    partes.push(`${c.nome}: cobrado ${fmtBRL(c.valor)}, sem regra cadastrada pra comparar`);
+    if ((desconsiderados || []).some(d => mesmoComponente(d, c))) partes.push(`${c.nome}: cobrado ${fmtBRL(c.valor)}, desconsiderado na análise`);
+    else partes.push(`${c.nome}: cobrado ${fmtBRL(c.valor)}, sem regra cadastrada pra comparar`);
   });
   // ICMS de propósito NÃO entra aqui — ele é calculado depois do subtotal (gross-up), é
   // consequência de uma divergência acima, não uma causa em si. O detalhamento fica
@@ -4086,17 +4088,22 @@ function calcularClassificacao(r, classificacao, base) {
   return out;
 }
 
-function montarRevisao(r, classificacoes, observacao) {
+function montarRevisao(r, classificacoes, observacao, desconsiderados) {
   classificacoes = Array.from(new Set((Array.isArray(classificacoes) ? classificacoes : [classificacoes]).filter(Boolean)));
   const reconciliacao = calcularReconciliacaoXml(r);
   const icmsCobrado = reconciliacao.componenteImposto ? reconciliacao.componenteImposto.valor : r.cte.vICMS;
   // CT-e sem ICMS destacado no XML (isento/Simples Nacional): o subtotal sem ICMS é o próprio valor cobrado
-  const subtotalCobrado = r.cobrado != null ? clamp2(r.cobrado - (icmsCobrado ?? 0)) : null;
+  // cobranças "não encontrado no cadastro" marcadas pra desconsiderar saem do cobrado da análise
+  // (sem passar a lista = mantém o que já estava marcado na análise salva)
+  const existenteDesc = STATE.revisoes[r.cte.chave]?.componentesDesconsiderados;
+  const desc = desconsideradosValidos(r, desconsiderados !== undefined ? desconsiderados : existenteDesc);
+  const somaDesc = clamp2(desc.reduce((a, d) => a + (d.valor || 0), 0));
+  const subtotalCobrado = r.cobrado != null ? clamp2(r.cobrado - (icmsCobrado ?? 0) - somaDesc) : null;
   const subtotalCalculado = r.calc.subtotalCalculado ?? null;
   // SUBTOTAL calculado − SUBTOTAL cobrado (sem ICMS): negativo = cobrado a maior (prejuízo)
   const diferencaApurada = (subtotalCobrado != null && subtotalCalculado != null)
     ? semZeroNeg(clamp2(subtotalCalculado - subtotalCobrado)) : null;
-  const base = { subtotalCobrado, subtotalCalculado, diferencaApurada, detalhamento: montarDetalhamentoDivergencias(r) };
+  const base = { subtotalCobrado, subtotalCalculado, diferencaApurada, detalhamento: montarDetalhamentoDivergencias(r, desc) };
 
   const existente = STATE.revisoes[r.cte.chave];
   const classifsAntes = classifsDaRevisao(existente);
@@ -4125,6 +4132,7 @@ function montarRevisao(r, classificacoes, observacao) {
     vencimentoFatura: (STATE.ultimaValidacao && STATE.ultimaValidacao.vencimentoFatura) || existente?.vencimentoFatura || null,
     tabelaUsada: r.tabelaAlternativa ? r.tabelaAlternativa.nome : null,
     reposicao: !!r.reposicao,
+    componentesDesconsiderados: desc,
     classificacoes,
     classificacao: classificacoes[0],          // compatibilidade: a primeira
     porClassif,
@@ -4159,7 +4167,7 @@ async function salvarAnaliseAtual(idx) {
   const classificacoes = classifsMarcadas(idx);
   if (!classificacoes.length) { toast(STATE.revisoes[r.cte.chave] ? 'Marque pelo menos uma classificação — ou use "Voltar para sem classificação".' : 'Marque pelo menos uma classificação antes de salvar.', 'error'); return; }
   const observacao = $(`#obsAnalise-${idx}`).value.trim();
-  const revisao = montarRevisao(r, classificacoes, observacao);
+  const revisao = montarRevisao(r, classificacoes, observacao, desconsideradosMarcados(idx));
 
   const btnSalvar = document.getElementById(`btnSalvarAnalise-${idx}`);
   if (btnSalvar) { btnSalvar.disabled = true; btnSalvar.textContent = 'Salvando…'; btnSalvar.classList.add('opacity-60'); }
@@ -4167,7 +4175,8 @@ async function salvarAnaliseAtual(idx) {
     await DataLayer.saveRevisao(revisao);
     STATE.revisoes[revisao.chave] = revisao;
     atualizarBadgeTratativas();
-    toast('Análise salva' + textoToastClassif(classificacoes) + '.', 'success');
+    const sd = (revisao.componentesDesconsiderados || []).reduce((a, d) => a + (d.valor || 0), 0);
+    toast('Análise salva' + textoToastClassif(classificacoes) + (sd ? ` — ${fmtBRL(sd)} desconsiderado(s) do cobrado` : '') + '.', 'success');
     if (STATE.ultimaValidacao) {
       renderResultadosValidacao();
       atualizarResumoDoLoteNoHistorico();
@@ -4343,9 +4352,14 @@ function abrirDetalheCte(idx) {
   // cobranças que existem no XML mas não têm nenhuma regra cadastrada pra elas —
   // entram na MESMA tabela, com "CALCULADO" avisando que falta cadastro (espelhando
   // o aviso "não encontrado no XML" que já existe pro caminho inverso)
+  const descAtuais = (STATE.revisoes[r.cte.chave]?.componentesDesconsiderados || []);
   const rowsSemCadastro = reconciliacao.residuais.map(c => `
     <tr class="border-t border-ink-100 bg-amber-50">
-      <td class="px-3 py-2 text-amber-800 font-medium">${escapeHtml(c.nome)}</td>
+      <td class="px-3 py-2 text-amber-800 font-medium">${escapeHtml(c.nome)}
+        <label class="flex items-center gap-1.5 mt-1 text-[11px] font-normal text-amber-900 cursor-pointer" title="Tira essa cobrança da comparação cobrado × calculado da análise (erro da transportadora, tabela, proposta). Vale ao salvar a análise.">
+          <input type="checkbox" class="chk-desc-${idx}" data-nome="${escapeHtml(c.nome)}" data-valor="${c.valor || 0}" ${descAtuais.some(d => mesmoComponente(d, c)) ? 'checked' : ''} onchange="atualizarPreviewDesc(${idx})"> Desconsiderar na análise
+        </label>
+      </td>
       <td class="px-3 py-2 text-right num text-amber-800 font-semibold">${fmtBRL(c.valor)}</td>
       <td class="px-3 py-2 text-right num"><span class="text-amber-700" title="Essa cobrança existe no XML mas nenhuma regra cadastrada no parceiro corresponde a ela — cadastre em Parceiros pra ela entrar na conta.">— não encontrado no cadastro</span></td>
     </tr>`).join('');
@@ -4489,6 +4503,32 @@ function abrirDetalheCte(idx) {
   `;
   modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
   document.body.appendChild(modal);
+  atualizarPreviewDesc(idx);
+}
+
+// ----- componentes "não encontrado no cadastro" desconsiderados na análise -----
+function mesmoComponente(a, b) { return normalizaNomeComponente(a.nome) === normalizaNomeComponente(b.nome) && Math.abs((a.valor || 0) - (b.valor || 0)) <= 0.01; }
+function desconsideradosMarcados(idx) {
+  return $$(`.chk-desc-${idx}`).filter(c => c.checked).map(c => ({ nome: c.dataset.nome, valor: Number(c.dataset.valor) || 0 }));
+}
+// só vale o que ainda é cobrança sem cadastro neste CT-e (se cadastrar a regra depois, deixa de ser desconsiderado)
+function desconsideradosValidos(r, lista) {
+  const residuais = calcularReconciliacaoXml(r).residuais;
+  return (lista || []).filter(d => residuais.some(c => mesmoComponente(d, c)));
+}
+function atualizarPreviewDesc(idx) {
+  const box = $(`#camposTransportadora-${idx}`);
+  if (!box) return;
+  const baseCob = box.dataset.baseCob === '' ? null : Number(box.dataset.baseCob);
+  const calc = box.dataset.calc === '' ? null : Number(box.dataset.calc);
+  const desc = desconsideradosMarcados(idx);
+  const soma = clamp2(desc.reduce((a, d) => a + d.valor, 0));
+  const cob = baseCob != null ? clamp2(baseCob - soma) : null;
+  const dif = (cob != null && calc != null) ? semZeroNeg(clamp2(calc - cob)) : null;
+  const elCob = $(`#prevCob-${idx}`), elDif = $(`#prevDif-${idx}`), elNota = $(`#prevDesc-${idx}`);
+  if (elCob) elCob.textContent = cob != null ? fmtBRL(cob) : '—';
+  if (elDif) elDif.textContent = dif != null ? fmtBRL(dif) : '—';
+  if (elNota) { elNota.textContent = soma ? `Desconsiderado: ${desc.map(d => `${d.nome} ${fmtBRL(d.valor)}`).join(', ')} (−${fmtBRL(soma)} no cobrado)` : ''; elNota.classList.toggle('hidden', !soma); }
 }
 
 // ---------------------------------------------------------------------
