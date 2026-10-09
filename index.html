@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-09-cte-sem-icms';
+const APP_VERSION = '2026-10-09-analises-status-massa';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -6255,6 +6255,10 @@ function renderTabelaTratativa(analisadas) {
     ...gruposStatus,
   ];
   const filtrados = subAba === 'todos' ? doTipo : doTipo.filter(r => (r.statusTratativa || 'pendente') === subAba);
+  // seleção só vale pras linhas que estão na tela
+  const visiveis = new Set(filtrados.map(chaveSelAn));
+  const selAn = STATE._selAnalises = new Set(Array.from(STATE._selAnalises || []).filter(k => visiveis.has(k)));
+  STATE._filtradosAnCache = filtrados;
 
   box.innerHTML = `
     <div class="flex flex-wrap gap-2 mb-4">
@@ -6265,10 +6269,21 @@ function renderTabelaTratativa(analisadas) {
       `).join('')}
     </div>
     ${filtrados.length === 0 ? emptyState('Nada aqui', 'Nenhum caso com esse status neste tópico.') : `
+    <div class="mb-3 bg-white rounded-2xl border border-ink-100 px-4 py-2.5 flex flex-wrap items-center gap-3 text-xs">
+      <span class="text-ink-500"><strong id="qtdSelAn" class="text-ink-800">${selAn.size}</strong> selecionado(s)</span>
+      <select id="selStatusMassaAn" class="border border-ink-200 rounded-lg px-2 py-1.5">
+        <option value="">Mudar status para…</option>
+        ${STATUS_TRATATIVA.map(st => `<option value="${st.valor}">${st.label}</option>`).join('')}
+      </select>
+      <button id="btnStatusMassaAn" ${selAn.size ? '' : 'disabled'} class="bg-ink-900 hover:bg-ink-800 disabled:opacity-40 text-white font-medium rounded-lg px-3 py-1.5">Aplicar aos selecionados</button>
+      <button id="btnLimparSelAn" class="text-ink-500 hover:text-ink-700">Limpar seleção</button>
+      <span class="ml-auto text-ink-400">Marque as linhas (ou a caixa do cabeçalho pra marcar todas as da tela) e escolha o status.</span>
+    </div>
     <div class="bg-white rounded-2xl shadow-panel border border-ink-100 overflow-hidden">
       <table class="w-full text-sm">
         <thead>
           <tr class="bg-ink-50 text-ink-500 text-[11px] uppercase tracking-wide">
+            <th class="pl-4 pr-1 py-3"><input type="checkbox" id="chkTodosAn" class="w-4 h-4 rounded border-ink-300 cursor-pointer" title="Marcar/desmarcar todas as linhas da tela" ${filtrados.length && filtrados.every(r => selAn.has(chaveSelAn(r))) ? 'checked' : ''}></th>
             <th class="text-left font-semibold px-4 py-3">CT-e</th>
             <th class="text-left font-semibold px-4 py-3">Emissão</th>
             <th class="text-left font-semibold px-4 py-3">Fatura</th>
@@ -6286,7 +6301,8 @@ function renderTabelaTratativa(analisadas) {
         </thead>
         <tbody class="divide-y divide-ink-100">
           ${filtrados.map(r => `
-            <tr class="hover:bg-ink-50/60">
+            <tr class="hover:bg-ink-50/60 ${selAn.has(chaveSelAn(r)) ? 'bg-brand-50/50' : ''}">
+              <td class="pl-4 pr-1 py-3"><input type="checkbox" class="chk-an w-4 h-4 rounded border-ink-300 cursor-pointer" data-sel="${escapeHtml(chaveSelAn(r))}" ${selAn.has(chaveSelAn(r)) ? 'checked' : ''}></td>
               <td class="px-4 py-3 num text-ink-700">${escapeHtml(r.nCT || '—')}</td>
               <td class="px-4 py-3 num text-ink-500 text-xs whitespace-nowrap">${fmtDia(r.dhEmi)}</td>
               <td class="px-4 py-3 num text-ink-600 text-xs">${escapeHtml(r.numeroFatura || '—')}${r.vencimentoFatura ? `<div class="text-[10px] text-ink-400">venc. ${fmtDataCurtaISO(r.vencimentoFatura)}</div>` : ''}</td>
@@ -6312,6 +6328,79 @@ function renderTabelaTratativa(analisadas) {
     </div>
     `}
   `;
+  ligarSelecaoAnalises();
+}
+
+function chaveSelAn(r) { return r.chave + '|' + (r.classificacao || ''); }
+function ligarSelecaoAnalises() {
+  const sel = STATE._selAnalises || (STATE._selAnalises = new Set());
+  const atualizar = () => {
+    const q = $('#qtdSelAn'); if (q) q.textContent = sel.size;
+    const b = $('#btnStatusMassaAn'); if (b) b.disabled = sel.size === 0;
+    const todos = $('#chkTodosAn'); const chks = $$('.chk-an');
+    if (todos) todos.checked = chks.length > 0 && chks.every(c => c.checked);
+  };
+  $$('.chk-an').forEach(c => c.addEventListener('change', () => {
+    if (c.checked) sel.add(c.dataset.sel); else sel.delete(c.dataset.sel);
+    c.closest('tr').classList.toggle('bg-brand-50/50', c.checked);
+    atualizar();
+  }));
+  const todos = $('#chkTodosAn');
+  if (todos) todos.addEventListener('change', () => {
+    $$('.chk-an').forEach(c => { c.checked = todos.checked; if (todos.checked) sel.add(c.dataset.sel); else sel.delete(c.dataset.sel); c.closest('tr').classList.toggle('bg-brand-50/50', todos.checked); });
+    atualizar();
+  });
+  const btn = $('#btnStatusMassaAn');
+  if (btn) btn.addEventListener('click', aplicarStatusEmMassaAnalises);
+  const limpar = $('#btnLimparSelAn');
+  if (limpar) limpar.addEventListener('click', () => { sel.clear(); $$('.chk-an').forEach(c => { c.checked = false; c.closest('tr').classList.remove('bg-brand-50/50'); }); atualizar(); });
+}
+
+// muda o status de UMA classificação da análise (ou do registro antigo, sem porClassif)
+function aplicarStatusNaRevisao(revisao, novoStatus, classif, agora) {
+  if (revisao.porClassif && classif && revisao.porClassif[classif]) {
+    const pc = revisao.porClassif[classif];
+    pc.statusTratativa = novoStatus;
+    pc.datasStatus = { ...(pc.datasStatus || {}), [novoStatus]: agora };
+    if (revisao.classificacao === classif) { revisao.statusTratativa = novoStatus; revisao.datasStatus = { ...pc.datasStatus }; }
+  } else {
+    revisao.statusTratativa = novoStatus;
+    revisao.datasStatus = { ...(revisao.datasStatus || {}), [novoStatus]: agora };
+  }
+}
+
+async function aplicarStatusEmMassaAnalises() {
+  const sel = STATE._selAnalises || new Set();
+  const novoStatus = $('#selStatusMassaAn')?.value;
+  if (!sel.size) { toast('Marque pelo menos uma linha.', 'warn'); return; }
+  if (!novoStatus) { toast('Escolha o status em "Mudar status para…".', 'error'); return; }
+  const agora = new Date().toISOString();
+  // agrupa por CT-e: um CT-e com 2 classificações selecionadas vira 1 gravação só
+  const porChave = {};
+  Array.from(sel).forEach(k => { const i = k.indexOf('|'); const ch = k.slice(0, i), c = k.slice(i + 1); (porChave[ch] = porChave[ch] || []).push(c); });
+  const alteradas = [];
+  Object.entries(porChave).forEach(([ch, cs]) => {
+    const orig = STATE.revisoes[ch];
+    if (!orig) return;
+    const rv = JSON.parse(JSON.stringify(orig));
+    cs.forEach(c => aplicarStatusNaRevisao(rv, novoStatus, c, agora));
+    alteradas.push(rv);
+  });
+  if (!alteradas.length) return;
+  const btn = $('#btnStatusMassaAn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Salvando…'; }
+  try {
+    await DataLayer.saveRevisoesEmLote(alteradas);
+    alteradas.forEach(rv => { STATE.revisoes[rv.chave] = rv; });
+    sel.clear();
+    atualizarBadgeTratativas();
+    toast(`Status de ${Object.values(porChave).flat().length} análise(s) atualizado para "${infoStatusTratativa(novoStatus).label}".`, 'success');
+    renderTratativas();
+  } catch (e) {
+    console.error(e);
+    toast(mensagemErroFirebase(e, 'atualizar os status'), 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Aplicar aos selecionados'; }
+  }
 }
 
 async function atualizarStatusTratativa(chave, novoStatus, classif) {
