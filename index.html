@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-09-origem-divergente';
+const APP_VERSION = '2026-10-09-cte-sem-icms';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -3344,10 +3344,17 @@ function renderBarraFiltros(v, f, qtdFiltrada, qtdTotal) {
 
 // Análises gravadas antes da v2 (base 'tabela' = subtotal, sinal cobrado − calculado): ao abrir o
 // lote, regrava só essas com frete total e sinal novo, mantendo classificação, observação e status.
+// análise de base "tabela" gravada sem o valor cobrado (CT-e sem ICMS destacado, antes da correção de 09/10)
+function analiseSemCobrado(rv) {
+  return classifsDaRevisao(rv).some(c => {
+    const d = (rv.porClassif && rv.porClassif[c]) || rv;
+    return (!d.baseComparacao || d.baseComparacao === 'tabela') && !CLASSIF_ZERADA.includes(c) && d.valorCobradoSubtotal == null;
+  });
+}
 async function atualizarRevisoesAntigasDoLote(v) {
   if (!v || v._revisoesAtualizadas) return;
   v._revisoesAtualizadas = true;
-  const alvos = (v.resultados || []).filter(r => { const rv = r.cte && STATE.revisoes[r.cte.chave]; return rv && rv.classificacao && (rv.versaoCalc || 0) < 3; });
+  const alvos = (v.resultados || []).filter(r => { const rv = r.cte && STATE.revisoes[r.cte.chave]; return rv && rv.classificacao && ((rv.versaoCalc || 0) < 3 || analiseSemCobrado(rv)); });
   if (!alvos.length) return;
   const novas = alvos.map(r => {
     const ant = STATE.revisoes[r.cte.chave];
@@ -4083,7 +4090,8 @@ function montarRevisao(r, classificacoes, observacao) {
   classificacoes = Array.from(new Set((Array.isArray(classificacoes) ? classificacoes : [classificacoes]).filter(Boolean)));
   const reconciliacao = calcularReconciliacaoXml(r);
   const icmsCobrado = reconciliacao.componenteImposto ? reconciliacao.componenteImposto.valor : r.cte.vICMS;
-  const subtotalCobrado = (r.cobrado != null && icmsCobrado != null) ? clamp2(r.cobrado - icmsCobrado) : null;
+  // CT-e sem ICMS destacado no XML (isento/Simples Nacional): o subtotal sem ICMS é o próprio valor cobrado
+  const subtotalCobrado = r.cobrado != null ? clamp2(r.cobrado - (icmsCobrado ?? 0)) : null;
   const subtotalCalculado = r.calc.subtotalCalculado ?? null;
   // SUBTOTAL calculado − SUBTOTAL cobrado (sem ICMS): negativo = cobrado a maior (prejuízo)
   const diferencaApurada = (subtotalCobrado != null && subtotalCalculado != null)
@@ -4352,7 +4360,8 @@ function abrirDetalheCte(idx) {
 
   // subtotal real cobrado = total do CT-e menos o imposto (assim compara maçã com maçã
   // contra o subtotal calculado, sem o efeito de amplificação do gross-up do ICMS)
-  const subtotalCobrado = (r.cobrado != null && icmsCobrado != null) ? clamp2(r.cobrado - icmsCobrado) : null;
+  // CT-e sem ICMS destacado no XML (isento/Simples Nacional): o subtotal sem ICMS é o próprio valor cobrado
+  const subtotalCobrado = r.cobrado != null ? clamp2(r.cobrado - (icmsCobrado ?? 0)) : null;
   const subtotalDiverge = subtotalCobrado !== null && r.calc.subtotalCalculado !== null && r.calc.subtotalCalculado !== undefined
     && Math.abs(subtotalCobrado - r.calc.subtotalCalculado) > 0.05;
 
