@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-05-transp-sem-icms';
+const APP_VERSION = '2026-10-09-origem-divergente';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -574,7 +574,7 @@ const DataLayer = {
     }
     for (let i = 0; i < lista.length; i += 400) {
       const batch = db.batch();
-      lista.slice(i, i + 400).forEach(r => batch.set(db.collection('revisoes').doc(r.chave), limparParaFirestore(r), { merge: true }));
+      lista.slice(i, i + 400).forEach(r => batch.set(db.collection('revisoes').doc(r.chave), limparParaFirestore(r)));
       await comTimeout(batch.commit(), 30000, 'salvar as análises');
     }
     return lista;
@@ -589,8 +589,22 @@ const DataLayer = {
       localDB_write(data);
       return revisao;
     }
-    await comTimeout(db.collection('revisoes').doc(revisao.chave).set(limparParaFirestore(revisao), { merge: true }), 20000, 'salvar a análise');
+    await comTimeout(db.collection('revisoes').doc(revisao.chave).set(limparParaFirestore(revisao)), 20000, 'salvar a análise');
     return revisao;
+  },
+  async deleteRevisoes(chaves) {
+    if (OFFLINE_MODE) {
+      const data = localDB_read();
+      data.revisoes = data.revisoes || {};
+      chaves.forEach(ch => { delete data.revisoes[ch]; });
+      localDB_write(data);
+      return;
+    }
+    for (let i = 0; i < chaves.length; i += 400) {
+      const batch = db.batch();
+      chaves.slice(i, i + 400).forEach(ch => batch.delete(db.collection('revisoes').doc(ch)));
+      await comTimeout(batch.commit(), 30000, 'remover as análises');
+    }
   },
 
   // ----- Configuração da planilha de dimensões de produtos (fonte global, não por parceiro) -----
@@ -1475,11 +1489,7 @@ function calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFlu
       totalClientePagou += r.valorFreteCliente;
       temAlgumaNfe = true;
     }
-    if (typeof analisadoSemErro === 'function' && analisadoSemErro(r)) {
-      if (ehReposicao(r) || classifPrejuizoTotal(r)) { /* sempre prejuízo — não neutraliza */ }
-      else if (ehPrejuizoTotal(r)) { ajusteSemErro += r.cobrado || 0; qtdSemErro++; }
-      else if (r.valorFreteCliente != null) { ajusteSemErro += (r.cobrado || 0) - r.valorFreteCliente; qtdSemErro++; }
-    }
+    // (desde 09/10 o Faturado é só Cliente pagou − Cobrado — "Sem erro" não ajusta mais)
   });
   (reentregas || []).forEach(x => { totalCobrado += x.cte.vTPrest || 0; });
   (semParceiro || []).forEach(c => { totalCobrado += c.vTPrest || 0; });
@@ -1489,7 +1499,7 @@ function calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFlu
     totalClientePagou: clamp2(totalClientePagou),
     ajusteSemErro: clamp2(ajusteSemErro),
     qtdSemErro,
-    faturado: clamp2(totalClientePagou - totalCobrado + ajusteSemErro),
+    faturado: clamp2(totalClientePagou - totalCobrado),
     temAlgumaNfe,
   };
 }
@@ -2070,9 +2080,15 @@ function validarLoteCtes(ctes, parceiros) {
     const parceiro = encontrarParceiroPorCTe(cte, parceiros);
     if (!parceiro) { semParceiro.push(cte); continue; }
 
-    const tipoOperacao = identificarTipoOperacao(cte, parceiro);
+    let tipoOperacao = identificarTipoOperacao(cte, parceiro);
     if (tipoOperacao === 'reentrega') { reentregas.push({ cte, parceiro }); continue; }
-    if (tipoOperacao === 'outro') { outrosFluxos.push({ cte, parceiro }); continue; }
+    // origem do CT-e diferente da cadastrada (e não é devolução): erro de emissão — a cobrança
+    // existe do mesmo jeito, então valida normalmente como saída e só marca o erro de origem
+    let origemDivergente = null;
+    if (tipoOperacao === 'outro') {
+      origemDivergente = { municipio: cte.xMunIni || '', uf: cte.UFIni || '', esperado: parceiro.origem || '' };
+      tipoOperacao = 'saida';
+    }
 
     // devolução: consulta a tarifa pelo REMETENTE (quem devolveu), não pelo destinatário
     // (que aqui é sempre o próprio Grupo TBX/origem do parceiro) — mesma tabela, 100% do valor
@@ -2089,6 +2105,7 @@ function validarLoteCtes(ctes, parceiros) {
       cte, parceiro, calc,
       cobrado, calculado, divergencia,
       tipoOperacao,
+      origemDivergente,
       reposicaoCte,
       reposicao: reposicaoCte,
       obsFluxo: reposicaoCte ? (trechoFluxo(obsCte) + ' (observação do CT-e)') : null,
@@ -2179,7 +2196,7 @@ function exportResultadosParaXlsx(resultados, semParceiro, parceirosEnvolvidos, 
     .sort((a,b) => Math.abs(b.divergencia||0) - Math.abs(a.divergencia||0))
     .forEach(r => {
       const row = [
-        r.tipoOperacao === 'devolucao' ? 'Devolução' : r.reposicao ? 'Reposição' : 'Saída',
+        (r.tipoOperacao === 'devolucao' ? 'Devolução' : r.reposicao ? 'Reposição' : 'Saída') + (r.origemDivergente ? ` (origem divergente: ${r.origemDivergente.municipio}/${r.origemDivergente.uf})` : ''),
         r.parceiro.nome, r.tabelaAlternativa ? r.tabelaAlternativa.nome : 'Atual', r.cte.nCT, (r.cte.notasFiscais||[]).map(n=>n.numero).join(', '), r.canal || '', r.pedido || '', r.cte.dhEmi,
         r.cte.xMunIni, r.cte.UFIni, r.cte.xMunFim, r.cte.UFFim,
         r.calc.regiaoEncontrada || '', r.cte.pesoBC ?? r.cte.pesoReal ?? '', r.cte.vCarga ?? '',
@@ -2329,7 +2346,7 @@ async function carregarRevisoes() {
 function atualizarBadgeTratativas() {
   const badge = $('#badgeTratativas');
   if (!badge) return;
-  const pendentes = Object.values(STATE.revisoes).filter(r => r.classificacao && r.classificacao !== 'sem_erro' && !statusEhResolvido(r.statusTratativa || 'pendente')).length;
+  const pendentes = todasEntradasAnalise().filter(e => entraNasAnalises(e) && !statusEhResolvido(e.statusTratativa || 'pendente')).length;
   if (pendentes > 0) {
     badge.textContent = pendentes;
     badge.classList.remove('hidden');
@@ -2580,6 +2597,7 @@ function trimResultadoParaHistorico(r) {
     calculado: r.calculado,
     divergencia: r.divergencia,
     tipoOperacao: r.tipoOperacao,
+    origemDivergente: r.origemDivergente || null,
     valorFreteCliente: r.valorFreteCliente,
     divergenciaCliente: r.divergenciaCliente,
     nfeVinculada: r.nfeVinculada,
@@ -3021,6 +3039,41 @@ async function processarZip(entrada) {
   }
 }
 
+// Lotes antigos: CT-es que ficaram em "trajeto atípico" voltam pra validação normal (com o marcador
+// de erro de origem). Lê os XMLs reenviados, aproveita só os CT-es que estão nessa lista do lote aberto.
+async function incluirAtipicosNaValidacao(arquivos) {
+  const v = STATE.ultimaValidacao;
+  if (!v || !(v.outrosFluxos || []).length) return;
+  const alvo = new Set(v.outrosFluxos.map(x => x.cte.chave).filter(Boolean));
+  try {
+    toast('Lendo os XMLs…', 'info');
+    const { ctes } = await readCtesFromZip(arquivos);
+    const achados = ctes.filter(c => c.chave && alvo.has(c.chave));
+    if (!achados.length) { toast('Nenhum dos CT-es com origem diferente deste lote foi encontrado nos arquivos enviados.', 'warn'); return; }
+    const novo = validarLoteCtes(achados, STATE.parceiros);
+    const nfes = await DataLayer.listNfesPorChaves(novo.resultados.flatMap(r => (r.cte.notasFiscais || []).map(n => n.chave))).catch(() => []);
+    if (nfes.length) enriquecerComNotasFiscais(novo.resultados, nfes);
+    await aplicarPlanilhaAoLote({ resultados: novo.resultados, reentregas: novo.reentregas, outrosFluxos: [] }).catch(e => console.error(e));
+    if (novo.resultados.some(r => r._itensNFe)) {
+      const produtosMap = await carregarMapaProdutosAtivo().catch(() => null);
+      if (produtosMap) recalcularComCubagem(novo.resultados, produtosMap);
+    }
+    const incluidos = new Set([...novo.resultados, ...novo.reentregas].map(x => x.cte.chave));
+    v.resultados.push(...novo.resultados);
+    v.reentregas = [...(v.reentregas || []), ...novo.reentregas];
+    v.outrosFluxos = v.outrosFluxos.filter(x => !incluidos.has(x.cte.chave));
+    renderResultadosValidacao();
+    if (v.historicoId) {
+      await DataLayer.substituirValidacao(v.historicoId, montarRegistroHistorico(v.nomeArquivo, v));
+      v._resumoGravado = { ...montarRegistroHistorico(v.nomeArquivo, v).resumo };
+    }
+    toast(`${novo.resultados.length} CT-e(s) incluído(s) na validação com o marcador de erro de origem${v.outrosFluxos.length ? ` — ${v.outrosFluxos.length} não estavam nos arquivos enviados` : ''}${v.historicoId ? ' — Histórico atualizado' : ''}.`, 'success');
+  } catch (e) {
+    console.error(e);
+    toast(mensagemErroFirebase(e, 'incluir os CT-es na validação'), 'error');
+  }
+}
+
 async function processarNotasFiscais(entrada, progressBoxId = 'progressNFeBox') {
   const nomeLote = nomeDoLote(entrada);
   const temValidacaoAtiva = STATE.ultimaValidacao && STATE.ultimaValidacao.resultados?.length > 0;
@@ -3204,7 +3257,7 @@ function renderResumoFinanceiro(r) {
           </div>
         </div>
         <div class="text-[11px] text-ink-300 max-w-sm">
-          Faturado = Cliente pagou − Cobrado${r.qtdSemErro ? ' + ajuste dos CT-es analisados como Sem erro (a diferença deles conta como zero)' : ''}, sobre o lote inteiro. Devolução, reversa e reentrega entram só no "Cobrado" (o cliente não paga nada nesses casos).
+          Faturado = soma do que o cliente pagou − soma do que a transportadora cobrou, sobre o lote inteiro. Devolução, reversa e reentrega entram só no "Cobrado" (o cliente não paga nada nesses casos).
           <strong class="text-ink-400">Esse card já inclui tudo</strong> — não some com os números dos cards de "Cobrado a maior", "Devolução" etc. abaixo, eles são comparações diferentes (contra a tabela negociada, não contra o que o cliente pagou) e ficariam contados duas vezes.
           ${!r.temAlgumaNfe ? '<br><span class="text-amber-600">Ainda sem nenhuma nota fiscal casada — importe as NF-es pra esse número ficar completo.</span>' : ''}
         </div>
@@ -3214,18 +3267,23 @@ function renderResumoFinanceiro(r) {
 
 // CT-e analisado como "Sem erro": a diferença (e a margem do cliente) contam como ZERO nos
 // cards e na tabela — a diferença original continua no detalhe/tooltip só como referência.
-function classificacaoDe(r) {
-  const rev = r && r.cte && STATE.revisoes ? STATE.revisoes[r.cte.chave] : null;
-  return rev ? rev.classificacao : null;
+function classifsDaRevisao(rev) {
+  if (!rev) return [];
+  if (Array.isArray(rev.classificacoes) && rev.classificacoes.length) return rev.classificacoes;
+  return rev.classificacao ? [rev.classificacao] : [];
 }
-function analisadoSemErro(r) { return CLASSIF_ZERADA.includes(classificacaoDe(r)); } // "Sem erro" ou "Full"
-function classifPrejuizoTotal(r) { return CLASSIF_PREJUIZO_TOTAL.includes(classificacaoDe(r)); } // Redespacho / Uso e Consumo
-function rotuloClassif(r) { const c = classificacaoDe(r); return (LABEL_CLASSIFICACAO[c] || {}).label || c || ''; }
+function classifsDe(r) { return classifsDaRevisao(r && r.cte && STATE.revisoes ? STATE.revisoes[r.cte.chave] : null); }
+function classificacaoDe(r) { return classifsDe(r)[0] || null; }
+function zeraDivergencia(r) { return classifsDe(r).some(c => CLASSIF_ZERA_DIVERG.includes(c)); }
+function zeraMargem(r) { return classifsDe(r).some(c => CLASSIF_ZERA_MARGEM.includes(c)); }
+function analisadoSemErro(r) { return zeraDivergencia(r); } // Divergência/Prejuízo considerada zero
+function classifPrejuizoTotal(r) { return classifsDe(r).some(c => CLASSIF_PREJUIZO_TOTAL.includes(c)); } // Redespacho / Uso e Consumo
+function rotuloClassif(r) { return classifsDe(r).map(c => (LABEL_CLASSIFICACAO[c] || {}).label || c).join(' + '); }
 // Convenção de exibição: Divergência/Prejuízo = CALCULADO − COBRADO → negativo = cobrado a maior (prejuízo)
 function semZeroNeg(v) { return v === 0 ? 0 : v; }
 function difExibida(v) { return v === null || v === undefined ? v : semZeroNeg(clamp2(-v)); }
 function divergenciaEfetiva(r) { return analisadoSemErro(r) && r.divergencia !== null && r.divergencia !== undefined ? 0 : r.divergencia; }
-function margemClienteEfetiva(r) { if (ehReposicao(r)) return r.divergenciaCliente; if (classifPrejuizoTotal(r)) return -(r.cobrado || 0); return analisadoSemErro(r) && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined ? 0 : r.divergenciaCliente; }
+function margemClienteEfetiva(r) { if (ehReposicao(r)) return r.divergenciaCliente; if (classifPrejuizoTotal(r)) return -(r.cobrado || 0); return zeraMargem(r) && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined ? 0 : r.divergenciaCliente; }
 
 // ----- Filtros da tela de resultados (canal, parceiro, UF, busca livre) -----
 function normBusca(s) { return (s ?? '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase(); }
@@ -3237,7 +3295,7 @@ function passaFiltrosResultado(x, f, ehSemParceiro) {
   if (f.parceiro && parceiroNome !== f.parceiro) return false;
   if (f.uf && (cte.destUF || '') !== f.uf) return false;
   if (f.busca) {
-    const alvo = normBusca([cte.nCT, cte.destMun, cte.destUF, ...(cte.notasFiscais || []).map(n => n.numero), x.pedido, canal, parceiroNome, ehSemParceiro ? cte.emitNome : ''].join(' '));
+    const alvo = normBusca([x.origemDivergente ? 'ORIGEM DIVERGENTE ERRO DE ORIGEM' : '', cte.nCT, cte.destMun, cte.destUF, ...(cte.notasFiscais || []).map(n => n.numero), x.pedido, canal, parceiroNome, ehSemParceiro ? cte.emitNome : ''].join(' '));
     if (!normBusca(f.busca).trim().split(/\s+/).every(t => alvo.includes(t))) return false;
   }
   return true;
@@ -3293,7 +3351,7 @@ async function atualizarRevisoesAntigasDoLote(v) {
   if (!alvos.length) return;
   const novas = alvos.map(r => {
     const ant = STATE.revisoes[r.cte.chave];
-    const nv = montarRevisao(r, ant.classificacao, ant.observacao || '');
+    const nv = montarRevisao(r, classifsDaRevisao(ant), ant.observacao || '');
     nv.atualizadoEm = ant.atualizadoEm || null; nv.atualizadoPor = ant.atualizadoPor || null;
     return nv;
   });
@@ -3337,7 +3395,7 @@ function renderResultadosValidacao() {
     <div class="flex items-center justify-between mb-4">
       <div class="text-sm text-ink-500">
         <span class="font-medium text-ink-800">${escapeHtml(nomeArquivo)}</span> ·
-        ${resultados.length} CT-e(s) validado(s)${devolucoes.length ? ` (${devolucoes.length} devolução)` : ''}${semParceiro.length ? ` · ${semParceiro.length} sem parceiro cadastrado` : ''}${outrosFluxos.length ? ` · ${outrosFluxos.length} trajeto atípico` : ''}${reentregas.length ? ` · ${reentregas.length} reentrega` : ''}${nfeImportada ? ` · ${comNfe.length} com nota fiscal casada` : ''}${duplicadosIgnorados ? ` · <span class="text-amber-600">${duplicadosIgnorados} duplicado(s) ignorado(s)</span>` : ''}
+        ${resultados.length} CT-e(s) validado(s)${devolucoes.length ? ` (${devolucoes.length} devolução)` : ''}${(() => { const q = resultados.filter(r => r.origemDivergente).length; return q ? ` · <span class="text-orange-700" title="Digite &quot;origem&quot; na busca pra ver só esses">${q} com erro de origem (validados normalmente)</span>` : ''; })()}${semParceiro.length ? ` · ${semParceiro.length} sem parceiro cadastrado` : ''}${outrosFluxos.length ? ` · ${outrosFluxos.length} trajeto atípico` : ''}${reentregas.length ? ` · ${reentregas.length} reentrega` : ''}${nfeImportada ? ` · ${comNfe.length} com nota fiscal casada` : ''}${duplicadosIgnorados ? ` · <span class="text-amber-600">${duplicadosIgnorados} duplicado(s) ignorado(s)</span>` : ''}
       </div>
       <div class="flex items-center gap-4">
         ${vAtual.historicoId
@@ -3397,8 +3455,12 @@ function renderResultadosValidacao() {
 
     ${outrosFluxos.length ? `
       <div class="mt-6 bg-blue-50 border border-blue-200 rounded-2xl p-5">
-        <div class="text-sm font-semibold text-blue-800 mb-1">${outrosFluxos.length} CT-e(s) com trajeto atípico — fora da validação</div>
-        <p class="text-xs text-blue-700 mb-3">Esses CT-es não saem nem voltam pra origem cadastrada do parceiro (não é um envio normal nem uma devolução reconhecível) — não dá pra saber qual tabela usar, então ficam de fora do cálculo. Listados aqui só pra controle.</p>
+        <div class="text-sm font-semibold text-blue-800 mb-1">${outrosFluxos.length} CT-e(s) com origem diferente da cadastrada — ainda fora da validação</div>
+        <p class="text-xs text-blue-700 mb-3">Lote importado antes da mudança de 09/10: na época esses CT-es ficaram de fora. Agora a origem diferente conta só como erro de emissão — pra validar esses junto com os demais, reenvie os XMLs deste lote (pode ser o mesmo .zip): só os CT-es abaixo são lidos, o resto é ignorado.</p>
+        <label class="inline-flex items-center gap-2 mb-3 cursor-pointer bg-white border border-blue-300 hover:bg-blue-100 text-blue-800 font-medium text-xs rounded-lg px-3 py-1.5">
+          <input type="file" id="fileIncluirAtipicos" multiple accept=".zip,.xml" class="hidden">
+          Incluir na validação — reenviar os XMLs
+        </label>
         <div class="text-xs">${renderGrupoForaFluxo('Trajeto atípico', outrosFluxos, 'ink')}</div>
       </div>
     ` : ''}
@@ -3547,16 +3609,25 @@ const LABEL_CLASSIFICACAO = {
   intelipost: { label: 'Intelipost', cls: 'bg-blue-50 text-blue-700 border-blue-200' },
   tabela: { label: 'Tabela', cls: 'bg-amber-50 text-amber-700 border-amber-200' },
   transportadora: { label: 'Transportadora', cls: 'bg-red-50 text-red-700 border-red-200' },
-  sem_erro: { label: 'Sem erro', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+  sem_erro: { label: 'Sem erro (antigo)', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+  sem_erro_transp: { label: 'Sem erro — Transportadora', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+  sem_erro_shopee: { label: 'Sem erro — Shopee', cls: 'bg-lime-50 text-lime-700 border-lime-200' },
 };
+function badgeOrigem(r) {
+  const o = r.origemDivergente;
+  if (!o) return '';
+  return ` <span title="Erro de emissão: o CT-e saiu de ${escapeHtml(o.municipio)}/${escapeHtml(o.uf)}, diferente da origem cadastrada do parceiro (${escapeHtml(o.esperado || '—')}). A cobrança existe do mesmo jeito — validado normalmente pela tabela, pelo destino." class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full border bg-orange-50 text-orange-700 border-orange-200 whitespace-nowrap">⚠ Origem: ${escapeHtml(o.municipio)}/${escapeHtml(o.uf)}</span>`;
+}
 function badgeAnalise(r) {
   const revisao = STATE.revisoes[r.cte.chave];
-  if (!revisao || !revisao.classificacao) return '';
-  const info = LABEL_CLASSIFICACAO[revisao.classificacao];
-  if (!info) return '';
+  const cs = classifsDaRevisao(revisao);
+  if (!cs.length) return '';
   const quando = revisao.atualizadoEm ? ` em ${fmtDate(revisao.atualizadoEm)}` : '';
-  const extra = revisao.classificacao === 'sem_erro' && revisao.diferencaApurada ? ` — diferença original ${fmtBRL(revisao.diferencaApurada)} considerada R$ 0,00` : '';
-  return ` <span title="Analisado${quando} por ${escapeHtml(revisao.atualizadoPor || '—')}: ${escapeHtml(info.label)}${extra}" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border ${info.cls}">✓ ${info.label}</span>`;
+  return cs.map(c => {
+    const info = LABEL_CLASSIFICACAO[c];
+    if (!info) return '';
+    return ` <span title="Analisado${quando} por ${escapeHtml(revisao.atualizadoPor || '—')}: ${escapeHtml((infoClassif(c) || info).label)}" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border ${info.cls}">✓ ${info.label}</span>`;
+  }).join('');
 }
 
 function statusBadge(status) {
@@ -3592,12 +3663,16 @@ function renderTabelaResultados(lista, filtro) {
   const barraMassa = `
     <div id="barraMassa" class="mb-3 bg-white rounded-2xl border border-ink-100 ring-brand-300 px-4 py-2.5 flex flex-wrap items-center gap-3 text-xs">
       <span class="text-ink-500"><strong id="qtdSelecionados" class="text-ink-800">${sel.size}</strong> selecionado(s)</span>
-      <select id="selMassaClassificacao" class="border border-ink-200 rounded-lg px-2 py-1.5 max-w-[300px]">
-        <option value="">Classificar como…</option>
-        ${CLASSIFICACOES_DIVERGENCIA.map(c => `<option value="${c.valor}">${c.label}</option>`).join('')}
-      </select>
+      <details id="massaClassifBox" class="relative">
+        <summary class="list-none cursor-pointer border border-ink-200 rounded-lg px-2.5 py-1.5 bg-white select-none"><span id="massaClassifTexto">Classificar como…</span> ▾</summary>
+        <div class="absolute z-30 mt-1 w-[420px] bg-white border border-ink-200 rounded-xl shadow-xl p-3 space-y-2">
+          ${GRUPOS_CLASSIF.map(g => `<div><div class="text-[10px] font-semibold uppercase tracking-wide text-ink-400 mb-0.5">${g.titulo}</div>${g.itens.map(v => `<label class="flex items-start gap-2 py-0.5 cursor-pointer"><input type="checkbox" class="chk-massa-classif mt-0.5" value="${v}"><span>${escapeHtml(infoClassif(v).label)}</span></label>`).join('')}</div>`).join('')}
+          <label class="flex items-center gap-2 pt-2 border-t border-ink-100 text-ink-600"><input type="checkbox" id="chkMassaAdicionar"> Adicionar às classificações que o CT-e já tem (sem marcar, substitui)</label>
+        </div>
+      </details>
       <input id="obsMassa" placeholder="Observação (opcional — vazio mantém a de cada CT-e)" class="border border-ink-200 rounded-lg px-2.5 py-1.5 flex-1 min-w-[220px]">
       <button id="btnAplicarMassa" ${sel.size ? '' : 'disabled'} class="bg-ink-900 hover:bg-ink-800 disabled:opacity-40 text-white font-medium rounded-lg px-3 py-1.5">Aplicar aos selecionados</button>
+      <button id="btnRemoverMassa" ${sel.size ? '' : 'disabled'} class="text-red-600 hover:text-red-700 border border-red-200 hover:bg-red-50 disabled:opacity-40 font-medium rounded-lg px-3 py-1.5">Voltar p/ sem classificação</button>
       <button id="btnLimparSelecao" class="text-ink-500 hover:text-ink-700">Limpar seleção</button>
       ${(() => {
         const rasc = (STATE.parceiros || []).filter(p => p.rascunho);
@@ -3644,7 +3719,7 @@ function renderTabelaResultados(lista, filtro) {
               <td class="px-4 py-3 text-ink-700">${escapeHtml(r.parceiro.nome)}</td>
               <td class="px-4 py-3 text-ink-600">${r.tipoOperacao === 'devolucao'
                 ? `<span title="Devolução — destino real do CT-e é a origem do parceiro; a região usada no cálculo é a do remetente (${escapeHtml(r.cte.remMun||r.cte.xMunIni)}/${escapeHtml(r.cte.remUF||r.cte.UFIni)})" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border bg-brand-50 text-brand-700 border-brand-200 mr-1">↩ Devolução</span>${escapeHtml(r.cte.remMun || r.cte.xMunIni)} / ${escapeHtml(r.cte.remUF || r.cte.UFIni)}`
-                : `${escapeHtml(r.cte.destMun)} <span class="text-ink-300">/</span> ${escapeHtml(r.cte.destUF)}${municipioAbrangenciaDivergente(r) ? ' <span title="Município da faixa de CEP na abrangência é diferente do declarado no CT-e" class="text-amber-500">⚠</span>' : ''}`
+                : `${escapeHtml(r.cte.destMun)} <span class="text-ink-300">/</span> ${escapeHtml(r.cte.destUF)}${municipioAbrangenciaDivergente(r) ? ' <span title="Município da faixa de CEP na abrangência é diferente do declarado no CT-e" class="text-amber-500">⚠</span>' : ''}${badgeOrigem(r)}`
               }</td>
               <td class="px-4 py-3 text-right num text-ink-700">${fmtBRL(r.cobrado)}</td>
               <td class="px-4 py-3 text-right num text-ink-700">${r.calculado !== null ? fmtBRL(r.calculado) : '—'}</td>
@@ -3660,7 +3735,7 @@ function renderTabelaResultados(lista, filtro) {
                 <td class="px-4 py-3 text-right num text-ink-700" title="${rotuloClassif(r)}: o cliente não paga esse frete">${fmtBRL(0)}</td>
                 <td class="px-4 py-3 text-right num font-semibold text-red-600" title="${rotuloClassif(r)} — prejuízo total">${fmtBRL(-(r.cobrado || 0))}</td>` : `
                 <td class="px-4 py-3 text-right num text-ink-700">${r.valorFreteCliente != null ? fmtBRL(r.valorFreteCliente) : '<span class="text-ink-300">sem NF-e</span>'}</td>
-                <td class="px-4 py-3 text-right num font-semibold ${r.divergenciaCliente == null ? 'text-ink-300' : margemClienteEfetiva(r) < 0 ? 'text-red-600' : 'text-emerald-600'}" ${analisadoSemErro(r) && r.divergenciaCliente ? `title="Analisado como ${rotuloClassif(r)} — margem original ${fmtBRL(r.divergenciaCliente)} considerada R$ 0,00"` : ''}>${r.divergenciaCliente != null ? (analisadoSemErro(r) && r.divergenciaCliente ? `${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(r.divergenciaCliente)}</span>` : (r.divergenciaCliente>0?'+':'') + fmtBRL(r.divergenciaCliente)) : '—'}</td>
+                <td class="px-4 py-3 text-right num font-semibold ${r.divergenciaCliente == null ? 'text-ink-300' : margemClienteEfetiva(r) < 0 ? 'text-red-600' : 'text-emerald-600'}" ${zeraMargem(r) && r.divergenciaCliente ? `title="Analisado como ${rotuloClassif(r)} — margem original ${fmtBRL(r.divergenciaCliente)} considerada R$ 0,00"` : ''}>${r.divergenciaCliente != null ? (zeraMargem(r) && r.divergenciaCliente ? `${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(r.divergenciaCliente)}</span>` : (r.divergenciaCliente>0?'+':'') + fmtBRL(r.divergenciaCliente)) : '—'}</td>
               `) : ''}
               <td class="px-4 py-3">${r.tabelaAlternativa ? `<span title="Calculado com a tabela em rascunho: ${escapeHtml(r.tabelaAlternativa.nome)}" class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full border bg-amber-50 text-amber-700 border-amber-200 mr-1">TABELA ANTIGA</span>` : ''}${statusBadge(r.calc.status)}${calcularReconciliacaoXml(r).temPendencia ? ' <span title="Existe cobrança no XML que nenhuma regra cadastrada reconhece" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border bg-red-50 text-red-700 border-red-200">$ não cadastrado</span>' : ''}${badgeAnalise(r)}</td>
               <td class="px-4 py-3 text-right">
@@ -3690,6 +3765,13 @@ function renderTabelaResultados(lista, filtro) {
     atualizarBarraSelecao();
   });
   $('#btnAplicarMassa').addEventListener('click', aplicarClassificacaoEmMassa);
+  const inpAtip = $('#fileIncluirAtipicos');
+  if (inpAtip) inpAtip.addEventListener('change', () => { const arqs = Array.from(inpAtip.files || []); inpAtip.value = ''; if (arqs.length) incluirAtipicosNaValidacao(arqs); });
+  $('#btnRemoverMassa').addEventListener('click', removerClassificacaoEmMassa);
+  $$('.chk-massa-classif').forEach(c => c.addEventListener('change', () => {
+    const cs = $$('.chk-massa-classif').filter(x => x.checked).map(x => (LABEL_CLASSIFICACAO[x.value] || {}).label || x.value);
+    $('#massaClassifTexto').textContent = cs.length ? cs.join(' + ') : 'Classificar como…';
+  }));
   const btnTabMassa = $('#btnAplicarTabelaMassa');
   if (btnTabMassa) btnTabMassa.addEventListener('click', async () => {
     const selSet = selecionadosSet();
@@ -3824,29 +3906,49 @@ const CLASSIFICACOES_DIVERGENCIA = [
   { valor: 'full', label: 'Full (sem prejuízo e sem ganho — diferença zerada)', labelCurta: 'Full' },
   { valor: 'redespacho', label: 'Redespacho (prejuízo total)', labelCurta: 'Redespacho' },
   { valor: 'uso_consumo', label: 'Uso e Consumo (prejuízo total)', labelCurta: 'Uso e Consumo' },
-  { valor: 'sem_erro', label: 'Sem erro — divergência explicada/aceitável', labelCurta: 'Sem erro' },
+  { valor: 'sem_erro_transp', label: 'Sem erro — divergência explicada/aceitável — Transportadora (zera só a Divergência/Prejuízo)', labelCurta: 'Sem erro (Transportadora)' },
+  { valor: 'sem_erro_shopee', label: 'Sem erro — divergência explicada/aceitável — Shopee (zera só a Margem)', labelCurta: 'Sem erro (Shopee)' },
 ];
+// classificação antiga, não dá mais pra escolher — só continua valendo nos CT-es que já tinham
+const CLASSIF_LEGADAS = [
+  { valor: 'sem_erro', label: 'Sem erro (antigo — zera Divergência e Margem)', labelCurta: 'Sem erro (antigo)' },
+];
+function infoClassif(v) { return CLASSIFICACOES_DIVERGENCIA.find(c => c.valor === v) || CLASSIF_LEGADAS.find(c => c.valor === v) || null; }
+// grupos do formulário de análise (cada CT-e pode ter mais de uma classificação)
+const GRUPOS_CLASSIF = [
+  { titulo: 'Divergência — cobrado × calculado (tabela)', itens: ['transportadora', 'tabela', 'proposta_comercial', 'sem_erro_transp'] },
+  { titulo: 'Margem — frete do cliente × cobrado', itens: ['plataforma', 'intelipost', 'transp_diferente', 'sem_erro_shopee'] },
+  { titulo: 'Outros', itens: ['full', 'redespacho', 'uso_consumo'] },
+];
+// zera a coluna Divergência/Prejuízo (cobrado × calculado)
+const CLASSIF_ZERA_DIVERG = ['sem_erro', 'sem_erro_transp', 'full'];
+// zera a coluna Margem (frete do cliente × cobrado)
+const CLASSIF_ZERA_MARGEM = ['sem_erro', 'sem_erro_shopee', 'full'];
+// só marcam que foi conferido — não aparecem nas abas de Análises
+const CLASSIF_SEM_ANALISE = ['sem_erro', 'sem_erro_transp', 'sem_erro_shopee'];
 // classificações em que a diferença é FRETE COBRADO pela transportadora × FRETE COBRADO DO CLIENTE
 // (não contra a tabela negociada)
 const CLASSIF_BASE_CLIENTE = ['plataforma', 'intelipost', 'transp_diferente'];
 // diferença sempre zerada (não é prejuízo nem ganho) — mesmo efeito do "Sem erro"
-const CLASSIF_ZERADA = ['sem_erro', 'full'];
+const CLASSIF_ZERADA = ['sem_erro', 'sem_erro_transp', 'sem_erro_shopee', 'full'];
 // sempre prejuízo total (o valor cobrado inteiro), igual devolução/reposição
 const CLASSIF_PREJUIZO_TOTAL = ['redespacho', 'uso_consumo'];
 
 function renderSecaoAnalise(idx, revisao, subtotalCobrado, subtotalCalculado, valorRessarcirPreview) {
-  const classificacaoAtual = revisao?.classificacao || '';
+  const atuais = classifsDaRevisao(revisao);
   const obsAtual = revisao?.observacao || '';
-  const mostrarCamposTransportadora = classificacaoAtual === 'transportadora';
+  const mostrarCamposTransportadora = atuais.includes('transportadora');
+  const chk = v => { const info = infoClassif(v); return `<label class="flex items-start gap-2 py-0.5 cursor-pointer"><input type="checkbox" class="chk-classif-${idx} mt-0.5" value="${v}" ${atuais.includes(v) ? 'checked' : ''} onchange="atualizarCamposTratativa(${idx})"><span>${escapeHtml(info ? info.label : v)}</span></label>`; };
   return `
     <div class="mt-4 pt-4 border-t border-ink-100">
       <div class="text-sm font-semibold text-ink-800 mb-1">Análise da divergência</div>
       ${revisao ? `<p class="text-[11px] text-ink-400 mb-2">Última análise em ${fmtDate(revisao.atualizadoEm)} por ${escapeHtml(revisao.atualizadoPor || '—')}.</p>` : `<p class="text-[11px] text-ink-400 mb-2">Ainda não analisado.</p>`}
       <div class="space-y-2">
-        <select id="selClassificacao-${idx}" onchange="atualizarCamposTratativa(${idx})" class="w-full border border-ink-200 rounded-lg px-3 py-2 text-sm">
-          <option value="">Selecione a classificação...</option>
-          ${CLASSIFICACOES_DIVERGENCIA.map(c => `<option value="${c.valor}" ${classificacaoAtual===c.valor?'selected':''}>${c.label}</option>`).join('')}
-        </select>
+        <div class="border border-ink-200 rounded-lg px-3 py-2 text-xs text-ink-700 space-y-2">
+          <div class="text-[11px] text-ink-400">Marque uma ou mais classificações:</div>
+          ${GRUPOS_CLASSIF.map(g => `<div><div class="text-[10px] font-semibold uppercase tracking-wide text-ink-400 mb-0.5">${g.titulo}</div>${g.itens.map(chk).join('')}</div>`).join('')}
+          ${atuais.filter(c => CLASSIF_LEGADAS.some(l => l.valor === c)).map(c => `<div><div class="text-[10px] font-semibold uppercase tracking-wide text-ink-400 mb-0.5">Antiga</div>${chk(c)}</div>`).join('')}
+        </div>
         <textarea id="obsAnalise-${idx}" rows="2" placeholder="Observações da tratativa (opcional)" class="w-full border border-ink-200 rounded-lg px-3 py-2 text-sm">${escapeHtml(obsAtual)}</textarea>
         <div id="camposTransportadora-${idx}" class="${mostrarCamposTransportadora ? '' : 'hidden'} grid grid-cols-3 gap-2 bg-red-50 border border-red-200 rounded-lg p-3 text-xs">
           <div>
@@ -3863,19 +3965,27 @@ function renderSecaoAnalise(idx, revisao, subtotalCobrado, subtotalCalculado, va
           </div>
           <p class="col-span-3 text-red-600/80 mt-1">Subtotal cobrado × subtotal calculado, sem ICMS — negativo = cobrado a maior. Vai pra aba Análises assim que você salvar.</p>
         </div>
-        <p id="avisoSemErro-${idx}" class="${classificacaoAtual === 'sem_erro' ? '' : 'hidden'} text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">Ao concluir como <strong>Sem erro</strong>, a diferença deste CT-e passa a contar como <strong>R$ 0,00</strong> (positiva ou negativa — já explicada por desconto, custo previsto etc.) e ele fica marcado como analisado.</p>
+        <p id="avisoSemErro-${idx}" class="${atuais.some(c => CLASSIF_SEM_ANALISE.includes(c)) ? '' : 'hidden'} text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">${textoAvisoSemErro(atuais)}</p>
         <button id="btnSalvarAnalise-${idx}" onclick="salvarAnaliseAtual(${idx})" class="w-full bg-ink-900 hover:bg-ink-800 text-white text-sm font-medium py-2 rounded-lg">${revisao ? 'Atualizar análise' : 'Concluir análise'}</button>
+        ${revisao ? `<button id="btnRemoverAnalise-${idx}" onclick="removerAnaliseAtual(${idx})" class="w-full text-xs text-red-600 hover:text-red-700 hover:bg-red-50 border border-red-200 font-medium py-1.5 rounded-lg">Voltar para sem classificação (tira das Análises)</button>` : ''}
       </div>
     </div>`;
 }
 
+function textoAvisoSemErro(cs) {
+  const p = [];
+  if (cs.includes('sem_erro_transp')) p.push('<strong>Sem erro — Transportadora</strong>: a Divergência/Prejuízo (cobrado × calculado) passa a contar como <strong>R$ 0,00</strong>; a Margem continua como está');
+  if (cs.includes('sem_erro_shopee')) p.push('<strong>Sem erro — Shopee</strong>: a Margem (frete do cliente × cobrado) passa a contar como <strong>R$ 0,00</strong>; a Divergência/Prejuízo continua como está');
+  if (cs.includes('sem_erro')) p.push('<strong>Sem erro (antigo)</strong>: zera Divergência e Margem');
+  return p.join('<br>');
+}
+function classifsMarcadas(idx) { return $$(`.chk-classif-${idx}`).filter(c => c.checked).map(c => c.value); }
 function atualizarCamposTratativa(idx) {
-  const sel = $(`#selClassificacao-${idx}`);
+  const cs = classifsMarcadas(idx);
   const box = $(`#camposTransportadora-${idx}`);
-  if (!sel || !box) return;
-  box.classList.toggle('hidden', sel.value !== 'transportadora');
+  if (box) box.classList.toggle('hidden', !cs.includes('transportadora'));
   const aviso = $(`#avisoSemErro-${idx}`);
-  if (aviso) aviso.classList.toggle('hidden', sel.value !== 'sem_erro');
+  if (aviso) { aviso.innerHTML = textoAvisoSemErro(cs); aviso.classList.toggle('hidden', !cs.some(c => CLASSIF_SEM_ANALISE.includes(c))); }
 }
 
 // Monta um texto automático listando TODOS os componentes que divergem entre cobrado e
@@ -3924,25 +4034,77 @@ function montarDetalhamentoDivergencias(r) {
   return partes.length ? partes.join(' | ') : 'Nenhum componente cobrado a maior que o calculado.';
 }
 
-function montarRevisao(r, classificacao, observacao) {
+// Valor de UMA classificação do CT-e (cada classificação tem a sua base de comparação e o seu status)
+function calcularClassificacao(r, classificacao, base) {
+  const out = {
+    detalhamentoErros: base.detalhamento,
+    valorCobradoSubtotal: base.subtotalCobrado,   // sem ICMS
+    valorRealSubtotal: base.subtotalCalculado,    // sem ICMS
+    valorRessarcir: CLASSIF_ZERADA.includes(classificacao) ? 0 : base.diferencaApurada,
+    baseComparacao: 'tabela',
+  };
+  if (classificacao === 'full') {
+    out.baseComparacao = 'zerada';
+    out.detalhamentoErros = `Full — sem prejuízo e sem ganho: diferença considerada R$ 0,00${base.diferencaApurada ? ` (diferença apurada contra a tabela: ${fmtBRL(base.diferencaApurada)})` : ''}.`;
+  }
+  if (classificacao === 'sem_erro_transp') {
+    out.baseComparacao = 'zerada';
+    out.detalhamentoErros = `Sem erro — Transportadora: Divergência/Prejuízo considerada R$ 0,00${base.diferencaApurada ? ` (diferença apurada sem ICMS: ${fmtBRL(base.diferencaApurada)})` : ''}.`;
+  }
+  if (classificacao === 'sem_erro_shopee') {
+    out.baseComparacao = 'zerada';
+    out.valorCobradoSubtotal = r.cobrado ?? null;
+    out.valorRealSubtotal = r.valorFreteCliente ?? null;
+    out.detalhamentoErros = `Sem erro — Shopee: Margem considerada R$ 0,00${r.divergenciaCliente ? ` (margem apurada: ${fmtBRL(r.divergenciaCliente)})` : ''}.`;
+  }
+  if (CLASSIF_PREJUIZO_TOTAL.includes(classificacao)) {
+    const rot = classificacao === 'redespacho' ? 'Redespacho' : 'Uso e Consumo';
+    out.baseComparacao = 'prejuizo';
+    out.valorCobradoSubtotal = r.cobrado ?? null;
+    out.valorRealSubtotal = 0;
+    out.valorRessarcir = r.cobrado != null ? semZeroNeg(clamp2(-r.cobrado)) : null;
+    out.detalhamentoErros = `${rot} — prejuízo total: o valor cobrado inteiro (${fmtBRL(r.cobrado)}) é prejuízo, o cliente não paga esse frete.`;
+  }
+  // plataforma / Intelipost / transportadora diferente da cotada: FRETE DO CLIENTE − FRETE COBRADO (negativo = prejuízo)
+  if (CLASSIF_BASE_CLIENTE.includes(classificacao)) {
+    const freteCliente = r.valorFreteCliente != null ? r.valorFreteCliente : null;
+    out.baseComparacao = 'cliente';
+    out.valorCobradoSubtotal = r.cobrado ?? null;
+    out.valorRealSubtotal = freteCliente;
+    out.valorRessarcir = (freteCliente != null && r.cobrado != null) ? semZeroNeg(clamp2(freteCliente - r.cobrado)) : null;
+    out.detalhamentoErros = freteCliente != null
+      ? `${classificacao === 'transp_diferente' ? `Despachado por ${r.parceiro.nome}, diferente da transportadora cotada. ` : ''}Frete cobrado pela transportadora ${fmtBRL(r.cobrado)} × frete cobrado do cliente ${fmtBRL(freteCliente)}${r.nfeVinculada?.nNF ? ` (NF ${r.nfeVinculada.nNF})` : ''}${ehReposicao(r) ? ' — reposição, cliente não paga' : ''} = diferença ${fmtBRL(out.valorRessarcir)}.`
+      : `Sem frete do cliente casado (importe o XML da NF-e ou a planilha) — não dá pra calcular a diferença frete cobrado × frete do cliente.`;
+  }
+  return out;
+}
+
+function montarRevisao(r, classificacoes, observacao) {
+  classificacoes = Array.from(new Set((Array.isArray(classificacoes) ? classificacoes : [classificacoes]).filter(Boolean)));
   const reconciliacao = calcularReconciliacaoXml(r);
   const icmsCobrado = reconciliacao.componenteImposto ? reconciliacao.componenteImposto.valor : r.cte.vICMS;
   const subtotalCobrado = (r.cobrado != null && icmsCobrado != null) ? clamp2(r.cobrado - icmsCobrado) : null;
   const subtotalCalculado = r.calc.subtotalCalculado ?? null;
-  // SUBTOTAL calculado − SUBTOTAL cobrado (sem ICMS):
-  // negativo = transportadora cobrou a maior (prejuízo); positivo = cobrou a menor
+  // SUBTOTAL calculado − SUBTOTAL cobrado (sem ICMS): negativo = cobrado a maior (prejuízo)
   const diferencaApurada = (subtotalCobrado != null && subtotalCalculado != null)
     ? semZeroNeg(clamp2(subtotalCalculado - subtotalCobrado)) : null;
-  // "Sem erro" = diferença já explicada (desconto, custo já considerado...) -> conta como ZERO,
-  // seja positiva ou negativa. A diferença original fica guardada só como referência.
-  const valorRessarcir = CLASSIF_ZERADA.includes(classificacao) ? 0 : diferencaApurada;
+  const base = { subtotalCobrado, subtotalCalculado, diferencaApurada, detalhamento: montarDetalhamentoDivergencias(r) };
 
   const existente = STATE.revisoes[r.cte.chave];
-  const statusAtual = existente?.statusTratativa || 'pendente';
-  const datasStatus = { ...(existente?.datasStatus || {}) };
-  if (!datasStatus[statusAtual]) datasStatus[statusAtual] = new Date().toISOString(); // primeira vez que essa análise existe
+  const classifsAntes = classifsDaRevisao(existente);
+  const agora = new Date().toISOString();
+  const porClassif = {};
+  classificacoes.forEach(c => {
+    const ant = existente?.porClassif?.[c] || (classifsAntes.includes(c) && classifsAntes[0] === c ? { statusTratativa: existente.statusTratativa, datasStatus: existente.datasStatus } : null);
+    let status = ant?.statusTratativa || 'pendente';
+    const datasStatus = { ...(ant?.datasStatus || {}) };
+    if (CLASSIF_ZERADA.includes(c)) status = 'resolvido_custo';
+    if (!datasStatus[status]) datasStatus[status] = agora;
+    porClassif[c] = { ...calcularClassificacao(r, c, base), statusTratativa: status, datasStatus };
+  });
+  const principal = porClassif[classificacoes[0]];
 
-  const revisao = {
+  return {
     chave: r.cte.chave,
     nCT: r.cte.nCT,
     parceiroNome: r.parceiro.nome,
@@ -3955,56 +4117,41 @@ function montarRevisao(r, classificacao, observacao) {
     vencimentoFatura: (STATE.ultimaValidacao && STATE.ultimaValidacao.vencimentoFatura) || existente?.vencimentoFatura || null,
     tabelaUsada: r.tabelaAlternativa ? r.tabelaAlternativa.nome : null,
     reposicao: !!r.reposicao,
-    classificacao,
+    classificacoes,
+    classificacao: classificacoes[0],          // compatibilidade: a primeira
+    porClassif,
     observacao,
-    detalhamentoErros: montarDetalhamentoDivergencias(r),
-    valorCobradoSubtotal: subtotalCobrado,     // sem ICMS
-    valorRealSubtotal: subtotalCalculado,      // sem ICMS
+    // campos da classificação principal no topo (compatibilidade com telas/versões antigas)
+    detalhamentoErros: principal.detalhamentoErros,
+    valorCobradoSubtotal: principal.valorCobradoSubtotal,
+    valorRealSubtotal: principal.valorRealSubtotal,
+    valorRessarcir: principal.valorRessarcir,
+    baseComparacao: principal.baseComparacao,
+    statusTratativa: principal.statusTratativa,
+    datasStatus: principal.datasStatus,
     freteTotalCobrado: r.cobrado ?? null, freteTotalCalculado: r.calculado ?? null, // só referência (com ICMS)
-    valorRessarcir,
-    versaoCalc: 3,
+    versaoCalc: 4,
     diferencaApurada,
     margemClienteApurada: r.divergenciaCliente ?? null,
     analisado: true,
-    baseComparacao: 'tabela',
-    statusTratativa: CLASSIF_ZERADA.includes(classificacao) ? 'resolvido_custo' : statusAtual,
-    datasStatus,
   };
-  if (CLASSIF_ZERADA.includes(classificacao) && !revisao.datasStatus.resolvido_custo) revisao.datasStatus.resolvido_custo = new Date().toISOString();
-  if (classificacao === 'full') {
-    revisao.baseComparacao = 'zerada';
-    revisao.detalhamentoErros = `Full — sem prejuízo e sem ganho: diferença considerada R$ 0,00${diferencaApurada ? ` (diferença apurada contra a tabela: ${fmtBRL(diferencaApurada)})` : ''}.`;
-  }
-  if (CLASSIF_PREJUIZO_TOTAL.includes(classificacao)) {
-    const rot = classificacao === 'redespacho' ? 'Redespacho' : 'Uso e Consumo';
-    revisao.baseComparacao = 'prejuizo';
-    revisao.valorCobradoSubtotal = r.cobrado ?? null;
-    revisao.valorRealSubtotal = 0;
-    revisao.valorRessarcir = r.cobrado != null ? semZeroNeg(clamp2(-r.cobrado)) : null;
-    revisao.detalhamentoErros = `${rot} — prejuízo total: o valor cobrado inteiro (${fmtBRL(r.cobrado)}) é prejuízo, o cliente não paga esse frete.`;
-  }
-  // Erro de plataforma (bug do site/e-commerce no frete cobrado do cliente): a diferença que importa
-  // é FRETE COBRADO pela transportadora × FRETE COBRADO DO CLIENTE na nota (negativa = prejuízo)
-  if (CLASSIF_BASE_CLIENTE.includes(classificacao)) {
-    const freteCliente = r.valorFreteCliente != null ? r.valorFreteCliente : null;
-    revisao.baseComparacao = 'cliente';
-    revisao.valorCobradoSubtotal = r.cobrado ?? null;
-    revisao.valorRealSubtotal = freteCliente;
-    revisao.valorRessarcir = (freteCliente != null && r.cobrado != null) ? semZeroNeg(clamp2(freteCliente - r.cobrado)) : null;
-    revisao.detalhamentoErros = freteCliente != null
-      ? `${classificacao === 'transp_diferente' ? `Despachado por ${r.parceiro.nome}, diferente da transportadora cotada. ` : ''}Frete cobrado pela transportadora ${fmtBRL(r.cobrado)} × frete cobrado do cliente ${fmtBRL(freteCliente)}${r.nfeVinculada?.nNF ? ` (NF ${r.nfeVinculada.nNF})` : ''}${ehReposicao(r) ? ' — reposição, cliente não paga' : ''} = diferença ${fmtBRL(revisao.valorRessarcir)}.`
-      : `Sem frete do cliente casado (importe o XML da NF-e ou a planilha) — não dá pra calcular a diferença frete cobrado × frete do cliente.`;
-  }
-  return revisao;
+}
+
+function textoToastClassif(cs) {
+  const p = [];
+  if (cs.some(c => CLASSIF_ZERA_DIVERG.includes(c))) p.push('Divergência/Prejuízo considerada R$ 0,00');
+  if (cs.some(c => CLASSIF_ZERA_MARGEM.includes(c))) p.push('Margem considerada R$ 0,00');
+  if (cs.some(c => CLASSIF_PREJUIZO_TOTAL.includes(c))) p.push('valor cobrado inteiro como prejuízo');
+  return p.length ? ' — ' + p.join('; ') : '';
 }
 
 async function salvarAnaliseAtual(idx) {
   const r = STATE.ultimaValidacao.resultados[idx];
   if (!r) return;
-  const classificacao = $(`#selClassificacao-${idx}`).value;
-  if (!classificacao) { toast('Escolha uma classificação antes de salvar.', 'error'); return; }
+  const classificacoes = classifsMarcadas(idx);
+  if (!classificacoes.length) { toast(STATE.revisoes[r.cte.chave] ? 'Marque pelo menos uma classificação — ou use "Voltar para sem classificação".' : 'Marque pelo menos uma classificação antes de salvar.', 'error'); return; }
   const observacao = $(`#obsAnalise-${idx}`).value.trim();
-  const revisao = montarRevisao(r, classificacao, observacao);
+  const revisao = montarRevisao(r, classificacoes, observacao);
 
   const btnSalvar = document.getElementById(`btnSalvarAnalise-${idx}`);
   if (btnSalvar) { btnSalvar.disabled = true; btnSalvar.textContent = 'Salvando…'; btnSalvar.classList.add('opacity-60'); }
@@ -4012,7 +4159,7 @@ async function salvarAnaliseAtual(idx) {
     await DataLayer.saveRevisao(revisao);
     STATE.revisoes[revisao.chave] = revisao;
     atualizarBadgeTratativas();
-    toast(CLASSIF_ZERADA.includes(classificacao) ? 'Análise salva — marcado como analisado, diferença considerada R$ 0,00 (inclusive no Faturado).' : CLASSIF_PREJUIZO_TOTAL.includes(classificacao) ? 'Análise salva — valor cobrado inteiro considerado prejuízo (inclusive no Faturado).' : 'Análise salva.', 'success');
+    toast('Análise salva' + textoToastClassif(classificacoes) + '.', 'success');
     if (STATE.ultimaValidacao) {
       renderResultadosValidacao();
       atualizarResumoDoLoteNoHistorico();
@@ -4027,6 +4174,35 @@ async function salvarAnaliseAtual(idx) {
   }
 }
 
+// Volta o CT-e pra "sem classificação": apaga a análise (sai das Análises) e ele volta pra conferência inicial
+async function removerAnalises(chaves) {
+  chaves = chaves.filter(ch => STATE.revisoes[ch]);
+  if (!chaves.length) return 0;
+  await DataLayer.deleteRevisoes(chaves);
+  chaves.forEach(ch => { delete STATE.revisoes[ch]; });
+  atualizarBadgeTratativas();
+  if (STATE.ultimaValidacao) { renderResultadosValidacao(); atualizarResumoDoLoteNoHistorico(); }
+  return chaves.length;
+}
+async function removerAnaliseAtual(idx) {
+  const r = STATE.ultimaValidacao.resultados[idx];
+  if (!r || !STATE.revisoes[r.cte.chave]) return;
+  if (!confirm(`Voltar o CT-e ${r.cte.nCT} para sem classificação?\n\nA análise (classificações, observação e status) será apagada e ele sai da aba Análises.`)) return;
+  const btn = document.getElementById(`btnRemoverAnalise-${idx}`);
+  if (btn) { btn.disabled = true; btn.textContent = 'Removendo…'; }
+  try {
+    await removerAnalises([r.cte.chave]);
+    toast(`CT-e ${r.cte.nCT} voltou para sem classificação.`, 'success');
+    const modalAberto = document.querySelector('.fixed.inset-0');
+    if (modalAberto) modalAberto.remove();
+    abrirDetalheCte(idx);
+  } catch (e) {
+    console.error(e);
+    toast(mensagemErroFirebase(e, 'remover a análise'), 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Voltar para sem classificação (tira das Análises)'; }
+  }
+}
+
 // ----- Classificação em massa (caixas de seleção na tabela de resultados) -----
 function selecionadosSet() {
   if (!(STATE._selecionados instanceof Set)) STATE._selecionados = new Set();
@@ -4037,6 +4213,7 @@ function atualizarBarraSelecao() {
   const cont = $('#qtdSelecionados'); if (cont) cont.textContent = sel.size;
   const bar = $('#barraMassa'); if (bar) bar.classList.toggle('ring-2', sel.size > 0);
   const btn = $('#btnAplicarMassa'); if (btn) btn.disabled = sel.size === 0;
+  const btnRem = $('#btnRemoverMassa'); if (btnRem) btnRem.disabled = sel.size === 0;
   const todos = $('#chkTodos');
   if (todos) {
     const visiveis = $$('.chk-cte');
@@ -4045,27 +4222,47 @@ function atualizarBarraSelecao() {
     todos.indeterminate = marcados > 0 && marcados < visiveis.length;
   }
 }
+async function removerClassificacaoEmMassa() {
+  const sel = selecionadosSet();
+  if (!sel.size) { toast('Selecione pelo menos um CT-e na tabela.', 'warn'); return; }
+  const chaves = Array.from(sel).filter(ch => STATE.revisoes[ch]);
+  if (!chaves.length) { toast('Nenhum dos selecionados tem classificação.', 'warn'); return; }
+  if (!confirm(`Voltar ${chaves.length} CT-e(s) para sem classificação?\n\nAs análises (classificações, observação e status) serão apagadas e eles saem da aba Análises.`)) return;
+  const btn = $('#btnRemoverMassa');
+  if (btn) { btn.disabled = true; btn.textContent = 'Removendo…'; }
+  try {
+    const n = await removerAnalises(chaves);
+    sel.clear();
+    renderResultadosValidacao();
+    toast(`${n} CT-e(s) voltaram para sem classificação.`, 'success');
+  } catch (e) {
+    console.error(e);
+    toast(mensagemErroFirebase(e, 'remover as análises'), 'error');
+    if (btn) { btn.disabled = false; btn.textContent = 'Voltar p/ sem classificação'; }
+  }
+}
+
 async function aplicarClassificacaoEmMassa() {
   const sel = selecionadosSet();
-  const classificacao = $('#selMassaClassificacao')?.value;
+  const classificacoes = $$('.chk-massa-classif').filter(x => x.checked).map(x => x.value);
+  const adicionar = !!$('#chkMassaAdicionar')?.checked;
   const obsNova = ($('#obsMassa')?.value || '').trim();
   if (!sel.size) { toast('Selecione pelo menos um CT-e na tabela.', 'warn'); return; }
-  if (!classificacao) { toast('Escolha a classificação a aplicar.', 'error'); return; }
+  if (!classificacoes.length) { toast('Marque pelo menos uma classificação em "Classificar como…".', 'error'); return; }
   const v = STATE.ultimaValidacao;
   const alvos = v.resultados.filter(r => sel.has(r.cte.chave));
   if (!alvos.length) { toast('Os CT-es selecionados não estão mais nesta validação.', 'warn'); sel.clear(); atualizarBarraSelecao(); return; }
-  const revisoes = alvos.map(r => montarRevisao(r, classificacao, obsNova || STATE.revisoes[r.cte.chave]?.observacao || ''));
+  const revisoes = alvos.map(r => montarRevisao(r, adicionar ? [...classifsDe(r), ...classificacoes] : classificacoes, obsNova || STATE.revisoes[r.cte.chave]?.observacao || ''));
   const btn = $('#btnAplicarMassa');
   if (btn) { btn.disabled = true; btn.textContent = 'Salvando…'; }
   try {
     await DataLayer.saveRevisoesEmLote(revisoes);
     revisoes.forEach(rv => { STATE.revisoes[rv.chave] = rv; });
     atualizarBadgeTratativas();
-    const info = CLASSIFICACOES_DIVERGENCIA.find(c => c.valor === classificacao);
     sel.clear();
     renderResultadosValidacao();
     atualizarResumoDoLoteNoHistorico();
-    toast(`${revisoes.length} CT-e(s) classificado(s) como "${info ? info.labelCurta : classificacao}"${CLASSIF_ZERADA.includes(classificacao) ? ' — diferença considerada R$ 0,00 (inclusive no Faturado)' : CLASSIF_PREJUIZO_TOTAL.includes(classificacao) ? ' — valor cobrado inteiro como prejuízo (inclusive no Faturado)' : ''}.`, 'success');
+    toast(`${revisoes.length} CT-e(s) ${adicionar ? 'receberam' : 'classificado(s) como'} "${classificacoes.map(c => (infoClassif(c) || {}).labelCurta || c).join(' + ')}"${textoToastClassif(classificacoes)}.`, 'success');
   } catch (e) {
     console.error(e);
     toast(mensagemErroFirebase(e, 'salvar as análises'), 'error');
@@ -4208,6 +4405,7 @@ function abrirDetalheCte(idx) {
       <div class="p-5 border-b border-ink-100 flex items-center justify-between sticky top-0 bg-white">
         <div>
           <div class="text-sm font-semibold text-ink-900">CT-e ${escapeHtml(r.cte.nCT)} · ${escapeHtml(r.parceiro.nome)}</div>
+          ${r.origemDivergente ? `<div class="text-xs mt-1 mb-1 px-2 py-1 rounded-lg bg-orange-50 text-orange-800 border border-orange-200">⚠ <strong>Erro de origem na emissão:</strong> o CT-e saiu de ${escapeHtml(r.origemDivergente.municipio)}/${escapeHtml(r.origemDivergente.uf)}, mas a origem cadastrada do parceiro é ${escapeHtml(r.origemDivergente.esperado || '—')}. Validado normalmente pela tabela (pelo destino), junto com os demais.</div>` : ''}
           <div class="text-xs text-ink-400">${escapeHtml(r.cte.destMun)}/${escapeHtml(r.cte.destUF)} · região "${escapeHtml(r.calc.regiaoEncontrada || '—')}" · peso base cálc. ${fmtNum(r.cte.pesoBC ?? r.cte.pesoReal)} kg${r.pesoCubadoInfo ? ` <span class="text-ink-300">(peso usado no cálculo: ${fmtNum(r.pesoCubadoInfo.pesoFinal)} kg — cubagem própria)</span>` : ''}</div>
           <div class="text-xs text-ink-400 mt-0.5">${nfsTxt}${emissaoTxt}${canalTxt} · chave CT-e <span class="font-mono text-[10px]">${escapeHtml(r.cte.chave)}</span></div>
           ${renderAbrangenciaUsada(r)}
@@ -5554,7 +5752,7 @@ async function renderHistorico() {
             <th class="text-left font-semibold px-5 py-3">Parceiros</th>
             <th class="text-right font-semibold px-5 py-3">CT-es</th>
             <th class="text-right font-semibold px-5 py-3">Divergências (+)</th>
-            <th class="text-right font-semibold px-5 py-3" title="Cliente pagou − Cobrado da transportadora (todo o lote)">Faturado</th>
+            <th class="text-right font-semibold px-5 py-3" title="Soma do que o cliente pagou − soma do que a transportadora cobrou (todo o lote)">Faturado</th>
             <th class="text-left font-semibold px-5 py-3">Por</th>
             <th class="px-5 py-3"></th>
           </tr>
@@ -5562,8 +5760,10 @@ async function renderHistorico() {
         <tbody class="divide-y divide-ink-100">
           ${historico.map((h, i) => {
             const temDetalhe = h.detalheDisponivel && (Array.isArray(h.resultados) || h.detalheEmPartes > 0);
-            const temFaturado = h.resumo?.faturado !== undefined && h.resumo?.faturado !== null;
-            const faturadoPositivo = temFaturado && h.resumo.faturado >= 0;
+            // Faturado = Cliente pagou − Cobrado (recalcula pelos totais gravados — lotes antigos tinham o ajuste "Sem erro")
+            const fatCalc = (h.resumo?.totalClientePagou != null && h.resumo?.totalCobrado != null) ? clamp2(h.resumo.totalClientePagou - h.resumo.totalCobrado) : h.resumo?.faturado;
+            const temFaturado = fatCalc !== undefined && fatCalc !== null;
+            const faturadoPositivo = temFaturado && fatCalc >= 0;
             return `
             <tr class="${temDetalhe ? 'hover:bg-brand-50/60 cursor-pointer' : 'opacity-60'}" ${temDetalhe ? `onclick="abrirHistoricoDetalhe(${i})"` : `title="Detalhe linha a linha não disponível pra este lote — exporte o Excel na época ou rode a validação de novo com o mesmo .zip"`}>
               <td class="px-5 py-3 text-ink-500 text-xs">${fmtDate(h.criadoEm)}</td>
@@ -5573,7 +5773,7 @@ async function renderHistorico() {
               <td class="px-5 py-3 text-ink-600 text-xs">${escapeHtml((h.resumo?.parceiros||[]).join(', '))}</td>
               <td class="px-5 py-3 text-right num">${h.resumo?.total ?? 0}</td>
               <td class="px-5 py-3 text-right num ${h.resumo?.qtdDivergenciaMaior ? 'text-red-600 font-semibold' : 'text-emerald-600'}">${h.resumo?.qtdDivergenciaMaior ?? 0}</td>
-              <td class="px-5 py-3 text-right num font-semibold ${temFaturado ? (faturadoPositivo ? 'text-emerald-600' : 'text-red-600') : 'text-ink-300'}">${temFaturado ? (faturadoPositivo ? '' : '-') + fmtBRL(Math.abs(h.resumo.faturado)) : '—'}</td>
+              <td class="px-5 py-3 text-right num font-semibold ${temFaturado ? (faturadoPositivo ? 'text-emerald-600' : 'text-red-600') : 'text-ink-300'}">${temFaturado ? (faturadoPositivo ? '' : '-') + fmtBRL(Math.abs(fatCalc)) : '—'}</td>
               <td class="px-5 py-3 text-ink-400 text-xs">${escapeHtml(h.criadoPor||'—')}</td>
               <td class="px-5 py-3 text-right text-xs ${temDetalhe ? 'text-brand-600 font-medium' : 'text-ink-300'}">${temDetalhe ? 'Ver comparação →' : 'sem detalhe'}</td>
             </tr>
@@ -5856,6 +6056,15 @@ function baseTabela(r) { return (!r.baseComparacao || r.baseComparacao === 'tabe
 function revisaoAntigaTabela(r) { return !r.versaoCalc && baseTabela(r); }
 // versão 2 (só em 05/10): gravou o frete total com ICMS → precisa reabrir o lote pra regravar sem ICMS
 function revisaoComIcms(r) { return r.versaoCalc === 2 && baseTabela(r); }
+// Cada CT-e aparece uma vez em CADA classificação que tiver (com o valor e o status daquela classificação)
+function entradasAnalise(rev) {
+  const cs = classifsDaRevisao(rev);
+  if (!cs.length) return [];
+  if (!rev.porClassif) return [{ ...rev, _classifs: cs }];
+  return cs.map(c => ({ ...rev, ...(rev.porClassif[c] || {}), classificacao: c, _classifs: cs }));
+}
+function todasEntradasAnalise() { return Object.values(STATE.revisoes).flatMap(entradasAnalise); }
+function entraNasAnalises(e) { return !CLASSIF_SEM_ANALISE.includes(e.classificacao); }
 function valorAnalise(r) {
   if (r.valorRessarcir === null || r.valorRessarcir === undefined) return r.valorRessarcir;
   return revisaoAntigaTabela(r) ? semZeroNeg(clamp2(-r.valorRessarcir)) : r.valorRessarcir;
@@ -5910,7 +6119,7 @@ async function renderTratativas() {
   }
 
   await carregarRevisoes();
-  let analisadasTodas = Object.values(STATE.revisoes).filter(r => r.classificacao);
+  let analisadasTodas = todasEntradasAnalise();
   // análises gravadas antes do canal existir: completa pela planilha de notas (só na tela)
   const semCanal = analisadasTodas.filter(r => !r.canal && r.notaFiscal);
   if (semCanal.length) {
@@ -5930,11 +6139,11 @@ async function renderTratativas() {
   }
 
   STATE._abaTratativaAtiva = STATE._abaTratativaAtiva || 'todos';
-  const abas = [{ valor: 'todos', label: 'Todos os tipos', labelCurta: 'Todos' }, ...CLASSIFICACOES_DIVERGENCIA.filter(c => c.valor !== 'sem_erro')];
+  const abas = [{ valor: 'todos', label: 'Todos os tipos', labelCurta: 'Todos' }, ...CLASSIFICACOES_DIVERGENCIA.filter(c => !CLASSIF_SEM_ANALISE.includes(c.valor))];
 
   // resumo por tipo — pra ver de cara onde está concentrado o erro
   const resumoPorTipo = abas.map(c => {
-    const doTipo = c.valor === 'todos' ? analisadas.filter(r => r.classificacao !== 'sem_erro') : analisadas.filter(r => r.classificacao === c.valor);
+    const doTipo = c.valor === 'todos' ? analisadas.filter(entraNasAnalises) : analisadas.filter(r => r.classificacao === c.valor);
     const pendentesDoTipo = doTipo.filter(r => !statusEhResolvido(r.statusTratativa || 'pendente'));
     return { ...c, qtd: doTipo.length, qtdPendente: pendentesDoTipo.length, valorTotal: somaAnalise(doTipo) };
   });
@@ -5964,7 +6173,7 @@ async function renderTratativas() {
         </select>
       </label>
       ${filtroAtivo ? `<button id="btnLimparFiltrosAn" class="text-brand-600 hover:text-brand-700 font-medium self-center">Limpar filtros</button>` : ''}
-      <span class="ml-auto self-center text-ink-400">${filtroAtivo ? `Mostrando <strong class="text-ink-700">${analisadas.filter(r => r.classificacao !== 'sem_erro').length}</strong> de ${analisadasTodas.filter(r => r.classificacao !== 'sem_erro').length} análise(s) — o Excel sai com esse filtro` : `${analisadasTodas.filter(r => r.classificacao !== 'sem_erro').length} análise(s) — sem filtro, o Excel sai geral`}</span>
+      <span class="ml-auto self-center text-ink-400">${filtroAtivo ? `Mostrando <strong class="text-ink-700">${analisadas.filter(entraNasAnalises).length}</strong> de ${analisadasTodas.filter(entraNasAnalises).length} análise(s) — o Excel sai com esse filtro` : `${analisadasTodas.filter(entraNasAnalises).length} análise(s) — sem filtro, o Excel sai geral`}</span>
     </div>
     <div class="grid grid-cols-3 lg:grid-cols-5 gap-4 mb-6">
       ${resumoPorTipo.map(c => `
@@ -5976,7 +6185,7 @@ async function renderTratativas() {
       `).join('')}
     </div>
     <div id="tabelaTratativaAtiva"></div>
-    <p class="text-xs text-ink-300 mt-3">Diferença: erro de tabela/transportadora/proposta = subtotal calculado − subtotal cobrado (sem ICMS); plataforma, Intelipost e transportadora diferente da cotada = frete do cliente − frete cobrado. Negativo = prejuízo. CT-es classificados como "Sem erro" não aparecem aqui — servem só pra marcar que a divergência foi conferida e é aceitável.</p>
+    <p class="text-xs text-ink-300 mt-3">Um CT-e com mais de uma classificação aparece em cada uma delas, com o valor e o status próprios. Diferença: erro de tabela/transportadora/proposta = subtotal calculado − subtotal cobrado (sem ICMS); plataforma, Intelipost e transportadora diferente da cotada = frete do cliente − frete cobrado. Negativo = prejuízo. CT-es classificados como "Sem erro" não aparecem aqui — servem só pra marcar que a divergência foi conferida e é aceitável.</p>
   `;
   $$('[data-filtro-an]').forEach(el => el.addEventListener('change', () => { STATE._filtrosAnalise[el.dataset.filtroAn] = el.value; renderTratativas(); }));
   const btnLimparAn = $('#btnLimparFiltrosAn');
@@ -6014,8 +6223,8 @@ function renderTabelaTratativa(analisadas) {
   STATE._analisadasCache = analisadas;
   const aba = STATE._abaTratativaAtiva;
   const subAba = STATE._subAbaTratativaAtiva || 'todos';
-  const infoAba = aba === 'todos' ? { label: 'Todos os tipos' } : CLASSIFICACOES_DIVERGENCIA.find(c => c.valor === aba);
-  const doTipo = (aba === 'todos' ? analisadas.filter(r => r.classificacao !== 'sem_erro') : analisadas.filter(r => r.classificacao === aba)).sort((a, b) => (b.atualizadoEm || '').localeCompare(a.atualizadoEm || ''));
+  const infoAba = aba === 'todos' ? { label: 'Todos os tipos' } : infoClassif(aba);
+  const doTipo = (aba === 'todos' ? analisadas.filter(entraNasAnalises) : analisadas.filter(r => r.classificacao === aba)).sort((a, b) => (b.atualizadoEm || '').localeCompare(a.atualizadoEm || ''));
   const box = $('#tabelaTratativaAtiva');
   const labelValor = ['transportadora', 'tabela', 'proposta_comercial'].includes(aba) ? 'Diferença sem ICMS (calculado − cobrado)' : CLASSIF_BASE_CLIENTE.includes(aba) ? 'Diferença (cliente − cobrado)' : CLASSIF_PREJUIZO_TOTAL.includes(aba) ? 'Prejuízo' : 'Diferença';
 
@@ -6082,7 +6291,7 @@ function renderTabelaTratativa(analisadas) {
               <td class="px-4 py-3 text-right num font-semibold ${valorAnalise(r) < -0.005 ? 'text-red-600' : valorAnalise(r) > 0.005 ? 'text-emerald-600' : 'text-ink-500'}">${valorAnalise(r) > 0.005 ? '+' : ''}${fmtBRL(valorAnalise(r))}</td>
               <td class="px-4 py-3 text-ink-500 text-xs max-w-[260px] truncate cursor-help" title="${escapeHtml((r.detalhamentoErros||'') + (r.observacao ? '\n\nObservação: '+r.observacao : ''))}">${escapeHtml(r.detalhamentoErros || '—')}</td>
               <td class="px-4 py-3">
-                <select onchange="atualizarStatusTratativa('${r.chave}', this.value)" class="text-xs border rounded-full px-2 py-1 ${infoStatusTratativa(r.statusTratativa||'pendente').cls}">
+                <select onchange="atualizarStatusTratativa('${r.chave}', this.value, '${r.classificacao}')" class="text-xs border rounded-full px-2 py-1 ${infoStatusTratativa(r.statusTratativa||'pendente').cls}">
                   ${[...STATUS_TRATATIVA, ...(r.statusTratativa === 'resolvido' ? [STATUS_LEGADO] : [])].map(s => `<option value="${s.valor}" ${(r.statusTratativa||'pendente')===s.valor?'selected':''}>${s.label}</option>`).join('')}
                 </select>
                 <div class="text-[10px] text-ink-300 mt-1 cursor-help" title="${escapeHtml(historicoStatusTexto(r))}">${fmtDataCurta((r.datasStatus||{})[r.statusTratativa||'pendente'])}</div>
@@ -6096,12 +6305,20 @@ function renderTabelaTratativa(analisadas) {
   `;
 }
 
-async function atualizarStatusTratativa(chave, novoStatus) {
+async function atualizarStatusTratativa(chave, novoStatus, classif) {
   const revisao = STATE.revisoes[chave];
   if (!revisao) return;
-  revisao.statusTratativa = novoStatus;
-  revisao.datasStatus = revisao.datasStatus || {};
-  revisao.datasStatus[novoStatus] = new Date().toISOString(); // sempre atualiza pra "agora" a cada vez que entra nesse status
+  const agora = new Date().toISOString(); // sempre atualiza pra "agora" a cada vez que entra nesse status
+  if (revisao.porClassif && classif && revisao.porClassif[classif]) {
+    const pc = revisao.porClassif[classif];
+    pc.statusTratativa = novoStatus;
+    pc.datasStatus = { ...(pc.datasStatus || {}), [novoStatus]: agora };
+    if (revisao.classificacao === classif) { revisao.statusTratativa = novoStatus; revisao.datasStatus = { ...pc.datasStatus }; }
+  } else {
+    revisao.statusTratativa = novoStatus;
+    revisao.datasStatus = revisao.datasStatus || {};
+    revisao.datasStatus[novoStatus] = agora;
+  }
   try {
     await DataLayer.saveRevisao(revisao);
     STATE.revisoes[chave] = revisao;
@@ -6120,7 +6337,7 @@ function exportarTratativasXlsx() {
   const aba = STATE._abaTratativaAtiva || 'todos';
   const fA = STATE._filtrosAnalise || {};
 
-  let todas = Object.values(STATE.revisoes).filter(r => r.classificacao && r.classificacao !== 'sem_erro');
+  let todas = todasEntradasAnalise().filter(entraNasAnalises);
   todas = filtrarAnalises(todas, fA);                                   // filtros (período, transportadora, canal)
   if (aba !== 'todos') todas = todas.filter(r => r.classificacao === aba); // aba (tipo de erro) selecionada
   if (subAba !== 'todos') todas = todas.filter(r => (r.statusTratativa || 'pendente') === subAba); // status
@@ -6131,7 +6348,7 @@ function exportarTratativasXlsx() {
 
   // uma aba por tipo de erro — pra acompanhar onde está concentrado o problema
   // (já filtrado pela subaba de status escolhida em Análises)
-  CLASSIFICACOES_DIVERGENCIA.filter(c => c.valor !== 'sem_erro').forEach(cat => {
+  CLASSIFICACOES_DIVERGENCIA.filter(c => !CLASSIF_SEM_ANALISE.includes(c.valor)).forEach(cat => {
     const doTipo = todas.filter(r => r.classificacao === cat.valor).sort((a,b) => (b.atualizadoEm||'').localeCompare(a.atualizadoEm||''));
     if (doTipo.length === 0) return;
     const linhas = [header];
@@ -6153,14 +6370,14 @@ function exportarTratativasXlsx() {
 
   // aba de resumo, já refletindo o mesmo filtro de status
   const descFiltros = [
-    `Tipo de erro: ${aba === 'todos' ? 'todos' : (CLASSIFICACOES_DIVERGENCIA.find(c => c.valor === aba) || {}).label || aba}`,
+    `Tipo de erro: ${aba === 'todos' ? 'todos' : (infoClassif(aba) || {}).label || aba}`,
     `Status: ${infoStatus ? infoStatus.label : 'todos'}`,
     `Período (emissão do CT-e): ${fA.de || fA.ate ? `${fA.de ? fmtDataCurtaISO(fA.de) : 'início'} a ${fA.ate ? fmtDataCurtaISO(fA.ate) : 'hoje'}` : 'todos'}`,
     `Transportadora: ${fA.transp || 'todas'}`,
     `Canal: ${fA.canal ? (fA.canal === '__sem__' ? 'sem canal identificado' : fA.canal) : 'todos'}`,
   ];
   const resumoLinhas = [['Relatório de Análises de Divergência'], ...descFiltros.map(t => [t]), [], ['Tipo de erro', 'Quantidade', 'Valor total (R$)']];
-  CLASSIFICACOES_DIVERGENCIA.filter(c => c.valor !== 'sem_erro' && (aba === 'todos' || c.valor === aba)).forEach(cat => {
+  CLASSIFICACOES_DIVERGENCIA.filter(c => !CLASSIF_SEM_ANALISE.includes(c.valor) && (aba === 'todos' || c.valor === aba)).forEach(cat => {
     const doTipo = todas.filter(r => r.classificacao === cat.valor);
     resumoLinhas.push([cat.labelCurta || cat.label, doTipo.length, somaAnalise(doTipo)]);
   });
