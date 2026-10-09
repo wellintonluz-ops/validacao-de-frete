@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-09-desconsiderar-componente';
+const APP_VERSION = '2026-10-09-importador-taxas';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -5267,14 +5267,15 @@ function renderImportadorBody() {
   }
 
   const grid = st.grid;
-  const previewRows = grid.slice(0, 14);
-  const maxCols = Math.min(16, Math.max(...previewRows.map(r => r.length), 1));
+  const previewRows = grid.slice(0, Math.max(14, st.headerRow + 6));
+  const maxCols = totalColunasPlanilha(grid);
 
-  const headerRowVals = grid[st.headerRow] || [];
+  // rótulo de cada coluna = cabeçalho + sub-cabeçalhos (planilhas com 2-3 linhas de título)
+  const headerRowVals = rotulosCabecalho(grid, st.headerRow);
   const colOptions = (selecionado) => {
     let opts = `<option value="">(nenhuma)</option>`;
     for (let c = 0; c < maxCols; c++) {
-      const label = headerRowVals[c] !== undefined && headerRowVals[c] !== null ? String(headerRowVals[c]) : `Coluna ${c+1}`;
+      const label = headerRowVals[c] ? String(headerRowVals[c]) : `Coluna ${c+1}`;
       opts += `<option value="${c}" ${String(selecionado)===String(c)?'selected':''}>${escapeHtml(label)} (col ${c+1} / ${colLetra(c)})</option>`;
     }
     return opts;
@@ -5287,7 +5288,7 @@ function renderImportadorBody() {
     camposFaixas = `
       <div class="mb-3">
         <label class="text-xs font-medium text-ink-500">Quantas colunas de faixa de peso tem essa planilha?</label>
-        <input type="number" min="1" max="10" value="${st.numFaixas}" onchange="STATE._import.numFaixas=parseInt(this.value)||1; renderImportadorBody();" class="ml-2 w-16 border border-ink-200 rounded-lg px-2 py-1 text-xs">
+        <input type="number" min="1" max="30" value="${st.numFaixas}" onchange="STATE._import.numFaixas=parseInt(this.value)||1; renderImportadorBody();" class="ml-2 w-16 border border-ink-200 rounded-lg px-2 py-1 text-xs">
       </div>
       <div class="grid grid-cols-3 gap-3 mb-3">
         ${Array.from({length: st.numFaixas}).map((_, i) => `
@@ -5385,7 +5386,36 @@ function colLetra(idx) {
   return s;
 }
 
+const UFS_BR = new Set(['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO']);
+// nº de colunas com conteúdo nas primeiras linhas da planilha (sem teto fixo — antes parava na 16)
+function totalColunasPlanilha(grid) {
+  let max = 1;
+  (grid || []).slice(0, 60).forEach(row => {
+    for (let c = (row || []).length - 1; c >= 0; c--) { const v = row[c]; if (v !== null && v !== undefined && v !== '') { max = Math.max(max, c + 1); break; } }
+  });
+  return Math.min(max, 200);
+}
+function ehLinhaDeDados(row) { return (row || []).some(v => typeof v === 'string' && UFS_BR.has(v.trim().toUpperCase())); }
+// junta o cabeçalho com as linhas de sub-título logo abaixo (até 3), parando na 1ª linha de dados (que tem uma UF)
+function rotulosCabecalho(grid, headerRow) {
+  const n = totalColunasPlanilha(grid);
+  const linhas = [grid[headerRow] || []];
+  for (let r = headerRow + 1; r < Math.min(grid.length, headerRow + 4); r++) {
+    const row = grid[r] || [];
+    if (ehLinhaDeDados(row)) break;
+    linhas.push(row);
+  }
+  // célula mesclada na vertical vem repetida em cada linha — entra uma vez só no rótulo
+  return Array.from({ length: n }, (_, c) => {
+    const partes = [];
+    linhas.forEach(l => { const v = l[c]; if (v === null || v === undefined) return; const t = String(v).trim(); if (t && partes[partes.length - 1] !== t) partes.push(t); });
+    return partes.join(' ');
+  });
+}
 function adivinharLinhaCabecalho(grid) {
+  for (let r = 0; r < Math.min(grid.length, 30); r++) {
+    if ((grid[r] || []).some(v => normalizaCabecalho(v) === 'UF')) return r;
+  }
   for (let r = 0; r < Math.min(grid.length, 30); r++) {
     const row = grid[r] || [];
     const textos = row.filter(v => typeof v === 'string' && v.trim().length > 1);
@@ -5424,52 +5454,81 @@ function normalizaCabecalho(s) {
     .replace(/\s+/g, ' ');
 }
 
-function detectarMapeamentoTarifasPadrao(headerRowVals) {
-  const norm = headerRowVals.map(v => normalizaCabecalho(v));
-  const acha = (pred) => norm.findIndex(pred);
-  const mapeamento = {};
-  const idxUf = acha(h => h === 'UF');
-  const idxRegiao = acha(h => h.includes('CLASSIFICA'));
-  if (idxUf < 0 || idxRegiao < 0) return null; // não é o padrão — não força nada
+// nome curto da taxa a partir do cabeçalho (tira "TAXA", "%", "S/NF", "R$/CTE", "MÍNIMO"…) —
+// curto de propósito, porque a conferência casa a regra com a cobrança do CT-e por "contém"
+function limparNomeTaxa(h) {
+  let t = ' ' + normalizaCabecalho(h) + ' ';
+  [/\(INFORMAR TAXA\)/g, /R\$ ?\/ ?(KG|CTE|CTRC|NF)/g, /R\$/g, /%/g, /S\/ ?NF/g, /SOBRE (O )?FRETE/g, /S\/ ?FRETE/g, /S\/ ?ICMS/g, /SOBRE (O )?VALOR( DA NF| DA NOTA)?/g,
+   /FRACAO (A CADA|DE|POR) ?100 ?KG/g, /A CADA 100 ?KG/g, /\bFRACAO\b/g, /\bMINIMO\b/g, /\bMIN\b/g, /\bVALOR\b(?= *$)/g, /[()\[\]:]/g]
+    .forEach(re => { t = t.replace(re, ' '); });
+  t = t.replace(/\s+/g, ' ').trim();
+  t = t.replace(/^(TAXA|TX)( DE| DA| DO| POR)? /, '').replace(/^(DE|DA|DO|POR) /, '').trim();
+  return t || normalizaCabecalho(h);
+}
 
+function detectarMapeamentoTarifasPadrao(labels, grid, headerRow) {
+  const norm = labels.map(v => normalizaCabecalho(v));
+  const mapeamento = {};
+  const idxUf = norm.findIndex(h => h === 'UF');
+  const idxRegiao = norm.findIndex(h => h.includes('CLASSIFICA') || /^REGIAO\b/.test(h));
+  if (idxUf < 0 || idxRegiao < 0) return null; // não parece tabela de frete — não força nada
   mapeamento.uf = idxUf;
   mapeamento.regiao = idxRegiao;
+  const inicio = Math.max(idxUf, idxRegiao) + 1;
+  const usados = new Set([idxUf, idxRegiao]);
 
-  // faixas de peso: todas as colunas rotuladas "KG", na ordem em que aparecem
+  // faixas de peso: "KG", "30KG", "30 KG", "ATÉ 10 KG"… (e um número puro logo em seguida, ex: "100")
   const colunasKg = [];
-  // reconhece tanto "KG" genérico (planilha em branco) quanto "30KG"/"50 KG" etc.
-  // (planilha já preenchida, com o limiar embutido no próprio cabeçalho)
-  norm.forEach((h, i) => { if (/^\d*\s*KG$/.test(h)) colunasKg.push(i); });
-  colunasKg.forEach((col, i) => { mapeamento['faixa_' + i] = col; });
+  norm.forEach((h, i) => { if (i >= inicio && /^(ATE )?\d*([.,]\d+)? ?KGS?$/.test(h)) colunasKg.push(i); });
+  if (colunasKg.length) { let j = colunasKg[colunasKg.length - 1] + 1; while (j < norm.length && /^\d+$/.test(norm[j])) { colunasKg.push(j); j++; } }
+  colunasKg.forEach((col, i) => { mapeamento['faixa_' + i] = col; usados.add(col); });
 
-  mapeamento.excedente = acha(h => h.includes('FRETE') && h.includes('EXCEDENTE'));
+  const idxExc = norm.findIndex((h, i) => i >= inicio && !usados.has(i) && h.includes('EXCEDENTE'));
+  mapeamento.excedente = idxExc;
+  if (idxExc >= 0) usados.add(idxExc);
+
+  // primeira linha de dados (pra saber se uma coluna "(Informar TAXA)" foi preenchida)
+  let iniDados = headerRow + 1;
+  while (iniDados < (grid || []).length && !ehLinhaDeDados(grid[iniDados])) iniDados++;
+  const temDados = (c) => (grid || []).slice(iniDados, iniDados + 400).some(row => { const v = (row || [])[c]; return v !== null && v !== undefined && String(v).trim() !== '' && String(v).trim() !== '-'; });
+
+  const ehMinimo = h => /\bMINIMO\b|\bMIN\b/.test(h);
+  const ehSobreFrete = h => /SOBRE (O )?FRETE|S\/ ?FRETE|S\/ ?ICMS|SUBTOTAL/.test(h);
+  const ehPct = h => h.includes('%') || /S\/ ?NF/.test(h) || h.includes('PERCENT');
 
   const regrasDetectadas = [];
-  const idxGrisPct = norm.findIndex(h => h.includes('GRIS') && !h.includes('MINIMO'));
-  const idxGrisMin = norm.findIndex(h => h.includes('GRIS') && h.includes('MINIMO'));
-  if (idxGrisPct >= 0) regrasDetectadas.push({ nome: 'GRIS', tipo: 'percentual_com_minimo', base: 'vCarga', colPct: idxGrisPct, colMin: idxGrisMin >= 0 ? idxGrisMin : null });
-
-  const idxAdvPct = norm.findIndex(h => h.includes('ADVALOR') && !h.includes('MINIMO'));
-  const idxAdvMin = norm.findIndex(h => h.includes('ADVALOR') && h.includes('MINIMO'));
-  if (idxAdvPct >= 0) regrasDetectadas.push({ nome: 'ADV', tipo: 'percentual_com_minimo', base: 'vCarga', colPct: idxAdvPct, colMin: idxAdvMin >= 0 ? idxAdvMin : null });
-
-  const idxPedagio = norm.findIndex(h => h.includes('PEDAGIO'));
-  if (idxPedagio >= 0) regrasDetectadas.push({ nome: 'PEDAGIO', tipo: 'por_fracao_100kg', colValor: idxPedagio });
-
-  [['TAS', 'TAS'], ['DESPACHO', 'DESPACHO'], ['COLETA', 'COLETA'], ['TRT', 'TRT']].forEach(([chave, nome]) => {
-    const i = norm.findIndex(h => h.includes('TAXA') && h.includes(chave));
-    if (i >= 0) regrasDetectadas.push({ nome, tipo: 'fixo_por_cte', colValor: i });
-  });
-
-  // colunas "(INFORMAR TAXA)" — slots livres pro parceiro ter taxas extras; entram como
-  // regra em branco (a pessoa só precisa dar um nome e conferir o tipo)
-  let nInformar = 0;
+  const minimos = [];
   norm.forEach((h, i) => {
-    if (h.includes('INFORMAR') && h.includes('TAXA')) {
-      nInformar++;
-      regrasDetectadas.push({ nome: '', tipo: 'fixo_por_cte', colValor: i });
+    if (i < inicio || usados.has(i) || !h) return;
+    if (ehMinimo(h)) { minimos.push(i); return; }
+    let nome, tipo, base = 'vCarga';
+    if (h.includes('GRIS')) { nome = 'GRIS'; tipo = 'percentual_com_minimo'; }
+    else if (/ADVALOR|AD VALOREM|AD-VALOREM|^ADV\b|FRETE VALOR/.test(h)) { nome = 'ADV'; tipo = 'percentual_com_minimo'; }
+    else if (h.includes('PEDAGIO')) { nome = 'PEDAGIO'; tipo = 'por_fracao_100kg'; }
+    else if (h.includes('INFORMAR') && h.includes('TAXA')) {
+      if (!temDados(i)) return;          // coluna livre do modelo que ficou vazia
+      nome = ''; tipo = 'fixo_por_cte';  // tem valor mas sem nome: a pessoa só dá o nome
     }
+    else if (ehSobreFrete(h)) { nome = limparNomeTaxa(h); tipo = 'percentual_sobre_subtotal'; }
+    else if (ehPct(h)) { nome = limparNomeTaxa(h); tipo = 'percentual_com_minimo'; }
+    else if (/FRACAO|100 ?KG/.test(h)) { nome = limparNomeTaxa(h); tipo = 'por_fracao_100kg'; }
+    else { nome = limparNomeTaxa(h); tipo = 'fixo_por_cte'; }
+    // mesma taxa em duas colunas (ex: GRIS % e outra GRIS sem "mínimo" escrito): a 2ª vira o mínimo
+    const repetida = nome && regrasDetectadas.find(r => r.nome === nome && r.tipo === 'percentual_com_minimo' && r.colMin == null);
+    if (repetida && tipo === 'percentual_com_minimo') { repetida.colMin = i; return; }
+    const rd = { nome, tipo, base, _col: i };
+    if (tipo === 'percentual_com_minimo' || tipo === 'percentual_sobre_subtotal') rd.colPct = i; else rd.colValor = i;
+    regrasDetectadas.push(rd);
   });
+  // colunas de "mínimo": vão pra taxa de mesmo nome; senão, pra taxa percentual mais próxima à esquerda
+  minimos.forEach(i => {
+    const raiz = limparNomeTaxa(norm[i]);
+    let alvo = regrasDetectadas.find(r => r.tipo === 'percentual_com_minimo' && r.colMin == null && r.nome && (raiz.includes(r.nome) || r.nome.includes(raiz) || (raiz.includes('ADVALOR') && r.nome === 'ADV')));
+    if (!alvo) alvo = regrasDetectadas.filter(r => r.tipo === 'percentual_com_minimo' && r.colMin == null && r._col < i).sort((a, b) => b._col - a._col)[0];
+    if (alvo) alvo.colMin = i;
+    else regrasDetectadas.push({ nome: raiz, tipo: 'fixo_por_cte', colValor: i, _col: i });
+  });
+  regrasDetectadas.sort((a, b) => a._col - b._col).forEach(r => { delete r._col; });
 
   return { mapeamento, numFaixas: colunasKg.length, regrasDetectadas };
 }
@@ -5497,9 +5556,9 @@ function detectarMapeamentoAbrangenciaPadrao(headerRowVals) {
 // com nada que a pessoa já tinha ajustado manualmente antes.
 function aplicarDeteccaoAutomatica(st) {
   st._deteccaoAutomatica = false;
-  const headerVals = (st.grid[st.headerRow] || []);
+  const headerVals = rotulosCabecalho(st.grid, st.headerRow);
   if (st.tipo === 'tarifas') {
-    const det = detectarMapeamentoTarifasPadrao(headerVals);
+    const det = detectarMapeamentoTarifasPadrao(headerVals, st.grid, st.headerRow);
     if (!det) return;
     st.mapeamento = { ...st.mapeamento, ...det.mapeamento };
     st.numFaixas = det.numFaixas || st.numFaixas;
@@ -5597,7 +5656,12 @@ function confirmarImportacao() {
     // linha bruta da planilha correspondente a cada `linhas[k]`, na mesma ordem, pra ler as colunas das regras
     const linhasBrutas = (st.grid || []).slice(st.headerRow + 1).filter(row => !(row || []).every(v => v === null || v === undefined || v === ''));
 
+    // UF escrita só na 1ª linha do grupo (as de baixo em branco): repete a UF de cima
+    let ufAnterior = '';
     const novas = linhas.map((l, k) => {
+      const ufLida = (l.uf || '').toString().toUpperCase().trim();
+      if (UFS_BR.has(ufLida)) ufAnterior = ufLida;
+      else if (!ufLida && (l.regiao || '').toString().trim() && ufAnterior && parseNumeroPlanilha(l['faixa_0'])) l.uf = ufAnterior;
       const valores = [];
       for (let i = 0; i < nFaixas; i++) valores.push(parseNumeroPlanilha(l['faixa_'+i]) || 0);
       const extras = {};
@@ -5621,7 +5685,7 @@ function confirmarImportacao() {
         excedente: parseNumeroPlanilha(l.excedente) || 0,
         extras,
       };
-    }).filter(t => t.uf && t.regiao);
+    }).filter(t => UFS_BR.has(t.uf) && t.regiao); // só linhas com UF de verdade (pula sub-cabeçalhos/cabeçalhos repetidos)
 
     if (novas.length === 0) { toast('Nenhuma linha válida encontrada com esse mapeamento.', 'error'); return; }
     if (p.motor.tarifas.length > 0 && !confirm(`Isso vai substituir as ${p.motor.tarifas.length} linhas atuais da grade por ${novas.length} novas linhas. Continuar?`)) return;
@@ -5940,7 +6004,7 @@ function renderPreviaProdutos() {
   const box = $('#previaProdutosBox');
   const grid = d.grid || [];
   const previewRows = grid.slice(0, 16);
-  const maxCols = Math.min(16, Math.max(...previewRows.map(r => r.length), 1));
+  const maxCols = totalColunasPlanilha(grid);
   const colOptions = (selecionado, opcional) => {
     let opts = opcional ? `<option value="">(não tenho essa coluna)</option>` : `<option value="">(nenhuma)</option>`;
     for (let c = 0; c < maxCols; c++) {
