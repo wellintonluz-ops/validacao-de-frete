@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-09-importador-taxas';
+const APP_VERSION = '2026-10-16-cte-varias-notas';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -1427,6 +1427,32 @@ async function lerPlanilhaNotas(file) {
   return { notas, linhas, aba: melhor.nome, colunasEncontradas: Object.entries(cols).filter(([, i]) => i >= 0).map(([k]) => k) };
 }
 
+// Frete do cliente por nota do CT-e ({ [nº NF]: { nNF, chave, vNF, frete, fonte } }).
+// Um CT-e pode levar várias NF-es: o frete do cliente é a SOMA do frete de todas elas.
+function freteNotasDoItem(x) {
+  if (x._freteNotas) return x._freteNotas;
+  const fn = {};
+  // lote reaberto do Histórico: recupera a lista gravada (ou a nota única dos lotes antigos)
+  if (Array.isArray(x.nfesVinculadas) && x.nfesVinculadas.length) x.nfesVinculadas.forEach(n => { fn[normNumeroNF(n.nNF)] = { ...n }; });
+  else if (x.nfeVinculada && (x.freteNfOriginal ?? x.valorFreteCliente) != null) fn[normNumeroNF(x.nfeVinculada.nNF)] = { nNF: x.nfeVinculada.nNF, chave: x.nfeVinculada.chave || null, vNF: x.nfeVinculada.vNF ?? null, frete: x.freteNfOriginal ?? x.valorFreteCliente, fonte: x.nfeVinculada.fonte || 'xml' };
+  x._freteNotas = fn;
+  return fn;
+}
+function recomputarFreteCliente(x) {
+  const lista = Object.values(x._freteNotas || {});
+  const qtdNotas = new Set(numerosNFDoItem(x)).size || ((x.cte && x.cte.notasFiscais) || []).length;
+  x.qtdNotasCte = qtdNotas;
+  if (!lista.length) { x.valorFreteCliente = null; x.nfeVinculada = null; x.nfesVinculadas = null; x.divergenciaCliente = null; x.qtdNotasComFrete = 0; return; }
+  const total = clamp2(lista.reduce((a, n) => a + (n.frete || 0), 0));
+  const somaVNF = lista.every(n => n.vNF != null) ? clamp2(lista.reduce((a, n) => a + n.vNF, 0)) : (lista[0].vNF ?? null);
+  x.valorFreteCliente = total;
+  x.nfesVinculadas = lista.map(n => ({ nNF: n.nNF, chave: n.chave || null, vNF: n.vNF ?? null, frete: n.frete, fonte: n.fonte }));
+  x.nfeVinculada = { nNF: lista.map(n => n.nNF).join(', '), chave: lista[0].chave || null, vNF: somaVNF, fonte: lista.every(n => n.fonte === 'planilha') ? 'planilha' : undefined };
+  x.qtdNotasComFrete = lista.length;
+  x.divergenciaCliente = clamp2(total - (x.cobrado || 0));
+  if (x.freteNfOriginal != null && x.reposicao) x.freteNfOriginal = null; // reposição: aplicarRegraReposicao guarda de novo o total
+}
+
 function numerosNFDoItem(x) {
   return ((x.cte && x.cte.notasFiscais) || []).map(n => normNumeroNF(n.numero)).filter(Boolean);
 }
@@ -1437,22 +1463,29 @@ function numerosNFDoItem(x) {
 function aplicarPlanilhaNosItens(itens, mapa) {
   let comCanal = 0, freteDaPlanilha = 0;
   itens.forEach(x => {
-    const nota = numerosNFDoItem(x).map(n => mapa[n]).find(Boolean);
-    if (!nota) return;
-    if (nota.canal) { x.canal = nota.canal; comCanal++; }
-    if (nota.pedido) x.pedido = nota.pedido;
-    if (nota.fluxo && 'cobrado' in x) { x.reposicao = true; x.obsFluxo = x.obsFluxo || nota.obsFluxo || 'FLUXO (planilha de notas)'; }
-    if ('fluxo' in nota && 'cobrado' in x) x.notaSemObs = false; // planilha com observações lidas também vale como conferida
-    aplicarRegraReposicao(x);
+    const numeros = numerosNFDoItem(x);
+    const notasPlan = numeros.map(n => mapa[n] ? { num: n, nota: mapa[n] } : null).filter(Boolean);
+    if (!notasPlan.length) return;
+    const comCanalNota = notasPlan.find(p => p.nota.canal);
+    if (comCanalNota) { x.canal = comCanalNota.nota.canal; comCanal++; }
+    const comPedido = notasPlan.find(p => p.nota.pedido);
+    if (comPedido) x.pedido = comPedido.nota.pedido;
+    const comFluxo = notasPlan.find(p => p.nota.fluxo);
+    if (comFluxo && 'cobrado' in x) { x.reposicao = true; x.obsFluxo = x.obsFluxo || comFluxo.nota.obsFluxo || 'FLUXO (planilha de notas)'; }
+    if (notasPlan.some(p => 'fluxo' in p.nota) && 'cobrado' in x) x.notaSemObs = false; // planilha com observações lidas também vale como conferida
     if ('cobrado' in x) {
-      if ((x.valorFreteCliente === null || x.valorFreteCliente === undefined) && nota.frete !== null && nota.frete !== undefined) {
-        x.valorFreteCliente = nota.frete;
-        x.nfeVinculada = { nNF: nota.nNF, chave: null, vNF: nota.valorNF ?? null, fonte: 'planilha' };
-        x.divergenciaCliente = clamp2(nota.frete - x.cobrado);
-        freteDaPlanilha++;
-      }
-      if (!x._itensNFe && nota.itens && nota.itens.length) x._itensNFe = nota.itens;
+      // cada nota do CT-e sem frete vindo do XML da NF-e recebe o frete da planilha
+      const fn = freteNotasDoItem(x);
+      let novas = 0;
+      notasPlan.forEach(({ num, nota }) => {
+        if (fn[num] || nota.frete === null || nota.frete === undefined) return;
+        fn[num] = { nNF: nota.nNF || num, chave: null, vNF: nota.valorNF ?? null, frete: nota.frete, fonte: 'planilha' };
+        novas++;
+      });
+      if (novas) { recomputarFreteCliente(x); freteDaPlanilha++; }
+      if (!x._itensNFe) { const its = notasPlan.flatMap(p => p.nota.itens || []); if (its.length) x._itensNFe = its; }
     }
+    aplicarRegraReposicao(x);
   });
   return { comCanal, freteDaPlanilha };
 }
@@ -1511,33 +1544,31 @@ function enriquecerComNotasFiscais(resultados, nfes) {
   let casados = 0;
   resultados.forEach(r => {
     const notas = r.cte.notasFiscais || [];
-    let nfeEncontrada = null;
-    for (const nf of notas) {
-      if (nf.chave && porChave[nf.chave]) { nfeEncontrada = porChave[nf.chave]; break; }
-    }
+    // todas as NF-es do CT-e encontradas (a transportadora pode juntar várias notas num CT-e só)
+    const nfesEncontradas = notas.map(nf => nf.chave && porChave[nf.chave]).filter(Boolean);
+    const nfeEncontrada = nfesEncontradas[0] || null;
     // "FLUXO" em QUALQUER nota do CT-e (um CT-e pode levar várias NF-es) — inclusive notas
     // lidas nesta sessão cuja gravação no banco ainda não terminou
     const memFluxo = STATE._fluxoPorChave || {};
     const notaComFluxo = notas.map(nf => nf.chave && (porChave[nf.chave] || null)).find(n => n && (n.fluxo || memFluxo[n.chave]))
       || (notas.find(nf => nf.chave && memFluxo[nf.chave]) ? { obsFluxo: memFluxo[notas.find(nf => nf.chave && memFluxo[nf.chave]).chave] } : null);
-    if (nfeEncontrada && nfeEncontrada.vFrete !== null && nfeEncontrada.vFrete !== undefined) {
-      r.valorFreteCliente = nfeEncontrada.vFrete;
-      r.nfeVinculada = { nNF: nfeEncontrada.nNF, chave: nfeEncontrada.chave, vNF: nfeEncontrada.vNF };
-      // divergência do TOTAL: o que o cliente pagou de frete vs o que a transportadora cobrou
-      // (positivo = cliente pagou mais que o custo do frete = margem; negativo = TBX perde no frete)
-      r.divergenciaCliente = clamp2(r.valorFreteCliente - r.cobrado);
-      casados++;
-    } else {
-      r.valorFreteCliente = null;
-      r.nfeVinculada = null;
-      r.divergenciaCliente = null;
-    }
-    // guarda os itens (mesmo sem vFrete) pra eventualmente recalcular a cubagem
-    r._itensNFe = nfeEncontrada ? nfeEncontrada.itens : null;
+    // frete do cliente = SOMA do vFrete de todas as NF-es do CT-e; divergência do TOTAL: o que o
+    // cliente pagou vs o que a transportadora cobrou (positivo = margem; negativo = TBX perde no frete)
+    r._freteNotas = {};
+    r.freteNfOriginal = null;
+    nfesEncontradas.forEach(n => {
+      if (n.vFrete === null || n.vFrete === undefined) return;
+      r._freteNotas[normNumeroNF(n.nNF)] = { nNF: n.nNF, chave: n.chave, vNF: n.vNF ?? null, frete: n.vFrete, fonte: 'xml' };
+    });
+    recomputarFreteCliente(r);
+    if (r.qtdNotasComFrete) casados++;
+    // guarda os itens de todas as notas (mesmo sem vFrete) pra eventualmente recalcular a cubagem
+    const itensTodas = nfesEncontradas.flatMap(n => n.itens || []);
+    r._itensNFe = itensTodas.length ? itensTodas : null;
     // "FLUXO" nas observações da NF-e -> reposição (prejuízo total, igual devolução)
     const fluxoNota = !!notaComFluxo;
     // nota importada antes da leitura das observações existir: não dá pra saber se tem FLUXO
-    r.notaSemObs = !fluxoNota && !!nfeEncontrada && !('fluxo' in nfeEncontrada) && !(nfeEncontrada.chave in memFluxo);
+    r.notaSemObs = !fluxoNota && nfesEncontradas.some(n => !('fluxo' in n) && !(n.chave in memFluxo));
     r.reposicao = fluxoNota || !!r.reposicaoCte;
     r.obsFluxo = fluxoNota ? (notaComFluxo.obsFluxo || memFluxo[notaComFluxo.chave] || 'FLUXO') : (r.reposicaoCte ? r.obsFluxo : null);
     if (!r.reposicao) r.freteNfOriginal = null;
@@ -2601,6 +2632,9 @@ function trimResultadoParaHistorico(r) {
     valorFreteCliente: r.valorFreteCliente,
     divergenciaCliente: r.divergenciaCliente,
     nfeVinculada: r.nfeVinculada,
+    nfesVinculadas: r.nfesVinculadas || null,
+    qtdNotasCte: r.qtdNotasCte ?? null,
+    qtdNotasComFrete: r.qtdNotasComFrete ?? null,
     canal: r.canal ?? null,
     pedido: r.pedido ?? null,
     tabelaAlternativa: r.tabelaAlternativa || null,
@@ -3741,7 +3775,7 @@ function renderTabelaResultados(lista, filtro) {
               ${mostrarMargem ? (classifPrejuizoTotal(r) ? `
                 <td class="px-4 py-3 text-right num text-ink-700" title="${rotuloClassif(r)}: o cliente não paga esse frete">${fmtBRL(0)}</td>
                 <td class="px-4 py-3 text-right num font-semibold text-red-600" title="${rotuloClassif(r)} — prejuízo total">${fmtBRL(-(r.cobrado || 0))}</td>` : `
-                <td class="px-4 py-3 text-right num text-ink-700">${r.valorFreteCliente != null ? fmtBRL(r.valorFreteCliente) : '<span class="text-ink-300">sem NF-e</span>'}</td>
+                <td class="px-4 py-3 text-right num text-ink-700">${r.valorFreteCliente != null ? fmtBRL(r.valorFreteCliente) : '<span class="text-ink-300">sem NF-e</span>'}${r.qtdNotasCte > 1 ? `<div class="text-[10px] ${r.qtdNotasComFrete < r.qtdNotasCte ? 'text-amber-600 font-semibold' : 'text-ink-400'}" title="${r.qtdNotasComFrete < r.qtdNotasCte ? 'Falta o frete do cliente de alguma nota deste CT-e — importe o XML da NF-e ou a planilha' : 'Soma do frete de todas as notas do CT-e'}">${r.qtdNotasComFrete || 0}/${r.qtdNotasCte} NFs</div>` : ''}</td>
                 <td class="px-4 py-3 text-right num font-semibold ${r.divergenciaCliente == null ? 'text-ink-300' : margemClienteEfetiva(r) < 0 ? 'text-red-600' : 'text-emerald-600'}" ${zeraMargem(r) && r.divergenciaCliente ? `title="Analisado como ${rotuloClassif(r)} — margem original ${fmtBRL(r.divergenciaCliente)} considerada R$ 0,00"` : ''}>${r.divergenciaCliente != null ? (zeraMargem(r) && r.divergenciaCliente ? `${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(r.divergenciaCliente)}</span>` : (r.divergenciaCliente>0?'+':'') + fmtBRL(r.divergenciaCliente)) : '—'}</td>
               `) : ''}
               <td class="px-4 py-3">${r.tabelaAlternativa ? `<span title="Calculado com a tabela em rascunho: ${escapeHtml(r.tabelaAlternativa.nome)}" class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full border bg-amber-50 text-amber-700 border-amber-200 mr-1">TABELA ANTIGA</span>` : ''}${statusBadge(r.calc.status)}${calcularReconciliacaoXml(r).temPendencia ? ' <span title="Existe cobrança no XML que nenhuma regra cadastrada reconhece" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border bg-red-50 text-red-700 border-red-200">$ não cadastrado</span>' : ''}${badgeAnalise(r)}</td>
@@ -4399,7 +4433,9 @@ function abrirDetalheCte(idx) {
 
   const infoNotaCliente = (() => {
     const partes = [];
-    if (r.nfeVinculada) partes.push(`Nota do cliente casada: NF ${escapeHtml(r.nfeVinculada.nNF || '')} (${r.nfeVinculada.fonte === 'planilha' ? 'planilha Excel' : 'XML da NF-e'})`);
+    const lista = r.nfesVinculadas || [];
+    if (lista.length > 1 || (r.qtdNotasCte > 1 && lista.length)) partes.push(`Notas do cliente casadas (${lista.length} de ${r.qtdNotasCte || lista.length}): ${lista.map(n => `NF ${escapeHtml(n.nNF || '')} ${fmtBRL(n.frete)} (${n.fonte === 'planilha' ? 'planilha' : 'XML'})`).join(' + ')} = <strong>${fmtBRL(lista.reduce((a, n) => a + (n.frete || 0), 0))}</strong>${r.qtdNotasCte > lista.length ? ` <span class="text-amber-700 font-semibold">— faltam ${r.qtdNotasCte - lista.length} nota(s) sem frete do cliente (importe o XML ou a planilha)</span>` : ''}`);
+    else if (r.nfeVinculada) partes.push(`Nota do cliente casada: NF ${escapeHtml(r.nfeVinculada.nNF || '')} (${r.nfeVinculada.fonte === 'planilha' ? 'planilha Excel' : 'XML da NF-e'})`);
     else partes.push('Nenhuma nota do cliente (XML ou planilha) casada com este CT-e ainda');
     partes.push(r.reposicao ? `<strong class="text-amber-700">REPOSIÇÃO</strong> — ${escapeHtml(r.obsFluxo || 'FLUXO')}` : '"FLUXO"/"REPOSIÇÃO" não encontrado nas observações da nota/CT-e');
     return `<div class="mt-1.5 text-[11px] text-ink-400 bg-ink-50 border border-ink-200 rounded-lg px-2.5 py-1.5">${partes.join(' · ')}</div>`;
@@ -4466,7 +4502,7 @@ function abrirDetalheCte(idx) {
             </tr>
             ${r.valorFreteCliente != null ? `
             <tr class="${r.divergenciaCliente < -0.05 ? 'bg-red-50' : ''}">
-              <td class="px-3 py-2 text-ink-500" title="Valor de frete (vFrete) declarado na NF-e nº ${escapeHtml(r.nfeVinculada?.nNF)} — o que o Grupo TBX cobrou do cliente final">Frete cobrado do cliente (${r.nfeVinculada?.fonte === 'planilha' ? 'planilha, ' : ''}NF nº ${escapeHtml(r.nfeVinculada?.nNF)})</td>
+              <td class="px-3 py-2 text-ink-500" title="Frete (vFrete) das NF-es nº ${escapeHtml(r.nfeVinculada?.nNF)} — o que o Grupo TBX cobrou do cliente final${(r.nfesVinculadas || []).length > 1 ? ' (soma das notas do CT-e)' : ''}">Frete cobrado do cliente (${r.nfeVinculada?.fonte === 'planilha' ? 'planilha, ' : ''}${(r.nfesVinculadas || []).length > 1 ? `soma de ${r.nfesVinculadas.length} NFs` : `NF nº ${escapeHtml(r.nfeVinculada?.nNF)}`})</td>
               <td class="px-3 py-2 text-right num ${r.divergenciaCliente < -0.05 ? 'text-red-700 font-semibold' : 'text-ink-600'}" colspan="2">${fmtBRL(r.valorFreteCliente)}</td>
             </tr>` : ''}
           </tfoot>
