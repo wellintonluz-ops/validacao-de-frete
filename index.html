@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-16-cte-varias-notas';
+const APP_VERSION = '2026-10-22-reposicao-divergencia';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -315,6 +315,10 @@ function aplicarRegraReposicao(r) {
 // Devolução e reposição: prejuízo total (a TBX paga o frete inteiro, o cliente não paga nada)
 function ehPrejuizoTotal(r) { return r.tipoOperacao === 'devolucao' || !!r.reposicao || (typeof classifPrejuizoTotal === 'function' && classifPrejuizoTotal(r)); }
 function ehReposicao(r) { return !!r.reposicao && r.tipoOperacao !== 'devolucao'; }
+// Divergência/Prejuízo (cobrado × tabela) = −valor cobrado inteiro só em devolução e Redespacho/Uso e Consumo.
+// Reposição NÃO: a cobrança da transportadora é conferida normal (calculado − cobrado);
+// o prejuízo total da reposição fica na MARGEM (cliente não paga o frete).
+function divergenciaPrejuizoTotal(r) { return r.tipoOperacao === 'devolucao' || (typeof classifPrejuizoTotal === 'function' && classifPrejuizoTotal(r)); }
 
 function fmtDate(iso) {
   if (!iso) return '—';
@@ -1129,6 +1133,8 @@ function parseCteXml(xmlString, fileName) {
       const tp = xmlText(q, 'tpMed');
       const val = xmlNum(q, 'qCarga');
       if (tp) qtds[tp.trim().toUpperCase()] = val;
+      // cUnid 00 = metro cúbico (padrão do CT-e), independente do texto do tpMed
+      if (xmlText(q, 'cUnid') === '00' && val != null && qtds._m3 == null) qtds._m3 = val;
     });
   }
 
@@ -1174,7 +1180,7 @@ function parseCteXml(xmlString, fileName) {
     vCarga: xmlNum(infCarga, 'vCarga'),
     pesoReal: qtds['PESO REAL'] ?? null,
     pesoBC: qtds['PESO BASE DE CALCULO'] ?? qtds['PESO BASE DE CÁLCULO'] ?? null,
-    m3: qtds['M3'] ?? null,
+    m3: qtds['M3'] ?? qtds['M³'] ?? qtds._m3 ?? (Object.entries(qtds).find(([k]) => /^(M3|M³|METROS? CUBICOS?|CUBAGEM)\b/.test(k.normalize('NFD').replace(/[\u0300-\u036f]/g, '')))?.[1]) ?? null,
 
     pICMS: xmlNum(icms00, 'pICMS') ?? buscarTagPorPrefixo(icms00, 'pICMS') ?? buscarTagEmQualquerLugar(infCte, 'pICMS') ?? buscarTagPorPrefixo(icmsWrapper, 'pICMS'),
     vICMS: xmlNum(icms00, 'vICMS') ?? buscarTagPorPrefixo(icms00, 'vICMS') ?? buscarTagEmQualquerLugar(infCte, 'vICMS') ?? buscarTagPorPrefixo(icmsWrapper, 'vICMS'),
@@ -1621,8 +1627,10 @@ function recalcularComCubagem(resultados, produtosMap) {
     const infoCubagem = calcularPesoCubado(r._itensNFe, produtosMap, fator);
     if (!infoCubagem || infoCubagem.pesoCubado == null) return;
     const pesoReal = r.cte.pesoReal || 0;
-    const pesoFinal = Math.max(pesoReal, infoCubagem.pesoCubado);
-    r.pesoCubadoInfo = { ...infoCubagem, pesoFinal, pesoDeclaradoCte: r.cte.pesoBC };
+    const limiteIsencao = Number(pCalc.isencaoCubagemM3) || 0;
+    const isentoCubagem = limiteIsencao > 0 && infoCubagem.volumeTotalM3 <= limiteIsencao + 1e-9 && pesoReal > 0;
+    const pesoFinal = isentoCubagem ? pesoReal : Math.max(pesoReal, infoCubagem.pesoCubado);
+    r.pesoCubadoInfo = { ...infoCubagem, pesoFinal, pesoDeclaradoCte: r.cte.pesoBC, isentoCubagem, limiteIsencao: limiteIsencao || null };
 
     if (!indicesPorParceiro[pCalc.id]) indicesPorParceiro[pCalc.id] = buildAbrangenciaIndex(pCalc.abrangencia || []);
     const enderecoConsulta = r.tipoOperacao === 'devolucao' ? { uf: r.cte.remUF, cep: r.cte.remCEP } : null;
@@ -1931,8 +1939,12 @@ function calcularParceiro(cte, parceiro, abrangenciaIndex, enderecoConsulta = nu
   // peso considerado: normalmente o "peso base de cálculo" que a própria transportadora
   // declarou no CT-e; pesoOverride permite substituir por um peso recalculado por nós
   // (maior entre peso real e peso cubado, usando nossa própria base de dimensões de produto)
-  const peso = pesoOverride ?? (cte.pesoBC ?? cte.pesoReal ?? null);
+  let peso = pesoOverride ?? (cte.pesoBC ?? cte.pesoReal ?? null);
+  // isenção de cubagem: até X m³ a transportadora não cobra cubagem — vale o peso REAL
+  const isencao = pesoOverride == null ? avaliarIsencaoCubagem(cte, parceiro) : null;
+  if (isencao && isencao.isento) peso = isencao.pesoUsado;
   const fretePesoInfo = calcFaixaPeso(peso, tarifaRow, motor.faixasPeso || [], motor.baseExcedente || 'por_kg');
+  if (isencao) fretePesoInfo.explicacao = (fretePesoInfo.explicacao ? fretePesoInfo.explicacao + ' · ' : '') + isencao.texto;
   const fretePeso = fretePesoInfo.valor;
 
   const ctx = { vCarga: cte.vCarga || 0, peso, tarifaRow, abrangenciaRow: abrRow, subtotalAtual: fretePeso || 0 };
@@ -1982,7 +1994,31 @@ function calcularParceiro(cte, parceiro, abrangenciaIndex, enderecoConsulta = nu
     componentes,
     subtotalCalculado: clamp2(subtotalCalculado),
     totalCalculado,
+    pesoUsado: peso,
+    isencaoCubagem: isencao || null,
   };
+}
+
+// Regra manual do parceiro: "isento de cubagem até X m³". Volume da carga = o m³ declarado
+// no CT-e; sem ele, estima pelo peso cubado declarado ÷ fator de cubagem do parceiro.
+// Até o limite: usa o peso real (sem cubagem). Acima: cubagem normal (peso base de cálculo do CT-e).
+function avaliarIsencaoCubagem(cte, parceiro) {
+  const limite = Number(parceiro.isencaoCubagemM3) || 0;
+  if (!(limite > 0)) return null;
+  const pesoReal = cte.pesoReal ?? null;
+  const pesoBC = cte.pesoBC ?? null;
+  let volume = cte.m3 != null && cte.m3 > 0 ? cte.m3 : null;
+  let estimado = false;
+  if (volume == null && pesoBC != null && parceiro.fatorCubagem > 0) {
+    if (pesoReal != null && pesoBC <= pesoReal + 0.001) return { isento: false, limite, volume: null, texto: `Isenção de cubagem até ${fmtNum(limite, 2)} m³: o CT-e já cobra pelo peso real` };
+    volume = pesoBC / parceiro.fatorCubagem; estimado = true;
+  }
+  if (volume == null) return { isento: false, limite, volume: null, texto: `Isenção de cubagem até ${fmtNum(limite, 2)} m³: CT-e sem m³ declarado e parceiro sem fator de cubagem — não deu pra conferir, usado o peso base de cálculo` };
+  const volTxt = `${fmtNum(volume, 3)} m³${estimado ? ' (estimado: peso base ÷ fator)' : ''}`;
+  if (volume <= limite + 1e-9 && pesoReal != null) {
+    return { isento: true, limite, volume, estimado, pesoUsado: pesoReal, texto: `Isento de cubagem: ${volTxt} ≤ ${fmtNum(limite, 2)} m³ — usado o peso real ${fmtNum(pesoReal)} kg${pesoBC != null && pesoBC !== pesoReal ? ` (CT-e declarou ${fmtNum(pesoBC)} kg)` : ''}` };
+  }
+  return { isento: false, limite, volume, estimado, texto: `Cubagem cobrada: ${volTxt} > ${fmtNum(limite, 2)} m³ (isenção só até esse volume)` };
 }
 
 // Normaliza nome de empresa pra comparação: maiúsculas, sem acento, espaços únicos.
@@ -2663,8 +2699,8 @@ function montarRegistroHistorico(nomeLote, v) {
   const { resultados, semParceiro = [], outrosFluxos = [], reentregas = [], duplicadosIgnorados = 0 } = v;
   const tol = 0.05;
   // devolução/reentrega ficam só na aba própria delas — não contam aqui, pra não duplicar
-  const maior = resultados.filter(r => !ehPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) > tol);
-  const menor = resultados.filter(r => !ehPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) < -tol);
+  const maior = resultados.filter(r => !divergenciaPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) > tol);
+  const menor = resultados.filter(r => !divergenciaPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) < -tol);
   const devolucoesResultados = resultados.filter(r => r.tipoOperacao === 'devolucao');
   const reposicoesResultados = resultados.filter(ehReposicao);
   const resumoFin = calcularResumoFinanceiro(resultados, reentregas, semParceiro, outrosFluxos);
@@ -3417,10 +3453,10 @@ function renderResultadosValidacao() {
   // devolução/reversa tem aba própria (prejuízo total) — não conta em nenhuma outra, pra
   // não aparecer duplicada em "cobrado a maior/menor" etc. (reentrega já nem entra em
   // "resultados", então nunca aparecia nessas abas mesmo)
-  const maior = resultados.filter(r => !ehPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) > tol);
-  const menor = resultados.filter(r => !ehPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) < -tol);
-  const revisao = resultados.filter(r => !ehPrejuizoTotal(r) && (r.calc.status === 'REVISAO_MANUAL' || r.calc.status === 'SEM_TARIFA' || r.calc.status === 'SEM_ABRANGENCIA'));
-  const ok = resultados.filter(r => !ehPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && Math.abs(divergenciaEfetiva(r)) <= tol && (r.calc.status === 'OK' || analisadoSemErro(r)));
+  const maior = resultados.filter(r => !divergenciaPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) > tol);
+  const menor = resultados.filter(r => !divergenciaPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && divergenciaEfetiva(r) < -tol);
+  const revisao = resultados.filter(r => !divergenciaPrejuizoTotal(r) && (r.calc.status === 'REVISAO_MANUAL' || r.calc.status === 'SEM_TARIFA' || r.calc.status === 'SEM_ABRANGENCIA'));
+  const ok = resultados.filter(r => !divergenciaPrejuizoTotal(r) && divergenciaEfetiva(r) !== null && Math.abs(divergenciaEfetiva(r)) <= tol && (r.calc.status === 'OK' || analisadoSemErro(r)));
   const devolucoes = resultados.filter(r => r.tipoOperacao === 'devolucao');
   const reposicoes = resultados.filter(ehReposicao);
   const prejuizoClassif = resultados.filter(r => classifPrejuizoTotal(r) && r.tipoOperacao !== 'devolucao' && !ehReposicao(r));
@@ -3486,7 +3522,7 @@ function renderResultadosValidacao() {
     </div>
     <div class="grid ${nfeImportada ? 'grid-cols-5' : 'grid-cols-4'} gap-3 mb-5">
       ${filtroCard('devolucao', 'Devolução (prejuízo total)', devolucoes.length, fmtBRL(devolucoes.reduce((a,r)=>a+(r.cobrado||0),0)), 'brand')}
-      ${filtroCard('reposicao', 'Reposição (prejuízo total)', reposicoes.length, fmtBRL(reposicoes.reduce((a,r)=>a+(r.cobrado||0),0)), 'amber')}
+      ${filtroCard('reposicao', 'Reposição (margem: prejuízo total)', reposicoes.length, fmtBRL(reposicoes.reduce((a,r)=>a+(r.cobrado||0),0)), 'amber')}
       ${filtroCard('prejuizo_classif', 'Redespacho / Uso e Consumo', prejuizoClassif.length, fmtBRL(-prejuizoClassif.reduce((a,r)=>a+(r.cobrado||0),0)), 'red')}
       ${filtroCard('reentrega', 'Reentrega (prejuízo total)', reentregas.length, fmtBRL(reentregas.reduce((a,x)=>a+(x.cte.vTPrest||0),0)), 'purple')}
       ${nfeImportada ? filtroCard('margem_negativa', 'Cliente pagou menos que o frete', margemNegativa.length, fmtBRL(margemNegativa.reduce((a,r)=>a+margemClienteEfetiva(r),0)), 'red') : ''}
@@ -3695,7 +3731,7 @@ function renderTabelaResultados(lista, filtro) {
   const nfsTxt = (r) => (r.cte.notasFiscais || []).map(n => n.numero).join(', ') || '—';
   const bannerDevolucao = filtro === 'reposicao' ? `
     <div class="mb-4 text-xs px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200">
-      <strong>Reposição é prejuízo direto, igual devolução</strong> — a nota fiscal do cliente tem "FLUXO" ou "REPOSIÇÃO" (em qualquer grafia) nas observações — produto reenviado por conta da TBX. O cliente não paga esse frete, então a coluna "Prejuízo" mostra o <strong>valor total cobrado</strong> pela transportadora e ele não entra no "Cliente pagou" do Faturado. O cálculo contra a tabela continua disponível em "Detalhes".
+      <strong>Reposição: o cliente não paga o frete</strong> — a nota fiscal do cliente tem "FLUXO" ou "REPOSIÇÃO" (em qualquer grafia) nas observações — produto reenviado por conta da TBX. Por isso a <strong>Margem</strong> é sempre o valor total cobrado, negativo (e ele não entra no "Cliente pagou" do Faturado). Já a coluna <strong>Divergência / prejuízo</strong> confere a cobrança da transportadora normalmente: calculado pela tabela − cobrado.
     </div>` : ehDevolucao ? `
     <div class="mb-4 text-xs px-3 py-2.5 rounded-lg bg-brand-50 text-brand-800 border border-brand-200">
       <strong>Devolução/reversa é prejuízo direto</strong> — o Grupo TBX paga esse frete do próprio bolso, sem repasse pro cliente. Por isso, a coluna "Prejuízo" abaixo mostra o <strong>valor total cobrado</strong> pela transportadora, não a diferença contra a tabela. O "Calculado" continua útil só pra conferir se a transportadora está cobrando certo (e não a mais) — não é o valor do prejuízo em si.
@@ -3743,7 +3779,7 @@ function renderTabelaResultados(lista, filtro) {
             <th class="text-left font-semibold px-4 py-3">Destino</th>
             <th class="text-right font-semibold px-4 py-3">Cobrado</th>
             <th class="text-right font-semibold px-4 py-3">Calculado</th>
-            ${mostrarDivergencia ? `<th class="text-right font-semibold px-4 py-3">${ehDevolucao ? 'Prejuízo (total cobrado)' : 'Divergência / prejuízo'}</th>` : ''}
+            ${mostrarDivergencia ? `<th class="text-right font-semibold px-4 py-3">${filtro === 'devolucao' || filtro === 'prejuizo_classif' ? 'Prejuízo (total cobrado)' : 'Divergência / prejuízo'}</th>` : ''}
             ${mostrarMargem ? '<th class="text-right font-semibold px-4 py-3">Frete Cliente</th><th class="text-right font-semibold px-4 py-3" title="Frete cliente − Cobrado da transportadora">Margem</th>' : ''}
             <th class="text-left font-semibold px-4 py-3">Status</th>
             <th class="px-4 py-3"></th>
@@ -3764,8 +3800,8 @@ function renderTabelaResultados(lista, filtro) {
               }</td>
               <td class="px-4 py-3 text-right num text-ink-700">${fmtBRL(r.cobrado)}</td>
               <td class="px-4 py-3 text-right num text-ink-700">${r.calculado !== null ? fmtBRL(r.calculado) : '—'}</td>
-              ${mostrarDivergencia ? ((ehDevolucao || ehPrejuizoTotal(r))
-                ? `<td class="px-4 py-3 text-right num font-semibold text-red-600" title="${classifPrejuizoTotal(r) ? rotuloClassif(r) : ehReposicao(r) ? 'Reposição' : 'Devolução'} — prejuízo total (valor cobrado inteiro)">${fmtBRL(-(r.cobrado || 0))}</td>`
+              ${mostrarDivergencia ? (divergenciaPrejuizoTotal(r)
+                ? `<td class="px-4 py-3 text-right num font-semibold text-red-600" title="${classifPrejuizoTotal(r) ? rotuloClassif(r) : 'Devolução'} — prejuízo total (valor cobrado inteiro)">${fmtBRL(-(r.cobrado || 0))}</td>`
                 : r.divergencia === null || r.divergencia === undefined
                   ? `<td class="px-4 py-3 text-right num text-ink-300">—</td>`
                   : analisadoSemErro(r) && Math.abs(r.divergencia) > 0.05
@@ -4465,7 +4501,7 @@ function abrirDetalheCte(idx) {
         <div>
           <div class="text-sm font-semibold text-ink-900">CT-e ${escapeHtml(r.cte.nCT)} · ${escapeHtml(r.parceiro.nome)}</div>
           ${r.origemDivergente ? `<div class="text-xs mt-1 mb-1 px-2 py-1 rounded-lg bg-orange-50 text-orange-800 border border-orange-200">⚠ <strong>Erro de origem na emissão:</strong> o CT-e saiu de ${escapeHtml(r.origemDivergente.municipio)}/${escapeHtml(r.origemDivergente.uf)}, mas a origem cadastrada do parceiro é ${escapeHtml(r.origemDivergente.esperado || '—')}. Validado normalmente pela tabela (pelo destino), junto com os demais.</div>` : ''}
-          <div class="text-xs text-ink-400">${escapeHtml(r.cte.destMun)}/${escapeHtml(r.cte.destUF)} · região "${escapeHtml(r.calc.regiaoEncontrada || '—')}" · peso base cálc. ${fmtNum(r.cte.pesoBC ?? r.cte.pesoReal)} kg${r.pesoCubadoInfo ? ` <span class="text-ink-300">(peso usado no cálculo: ${fmtNum(r.pesoCubadoInfo.pesoFinal)} kg — cubagem própria)</span>` : ''}</div>
+          <div class="text-xs text-ink-400">${escapeHtml(r.cte.destMun)}/${escapeHtml(r.cte.destUF)} · região "${escapeHtml(r.calc.regiaoEncontrada || '—')}" · peso base cálc. ${fmtNum(r.cte.pesoBC ?? r.cte.pesoReal)} kg${r.pesoCubadoInfo ? ` <span class="text-ink-300">(peso usado no cálculo: ${fmtNum(r.pesoCubadoInfo.pesoFinal)} kg — ${r.pesoCubadoInfo.isentoCubagem ? `isento de cubagem: volume ${fmtNum(r.pesoCubadoInfo.volumeTotalM3, 3)} m³ ≤ ${fmtNum(r.pesoCubadoInfo.limiteIsencao, 2)} m³, peso real` : 'cubagem própria'})</span>` : ''}${!r.pesoCubadoInfo && r.calc.isencaoCubagem ? `<div class="mt-0.5 ${r.calc.isencaoCubagem.isento ? 'text-emerald-700' : 'text-ink-500'}">${r.calc.isencaoCubagem.isento ? '✓ ' : ''}${escapeHtml(r.calc.isencaoCubagem.texto)}</div>` : ''}</div>
           <div class="text-xs text-ink-400 mt-0.5">${nfsTxt}${emissaoTxt}${canalTxt} · chave CT-e <span class="font-mono text-[10px]">${escapeHtml(r.cte.chave)}</span></div>
           ${renderAbrangenciaUsada(r)}
           ${infoNotaCliente}
@@ -4835,6 +4871,11 @@ function renderParceiroForm() {
           <div class="mt-4 pt-4 border-t border-ink-100">
             <label class="text-xs font-medium text-ink-500">Fator de cubagem (kg por m³)</label>
             <input id="fFatorCubagem" type="number" step="0.01" value="${p.fatorCubagem ?? ''}" placeholder="Ex: 300" class="mt-1 w-40 border border-ink-200 rounded-lg px-3 py-2 text-sm font-mono">
+            <div class="mt-3">
+              <label class="text-xs font-medium text-ink-500">Isenção de cubagem até (m³) <span class="text-ink-300 font-normal">— regra manual, opcional</span></label>
+              <input id="fIsencaoCubagem" type="number" step="0.001" min="0" value="${p.isencaoCubagemM3 ?? ''}" placeholder="Ex: 1" class="mt-1 w-40 border border-ink-200 rounded-lg px-3 py-2 text-sm font-mono">
+              <p class="text-[11px] text-ink-300 mt-1">Quando a transportadora não cobra cubagem até um certo volume: até esse m³ o cálculo usa o <strong>peso real</strong>; acima dele, entra a cubagem normal. O volume vem do m³ declarado no CT-e (ou da sua planilha de produtos, quando a cubagem própria estiver ativa); sem m³ no CT-e, é estimado pelo peso base de cálculo ÷ fator de cubagem. Deixe em branco se o parceiro não tem isenção.</p>
+            </div>
             <p class="text-[11px] text-ink-300 mt-1">Usado pra recalcular o peso cubado a partir das dimensões dos produtos (comprimento × largura × altura, em metros, × esse fator). O peso considerado no cálculo é sempre o maior entre peso real e peso cubado. Deixe em branco pra não recalcular (usa só o peso declarado no CT-e).</p>
           </div>
         </div>
@@ -5823,6 +5864,8 @@ async function salvarParceiro() {
   p.ativo = $('#fAtivo').checked;
   const fatorInput = $('#fFatorCubagem').value;
   p.fatorCubagem = fatorInput ? parseFloat(fatorInput) : null;
+  const isencaoInput = ($('#fIsencaoCubagem')?.value || '').replace(',', '.');
+  p.isencaoCubagemM3 = isencaoInput && parseFloat(isencaoInput) > 0 ? parseFloat(isencaoInput) : null;
 
   if (!p.nome) { toast('Informe o nome do parceiro — é ele que casa o CT-e ao parceiro (não o CNPJ, já que um parceiro pode emitir por mais de um CNPJ).', 'error'); return; }
   if (p.cnpj && p.cnpj.length !== 14) { toast('O CNPJ informado está incompleto (precisa ter 14 dígitos) — ou deixe em branco, ele é só informativo.', 'error'); return; }
