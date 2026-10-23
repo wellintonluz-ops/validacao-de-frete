@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-22-reposicao-divergencia';
+const APP_VERSION = '2026-10-23-complemento-taxa';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -313,7 +313,7 @@ function aplicarRegraReposicao(r) {
   r.divergenciaCliente = clamp2(0 - (r.cobrado || 0));
 }
 // Devolução e reposição: prejuízo total (a TBX paga o frete inteiro, o cliente não paga nada)
-function ehPrejuizoTotal(r) { return r.tipoOperacao === 'devolucao' || !!r.reposicao || (typeof classifPrejuizoTotal === 'function' && classifPrejuizoTotal(r)); }
+function ehPrejuizoTotal(r) { return r.tipoOperacao === 'devolucao' || !!r.reposicao || (typeof classifPrejuizoTotal === 'function' && (classifPrejuizoTotal(r) || classifMargemTotal(r))); }
 function ehReposicao(r) { return !!r.reposicao && r.tipoOperacao !== 'devolucao'; }
 // Divergência/Prejuízo (cobrado × tabela) = −valor cobrado inteiro só em devolução e Redespacho/Uso e Consumo.
 // Reposição NÃO: a cobrança da transportadora é conferida normal (calculado − cobrado);
@@ -3348,12 +3348,13 @@ function zeraDivergencia(r) { return classifsDe(r).some(c => CLASSIF_ZERA_DIVERG
 function zeraMargem(r) { return classifsDe(r).some(c => CLASSIF_ZERA_MARGEM.includes(c)); }
 function analisadoSemErro(r) { return zeraDivergencia(r); } // Divergência/Prejuízo considerada zero
 function classifPrejuizoTotal(r) { return classifsDe(r).some(c => CLASSIF_PREJUIZO_TOTAL.includes(c)); } // Redespacho / Uso e Consumo
+function classifMargemTotal(r) { return classifsDe(r).some(c => CLASSIF_MARGEM_TOTAL.includes(c)); } // Valor complementar de taxa
 function rotuloClassif(r) { return classifsDe(r).map(c => (LABEL_CLASSIFICACAO[c] || {}).label || c).join(' + '); }
 // Convenção de exibição: Divergência/Prejuízo = CALCULADO − COBRADO → negativo = cobrado a maior (prejuízo)
 function semZeroNeg(v) { return v === 0 ? 0 : v; }
 function difExibida(v) { return v === null || v === undefined ? v : semZeroNeg(clamp2(-v)); }
 function divergenciaEfetiva(r) { return analisadoSemErro(r) && r.divergencia !== null && r.divergencia !== undefined ? 0 : r.divergencia; }
-function margemClienteEfetiva(r) { if (ehReposicao(r)) return r.divergenciaCliente; if (classifPrejuizoTotal(r)) return -(r.cobrado || 0); return zeraMargem(r) && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined ? 0 : r.divergenciaCliente; }
+function margemClienteEfetiva(r) { if (ehReposicao(r)) return r.divergenciaCliente; if (classifPrejuizoTotal(r) || classifMargemTotal(r)) return -(r.cobrado || 0); return zeraMargem(r) && r.divergenciaCliente !== null && r.divergenciaCliente !== undefined ? 0 : r.divergenciaCliente; }
 
 // ----- Filtros da tela de resultados (canal, parceiro, UF, busca livre) -----
 function normBusca(s) { return (s ?? '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase(); }
@@ -3689,6 +3690,7 @@ const LABEL_CLASSIFICACAO = {
   sem_erro: { label: 'Sem erro (antigo)', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
   sem_erro_transp: { label: 'Sem erro — Transportadora', cls: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
   sem_erro_shopee: { label: 'Sem erro — Shopee', cls: 'bg-lime-50 text-lime-700 border-lime-200' },
+  complementar_taxa: { label: 'Complemento de taxa', cls: 'bg-orange-50 text-orange-700 border-orange-200' },
 };
 function badgeOrigem(r) {
   const o = r.origemDivergente;
@@ -3808,7 +3810,7 @@ function renderTabelaResultados(lista, filtro) {
                     ? `<td class="px-4 py-3 text-right num font-semibold text-emerald-600" title="Analisado como ${rotuloClassif(r)} — diferença original ${fmtBRL(difExibida(r.divergencia))} considerada R$ 0,00">${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(difExibida(r.divergencia))}</span></td>`
                     : `<td class="px-4 py-3 text-right num font-semibold ${difExibida(r.divergencia) < -0.005 ? 'text-red-600' : 'text-emerald-600'}" ${Math.abs(r.divergencia) <= 0.05 && Math.abs(r.divergencia) >= 0.005 ? 'title="Diferença de centavos, dentro da tolerância de R$ 0,05 — o CT-e conta como conferido"' : ''}>${difExibida(r.divergencia)>0.005?'+':''}${fmtBRL(difExibida(r.divergencia))}</td>`
               ) : ''}
-              ${mostrarMargem ? (classifPrejuizoTotal(r) ? `
+              ${mostrarMargem ? ((classifPrejuizoTotal(r) || classifMargemTotal(r)) ? `
                 <td class="px-4 py-3 text-right num text-ink-700" title="${rotuloClassif(r)}: o cliente não paga esse frete">${fmtBRL(0)}</td>
                 <td class="px-4 py-3 text-right num font-semibold text-red-600" title="${rotuloClassif(r)} — prejuízo total">${fmtBRL(-(r.cobrado || 0))}</td>` : `
                 <td class="px-4 py-3 text-right num text-ink-700">${r.valorFreteCliente != null ? fmtBRL(r.valorFreteCliente) : '<span class="text-ink-300">sem NF-e</span>'}${r.qtdNotasCte > 1 ? `<div class="text-[10px] ${r.qtdNotasComFrete < r.qtdNotasCte ? 'text-amber-600 font-semibold' : 'text-ink-400'}" title="${r.qtdNotasComFrete < r.qtdNotasCte ? 'Falta o frete do cliente de alguma nota deste CT-e — importe o XML da NF-e ou a planilha' : 'Soma do frete de todas as notas do CT-e'}">${r.qtdNotasComFrete || 0}/${r.qtdNotasCte} NFs</div>` : ''}</td>
@@ -3985,6 +3987,7 @@ const CLASSIFICACOES_DIVERGENCIA = [
   { valor: 'uso_consumo', label: 'Uso e Consumo (prejuízo total)', labelCurta: 'Uso e Consumo' },
   { valor: 'sem_erro_transp', label: 'Sem erro — divergência explicada/aceitável — Transportadora (zera só a Divergência/Prejuízo)', labelCurta: 'Sem erro (Transportadora)' },
   { valor: 'sem_erro_shopee', label: 'Sem erro — divergência explicada/aceitável — Shopee (zera só a Margem)', labelCurta: 'Sem erro (Shopee)' },
+  { valor: 'complementar_taxa', label: 'Valor complementar de taxa (Divergência zerada, Margem = −valor cobrado)', labelCurta: 'Complemento de taxa' },
 ];
 // classificação antiga, não dá mais pra escolher — só continua valendo nos CT-es que já tinham
 const CLASSIF_LEGADAS = [
@@ -3995,19 +3998,21 @@ function infoClassif(v) { return CLASSIFICACOES_DIVERGENCIA.find(c => c.valor ==
 const GRUPOS_CLASSIF = [
   { titulo: 'Divergência — cobrado × calculado (tabela)', itens: ['transportadora', 'tabela', 'proposta_comercial', 'sem_erro_transp'] },
   { titulo: 'Margem — frete do cliente × cobrado', itens: ['plataforma', 'intelipost', 'transp_diferente', 'sem_erro_shopee'] },
-  { titulo: 'Outros', itens: ['full', 'redespacho', 'uso_consumo'] },
+  { titulo: 'Outros', itens: ['full', 'redespacho', 'uso_consumo', 'complementar_taxa'] },
 ];
 // zera a coluna Divergência/Prejuízo (cobrado × calculado)
-const CLASSIF_ZERA_DIVERG = ['sem_erro', 'sem_erro_transp', 'full'];
+const CLASSIF_ZERA_DIVERG = ['sem_erro', 'sem_erro_transp', 'full', 'complementar_taxa'];
+// Margem = −valor cobrado inteiro (cliente não paga esse CT-e), sem mexer na Divergência
+const CLASSIF_MARGEM_TOTAL = ['complementar_taxa'];
 // zera a coluna Margem (frete do cliente × cobrado)
 const CLASSIF_ZERA_MARGEM = ['sem_erro', 'sem_erro_shopee', 'full'];
 // só marcam que foi conferido — não aparecem nas abas de Análises
-const CLASSIF_SEM_ANALISE = ['sem_erro', 'sem_erro_transp', 'sem_erro_shopee'];
+const CLASSIF_SEM_ANALISE = ['sem_erro', 'sem_erro_transp', 'sem_erro_shopee', 'complementar_taxa'];
 // classificações em que a diferença é FRETE COBRADO pela transportadora × FRETE COBRADO DO CLIENTE
 // (não contra a tabela negociada)
 const CLASSIF_BASE_CLIENTE = ['plataforma', 'intelipost', 'transp_diferente'];
 // diferença sempre zerada (não é prejuízo nem ganho) — mesmo efeito do "Sem erro"
-const CLASSIF_ZERADA = ['sem_erro', 'sem_erro_transp', 'sem_erro_shopee', 'full'];
+const CLASSIF_ZERADA = ['sem_erro', 'sem_erro_transp', 'sem_erro_shopee', 'full', 'complementar_taxa'];
 // sempre prejuízo total (o valor cobrado inteiro), igual devolução/reposição
 const CLASSIF_PREJUIZO_TOTAL = ['redespacho', 'uso_consumo'];
 
@@ -4055,6 +4060,7 @@ function textoAvisoSemErro(cs) {
   if (cs.includes('sem_erro_transp')) p.push('<strong>Sem erro — Transportadora</strong>: a Divergência/Prejuízo (cobrado × calculado) passa a contar como <strong>R$ 0,00</strong>; a Margem continua como está');
   if (cs.includes('sem_erro_shopee')) p.push('<strong>Sem erro — Shopee</strong>: a Margem (frete do cliente × cobrado) passa a contar como <strong>R$ 0,00</strong>; a Divergência/Prejuízo continua como está');
   if (cs.includes('sem_erro')) p.push('<strong>Sem erro (antigo)</strong>: zera Divergência e Margem');
+  if (cs.includes('complementar_taxa')) p.push('<strong>Valor complementar de taxa</strong>: a Divergência/Prejuízo passa a contar como <strong>R$ 0,00</strong> e a Margem é sempre o <strong>valor cobrado inteiro, negativo</strong> (o cliente não paga esse CT-e). Não vai pra aba Análises');
   return p.join('<br>');
 }
 function classifsMarcadas(idx) { return $$(`.chk-classif-${idx}`).filter(c => c.checked).map(c => c.value); }
@@ -4129,6 +4135,10 @@ function calcularClassificacao(r, classificacao, base) {
   if (classificacao === 'sem_erro_transp') {
     out.baseComparacao = 'zerada';
     out.detalhamentoErros = `Sem erro — Transportadora: Divergência/Prejuízo considerada R$ 0,00${base.diferencaApurada ? ` (diferença apurada sem ICMS: ${fmtBRL(base.diferencaApurada)})` : ''}.`;
+  }
+  if (classificacao === 'complementar_taxa') {
+    out.baseComparacao = 'zerada';
+    out.detalhamentoErros = `Valor complementar de taxa: Divergência/Prejuízo considerada R$ 0,00${base.diferencaApurada ? ` (diferença apurada sem ICMS: ${fmtBRL(base.diferencaApurada)})` : ''}; Margem = −${fmtBRL(r.cobrado)} (cliente não paga esse CT-e).`;
   }
   if (classificacao === 'sem_erro_shopee') {
     out.baseComparacao = 'zerada';
@@ -4228,6 +4238,7 @@ function textoToastClassif(cs) {
   if (cs.some(c => CLASSIF_ZERA_DIVERG.includes(c))) p.push('Divergência/Prejuízo considerada R$ 0,00');
   if (cs.some(c => CLASSIF_ZERA_MARGEM.includes(c))) p.push('Margem considerada R$ 0,00');
   if (cs.some(c => CLASSIF_PREJUIZO_TOTAL.includes(c))) p.push('valor cobrado inteiro como prejuízo');
+  if (cs.some(c => CLASSIF_MARGEM_TOTAL.includes(c))) p.push('Margem = −valor cobrado inteiro');
   return p.length ? ' — ' + p.join('; ') : '';
 }
 
