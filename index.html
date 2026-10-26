@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-23-complemento-taxa';
+const APP_VERSION = '2026-10-26-sentido-garuva';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -243,6 +243,7 @@ const STATE = {
 // 3. UTILITÁRIOS
 // ---------------------------------------------------------------------
 const $ = (sel, root=document) => root.querySelector(sel);
+const UFS_BR = new Set(['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO']);
 const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
 const uid = () => 'id_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 const onlyDigits = (s) => (s || '').toString().replace(/\D/g, '');
@@ -2099,7 +2100,9 @@ function encontrarParceiroPorCTe(cte, parceirosTodos) {
 // Extrai UF/município da string livre de "origem" do parceiro (ex: "Garuva - SC")
 function parseOrigemParceiro(origemTexto) {
   if (!origemTexto) return { municipio: null, uf: null };
-  const partes = origemTexto.split('-').map(s => s.trim()).filter(Boolean);
+  // aceita "Garuva - SC", "Garuva/SC", "Garuva, SC" e "Garuva SC"
+  const t = origemTexto.toString().trim().replace(/\s*[\/,]\s*([A-Za-z]{2})\s*$/, ' - $1').replace(/\s+([A-Za-z]{2})$/, (m, uf) => UFS_BR.has(uf.toUpperCase()) ? ' - ' + uf : m);
+  const partes = t.split('-').map(s => s.trim()).filter(Boolean);
   if (partes.length >= 2) {
     const ufCand = partes[partes.length - 1].toUpperCase();
     if (ufCand.length === 2) return { municipio: partes.slice(0, -1).join('-').trim().toUpperCase(), uf: ufCand };
@@ -2114,6 +2117,15 @@ function parseOrigemParceiro(origemTexto) {
 // Devolução e reversa são a mesma coisa pra fins de precificação — o frete de volta
 // custa 100% do valor da mesma tabela de saída, só que consultado pelo REMETENTE (quem
 // está devolvendo), já que o "destino" do CT-e nesse caso é sempre a origem do parceiro.
+const BASE_TBX = { municipio: 'GARUVA', uf: 'SC' };
+// saída cujo início da prestação (xMunIni) não é a base — o remetente é a TBX, mas o CT-e foi emitido
+// com outra cidade de origem: erro de emissão (valida normal, só marca)
+function inicioDivergenteDaBase(cte, parceiro) {
+  if (!cte.xMunIni) return false;
+  const bases = [parseOrigemParceiro(parceiro.origem), BASE_TBX].filter(b => b.municipio);
+  const n = normalizaNomeParceiro;
+  return !bases.some(b => n(cte.xMunIni) === n(b.municipio) && (!b.uf || !cte.UFIni || cte.UFIni === b.uf));
+}
 function identificarTipoOperacao(cte, parceiro) {
   // reentrega: identificada pela observação do próprio CT-e (não tem tabela pra isso,
   // então não é calculada de jeito nenhum — só listada pra controle, como devolução era
@@ -2122,14 +2134,18 @@ function identificarTipoOperacao(cte, parceiro) {
   const textoObs = norm((cte.xObs || '') + ' ' + (cte.obsContTextos || ''));
   if (textoObs.includes('REENTREGA')) return 'reentrega';
 
-  const origem = parseOrigemParceiro(parceiro.origem);
-  if (!origem.municipio) return 'saida'; // parceiro sem origem cadastrada -> não classifica, trata como normal
+  // a base do Grupo TBX (Garuva/SC) é sempre uma ponta da tabela; além dela, vale a origem cadastrada
+  // do parceiro (ex: armazém em outra cidade). Confere o início/fim da prestação E o remetente/destinatário.
+  const bases = [parseOrigemParceiro(parceiro.origem), BASE_TBX].filter(b => b.municipio);
+  const ehBase = (mun, uf) => !!mun && bases.some(b => norm(mun) === norm(b.municipio) && (!b.uf || !uf || uf === b.uf));
+  const saiDaBase = ehBase(cte.xMunIni, cte.UFIni) || ehBase(cte.remMun, cte.remUF);
+  const chegaNaBase = ehBase(cte.xMunFim, cte.UFFim) || ehBase(cte.destMun, cte.destUF);
 
-  const iniMatch = norm(cte.xMunIni) === norm(origem.municipio) && (!origem.uf || cte.UFIni === origem.uf);
-  const fimMatch = norm(cte.xMunFim) === norm(origem.municipio) && (!origem.uf || cte.UFFim === origem.uf);
-
-  if (iniMatch) return 'saida';
-  if (fimMatch) return 'devolucao'; // volta pra origem do parceiro (devolução/reversa — tratadas como uma coisa só)
+  if (saiDaBase && !chegaNaBase) return 'saida';
+  // volta pra base (devolução/reversa — tratadas como uma coisa só): calcula pela ponta de fora (remetente)
+  if (chegaNaBase && !saiDaBase) return 'devolucao';
+  if (saiDaBase) return 'saida';
+  if (!parseOrigemParceiro(parceiro.origem).municipio) return 'saida'; // parceiro sem origem cadastrada -> trata como normal
   return 'outro';
 }
 
@@ -2152,7 +2168,7 @@ function validarLoteCtes(ctes, parceiros) {
     // origem do CT-e diferente da cadastrada (e não é devolução): erro de emissão — a cobrança
     // existe do mesmo jeito, então valida normalmente como saída e só marca o erro de origem
     let origemDivergente = null;
-    if (tipoOperacao === 'outro') {
+    if (tipoOperacao === 'outro' || (tipoOperacao === 'saida' && parseOrigemParceiro(parceiro.origem).municipio && inicioDivergenteDaBase(cte, parceiro))) {
       origemDivergente = { municipio: cte.xMunIni || '', uf: cte.UFIni || '', esperado: parceiro.origem || '' };
       tipoOperacao = 'saida';
     }
@@ -2777,6 +2793,11 @@ async function recalcularLoteAtual() {
       if (!p) { semCadastro++; return; }
       r.parceiro = p;
       const pCalc = parceiroCalculo(r); // mantém a tabela em rascunho escolhida na análise, se houver
+      // reavalia o sentido do trajeto (ex: CT-e que chega em Garuva vindo de outra cidade = devolução)
+      const tipoNovo = identificarTipoOperacao(r.cte, p);
+      if (tipoNovo === 'devolucao') { r.tipoOperacao = tipoNovo; r.origemDivergente = null; }
+      else if (tipoNovo === 'saida') { r.tipoOperacao = tipoNovo; if (!(r.cte.xMunIni && inicioDivergenteDaBase(r.cte, p))) r.origemDivergente = null; }
+      else if (tipoNovo === 'outro') { r.tipoOperacao = 'saida'; r.origemDivergente = { municipio: r.cte.xMunIni || r.cte.remMun || '', uf: r.cte.UFIni || r.cte.remUF || '', esperado: p.origem || '' }; }
       if (!indices[pCalc.id]) indices[pCalc.id] = buildAbrangenciaIndex(pCalc.abrangencia || []);
       const enderecoConsulta = r.tipoOperacao === 'devolucao' ? { uf: r.cte.remUF, cep: r.cte.remCEP } : null;
       r.calc = calcularParceiro(r.cte, pCalc, indices[pCalc.id], enderecoConsulta);
@@ -5474,7 +5495,6 @@ function colLetra(idx) {
   return s;
 }
 
-const UFS_BR = new Set(['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO']);
 // nº de colunas com conteúdo nas primeiras linhas da planilha (sem teto fixo — antes parava na 16)
 function totalColunasPlanilha(grid) {
   let max = 1;
