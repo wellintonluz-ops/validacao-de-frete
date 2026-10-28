@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-28-campo-tickets';
+const APP_VERSION = '2026-10-28-tickets-com-custas';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -1528,17 +1528,23 @@ async function lerBaseTickets(file) {
   }
   throw new Error('Não reconheci a base de tickets (colunas "Nº NF" e "Custas para transportadora").');
 }
-// marca os CT-es cuja nota (coluna "Nº NF" da base) tem ticket — marcador "Custas transportadora"
+// só gera o marcador o ticket com custas pra transportadora: "Custas devolução",
+// "Custas devolução + reenvio" ou "Reenvio" ("Sem custas adicionais" não marca)
+function ticketTemCustas(t) {
+  const c = normalizaCabecalho(t && t.custas);
+  return !!c && !c.startsWith('SEM CUSTAS') && (c.includes('CUSTAS DEVOLUCAO') || c.includes('REENVIO'));
+}
+// marca os CT-es cuja nota (coluna "Nº NF" da base) tem ticket com custas — marcador "Custas transportadora"
 function aplicarTicketsNosItens(itens, mapa) {
   let marcados = 0;
   itens.forEach(x => {
     const vistos = new Set(); const lista = [];
     numerosNFDoItem(x).forEach(n => (mapa[n] || []).forEach(t => {
-      if (vistos.has(t.id)) return; vistos.add(t.id);
+      if (!ticketTemCustas(t) || vistos.has(t.id)) return; vistos.add(t.id);
       lista.push({ id: t.id, nf: n, nfCompra: t.nfCompra, nfs: t.nfs, tipo: t.tipo, motivo: t.motivo, custas: t.custas, status: t.status, abertoEm: t.abertoEm });
     }));
     if (lista.length) { x.ticketsCustas = lista; marcados++; }
-    else if (x.ticketsCustas && Object.keys(mapa).length) delete x.ticketsCustas;
+    else delete x.ticketsCustas;
   });
   return { marcados };
 }
@@ -1553,11 +1559,10 @@ async function aplicarTicketsAoLote(v) {
   return aplicarTicketsNosItens(todos, mapa);
 }
 function badgeTickets(r) {
-  const l = r.ticketsCustas;
+  const l = (r.ticketsCustas || []).filter(ticketTemCustas); // lotes gravados antes também só mostram os com custas
   if (!l || !l.length) return '';
   const det = l.map(t => `NF ${t.nf}: ${t.custas || '—'} · ${t.tipo || '—'} · ${t.motivo || '—'} · status ${t.status || '—'}${t.abertoEm ? ' · aberto em ' + t.abertoEm.replace('T', ' ') : ''}${t.nfCompra?.length ? ' · NF de compra ' + t.nfCompra.join(', ') : ''}`).join('\n');
-  const comCusta = l.some(t => t.custas && !/^SEM CUSTAS/i.test(normalizaCabecalho(t.custas)));
-  return ` <span title="Ticket na base de tickets:\n${escapeHtml(det)}" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border whitespace-nowrap ${comCusta ? 'bg-fuchsia-50 text-fuchsia-700 border-fuchsia-300' : 'bg-violet-50 text-violet-700 border-violet-200'}">🎫 Custas transportadora${l.length > 1 ? ` (${l.length})` : ''}</span>`;
+  return ` <span title="Ticket com custas pra transportadora:\n${escapeHtml(det)}" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border whitespace-nowrap bg-fuchsia-50 text-fuchsia-700 border-fuchsia-300">🎫 Custas transportadora${l.length > 1 ? ` (${l.length})` : ''}</span>`;
 }
 async function processarBaseTickets(file, progressBoxId = 'progressNFeBox') {
   const progressBox = $('#' + progressBoxId);
@@ -1574,8 +1579,8 @@ async function processarBaseTickets(file, progressBoxId = 'progressNFeBox') {
       const { marcados } = await aplicarTicketsAoLote(v);
       renderResultadosValidacao();
       if (v.historicoId) DataLayer.substituirValidacao(v.historicoId, montarRegistroHistorico(v.nomeArquivo, v)).catch(e => console.error('[Histórico] falha ao atualizar:', e));
-      msg += ` ${marcados} CT-e(s) do lote aberto marcado(s) com "Custas transportadora".`;
-    } else msg += ' Os CT-es dessas notas vão ser marcados sozinhos quando forem validados.';
+      msg += ` ${marcados} CT-e(s) do lote aberto marcado(s) com "Custas transportadora" (só tickets com Custas devolução / Custas devolução + reenvio / Reenvio).`;
+    } else msg += ' Os CT-es das notas com custas (Custas devolução / + reenvio / Reenvio) vão ser marcados sozinhos quando forem validados.';
     esconder();
     toast(msg, 'success');
   } catch (e) {
@@ -2490,7 +2495,7 @@ function exportResultadosParaXlsx(resultados, semParceiro, parceirosEnvolvidos, 
         row.push(comp && comp.aplicavel ? comp.valor : (comp && comp.manual ? 'manual' : ''));
       });
       row.push(r.cobrado, r.calculado, difExibida(r.divergencia) ?? '', r.calc.status, r.valorFreteCliente ?? '', r.divergenciaCliente ?? '',
-        (r.ticketsCustas || []).map(t => `NF ${t.nf}: ${t.custas || ''} / ${t.tipo || ''} / ${t.motivo || ''} / ${t.status || ''}`).join(' | '));
+        (r.ticketsCustas || []).filter(ticketTemCustas).map(t => `NF ${t.nf}: ${t.custas || ''} / ${t.tipo || ''} / ${t.motivo || ''} / ${t.status || ''}`).join(' | '));
       linhasDetalhe.push(row);
     });
 
@@ -2814,7 +2819,7 @@ function renderValidar() {
           <input type="file" id="folderTickets" webkitdirectory directory multiple class="hidden">
           <div class="text-3xl mb-1">🎫</div>
           <div class="text-sm font-medium text-ink-700">Relatório de Tickets (custas transportadora)</div>
-          <div class="text-xs text-ink-400 mt-1">Arraste aqui o <strong>Ticket - ….xlsx</strong>. Fica salvo sem duplicar, e os CT-es das notas da coluna "Nº NF" ganham o marcador "Custas transportadora" — agora ou quando forem validados.</div>
+          <div class="text-xs text-ink-400 mt-1">Arraste aqui o <strong>Ticket - ….xlsx</strong>. Fica salvo sem duplicar, e os CT-es das notas da coluna "Nº NF" com <strong>Custas devolução</strong>, <strong>Custas devolução + reenvio</strong> ou <strong>Reenvio</strong> ganham o marcador "Custas transportadora" — agora ou quando forem validados.</div>
           <div class="flex items-center justify-center gap-2 mt-4">
             <button type="button" data-acao="arquivos" data-alvo="tickets" class="btn-upload px-3 py-1.5 rounded-lg border border-ink-200 bg-white text-xs font-medium text-ink-700 hover:border-violet-400 hover:text-violet-700">Selecionar relatório (Excel)</button>
           </div>
@@ -3614,7 +3619,7 @@ function passaFiltrosResultado(x, f, ehSemParceiro) {
   if (f.parceiro && parceiroNome !== f.parceiro) return false;
   if (f.uf && (cte.destUF || '') !== f.uf) return false;
   if (f.busca) {
-    const alvo = normBusca([x.origemDivergente ? 'ORIGEM DIVERGENTE ERRO DE ORIGEM' : '', x.ticketsCustas && x.ticketsCustas.length ? 'CUSTAS TRANSPORTADORA TICKET ' + x.ticketsCustas.map(t => [t.custas, t.motivo, t.tipo, t.status].join(' ')).join(' ') : '', cte.nCT, cte.destMun, cte.destUF, ...(cte.notasFiscais || []).map(n => n.numero), x.pedido, canal, parceiroNome, ehSemParceiro ? cte.emitNome : ''].join(' '));
+    const alvo = normBusca([x.origemDivergente ? 'ORIGEM DIVERGENTE ERRO DE ORIGEM' : '', (x.ticketsCustas || []).some(ticketTemCustas) ? 'CUSTAS TRANSPORTADORA TICKET ' + x.ticketsCustas.filter(ticketTemCustas).map(t => [t.custas, t.motivo, t.tipo, t.status].join(' ')).join(' ') : '', cte.nCT, cte.destMun, cte.destUF, ...(cte.notasFiscais || []).map(n => n.numero), x.pedido, canal, parceiroNome, ehSemParceiro ? cte.emitNome : ''].join(' '));
     if (!normBusca(f.busca).trim().split(/\s+/).every(t => alvo.includes(t))) return false;
   }
   return true;
@@ -3721,7 +3726,7 @@ function renderResultadosValidacao() {
     <div class="flex items-center justify-between mb-4">
       <div class="text-sm text-ink-500">
         <span class="font-medium text-ink-800">${escapeHtml(nomeArquivo)}</span> ·
-        ${resultados.length} CT-e(s) validado(s)${devolucoes.length ? ` (${devolucoes.length} devolução)` : ''}${(() => { const q = resultados.filter(r => r.origemDivergente).length; return q ? ` · <span class="text-orange-700" title="Digite &quot;origem&quot; na busca pra ver só esses">${q} com erro de origem (validados normalmente)</span>` : ''; })()}${(() => { const q = resultados.filter(r => r.ticketsCustas && r.ticketsCustas.length).length; return q ? ` · <span class="text-violet-700" title="Digite &quot;custas&quot; na busca pra ver só esses">🎫 ${q} com ticket (custas transportadora)</span>` : ''; })()}${semParceiro.length ? ` · ${semParceiro.length} sem parceiro cadastrado` : ''}${outrosFluxos.length ? ` · ${outrosFluxos.length} trajeto atípico` : ''}${reentregas.length ? ` · ${reentregas.length} reentrega` : ''}${nfeImportada ? ` · ${comNfe.length} com nota fiscal casada` : ''}${duplicadosIgnorados ? ` · <span class="text-amber-600">${duplicadosIgnorados} duplicado(s) ignorado(s)</span>` : ''}
+        ${resultados.length} CT-e(s) validado(s)${devolucoes.length ? ` (${devolucoes.length} devolução)` : ''}${(() => { const q = resultados.filter(r => r.origemDivergente).length; return q ? ` · <span class="text-orange-700" title="Digite &quot;origem&quot; na busca pra ver só esses">${q} com erro de origem (validados normalmente)</span>` : ''; })()}${(() => { const q = resultados.filter(r => (r.ticketsCustas || []).some(ticketTemCustas)).length; return q ? ` · <span class="text-violet-700" title="Digite &quot;custas&quot; na busca pra ver só esses">🎫 ${q} com ticket (custas transportadora)</span>` : ''; })()}${semParceiro.length ? ` · ${semParceiro.length} sem parceiro cadastrado` : ''}${outrosFluxos.length ? ` · ${outrosFluxos.length} trajeto atípico` : ''}${reentregas.length ? ` · ${reentregas.length} reentrega` : ''}${nfeImportada ? ` · ${comNfe.length} com nota fiscal casada` : ''}${duplicadosIgnorados ? ` · <span class="text-amber-600">${duplicadosIgnorados} duplicado(s) ignorado(s)</span>` : ''}
       </div>
       <div class="flex items-center gap-4">
         ${vAtual.historicoId
@@ -4741,7 +4746,7 @@ function abrirDetalheCte(idx) {
     else if (r.nfeVinculada) partes.push(`Nota do cliente casada: NF ${escapeHtml(r.nfeVinculada.nNF || '')} (${r.nfeVinculada.fonte === 'planilha' ? 'planilha Excel' : 'XML da NF-e'})`);
     else partes.push('Nenhuma nota do cliente (XML ou planilha) casada com este CT-e ainda');
     partes.push(r.reposicao ? `<strong class="text-amber-700">REPOSIÇÃO</strong> — ${escapeHtml(r.obsFluxo || 'FLUXO')}` : '"FLUXO"/"REPOSIÇÃO" não encontrado nas observações da nota/CT-e');
-    const tks = (r.ticketsCustas || []).map(t => `<div class="mt-1 text-violet-800">🎫 <strong>Custas transportadora</strong> — NF ${escapeHtml(t.nf)}: ${escapeHtml(t.custas || '—')} · ${escapeHtml(t.tipo || '—')} · ${escapeHtml(t.motivo || '—')} · status ${escapeHtml(t.status || '—')}${t.abertoEm ? ' · aberto em ' + escapeHtml(t.abertoEm.replace('T', ' ')) : ''}${t.nfCompra?.length ? ' · NF de compra ' + escapeHtml(t.nfCompra.join(', ')) : ''}</div>`).join('');
+    const tks = (r.ticketsCustas || []).filter(ticketTemCustas).map(t => `<div class="mt-1 text-violet-800">🎫 <strong>Custas transportadora</strong> — NF ${escapeHtml(t.nf)}: ${escapeHtml(t.custas || '—')} · ${escapeHtml(t.tipo || '—')} · ${escapeHtml(t.motivo || '—')} · status ${escapeHtml(t.status || '—')}${t.abertoEm ? ' · aberto em ' + escapeHtml(t.abertoEm.replace('T', ' ')) : ''}${t.nfCompra?.length ? ' · NF de compra ' + escapeHtml(t.nfCompra.join(', ')) : ''}</div>`).join('');
     return `<div class="mt-1.5 text-[11px] text-ink-400 bg-ink-50 border border-ink-200 rounded-lg px-2.5 py-1.5">${partes.join(' · ')}${tks}</div>`;
   })();
   const avisoReconciliacao = reconciliacao.temPendencia ? `
