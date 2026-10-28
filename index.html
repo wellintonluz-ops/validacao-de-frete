@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-26-sentido-garuva';
+const APP_VERSION = '2026-10-28-base-tickets';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -760,6 +760,81 @@ const DataLayer = {
       (STATE._baldesPlanilha = STATE._baldesPlanilha || {})[idBalde] = atuais; // já fica em cache pra casar sem ler de novo
     }
     return { novas, jaExistiam };
+  },
+  // Base de tickets (devoluções/reenvios/custas): baldes de 500 notas pelo nº da NF da coluna "Nº NF",
+  // cada nota com a lista dos tickets dela. Ticket repetido (mesma NF de compra + NFs + data de abertura)
+  // não vira registro novo — só atualiza status/custas se mudaram.
+  _baldeTicket(n) { return 't' + Math.floor(parseInt(n, 10) / 500); },
+  async salvarTickets(tickets, origem) {
+    const agora = new Date().toISOString();
+    const porBalde = {};
+    tickets.forEach(t => {
+      const alvos = t.nfs.length ? t.nfs.map(nf => [this._baldeTicket(nf), nf]) : [['sem_nf', '_']];
+      alvos.forEach(([b, nf]) => { ((porBalde[b] = porBalde[b] || {})[nf] = porBalde[b][nf] || []).push(t); });
+    });
+    const novos = new Set(), atualizados = new Set(), jaExistiam = new Set();
+    const camposMutaveis = ['status', 'custas', 'motivo', 'tipo', 'nfdRetorno', 'criadoPor'];
+    const mesclar = (atuais) => {
+      let mudou = false;
+      return { mudou: () => mudou, aplica: (nf, t) => {
+        const lista = atuais[nf] = atuais[nf] || [];
+        const ex = lista.find(x => x.id === t.id);
+        if (!ex) { lista.push({ ...t, arquivoOrigem: origem, importadoEm: agora }); novos.add(t.id); mudou = true; return; }
+        const dif = camposMutaveis.filter(c => (t[c] ?? null) !== (ex[c] ?? null));
+        if (dif.length) { dif.forEach(c => { ex[c] = t[c] ?? null; }); ex.atualizadoEm = agora; atualizados.add(t.id); mudou = true; }
+        else jaExistiam.add(t.id);
+      } };
+    };
+    if (OFFLINE_MODE) {
+      const data = localDB_read();
+      data.ticketsNotas = data.ticketsNotas || {};
+      Object.entries(porBalde).forEach(([b, notas]) => {
+        const atuais = data.ticketsNotas[b] = data.ticketsNotas[b] || {};
+        const m = mesclar(atuais);
+        Object.entries(notas).forEach(([nf, ts]) => ts.forEach(t => m.aplica(nf, t)));
+      });
+      localDB_write(data);
+    } else {
+      const cache = STATE._baldesTickets = STATE._baldesTickets || {};
+      const ids = Object.keys(porBalde);
+      let i = 0;
+      const worker = async () => {
+        while (i < ids.length) {
+          const b = ids[i++];
+          const ref = db.collection('ticketsNotas').doc(b);
+          const doc = await comTimeout(ref.get(), 30000, 'ler a base de tickets');
+          const atuais = doc.exists ? JSON.parse(doc.data().dados || '{}') : {};
+          const m = mesclar(atuais);
+          Object.entries(porBalde[b]).forEach(([nf, ts]) => ts.forEach(t => m.aplica(nf, t)));
+          if (m.mudou()) await comTimeout(ref.set({ dados: JSON.stringify(atuais), qtd: Object.keys(atuais).length, atualizadoEm: agora }), 30000, 'salvar a base de tickets');
+          cache[b] = atuais;
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(6, ids.length) }, worker));
+    }
+    atualizados.forEach(id => { novos.delete(id); jaExistiam.delete(id); });
+    novos.forEach(id => jaExistiam.delete(id));
+    return { novos: novos.size, atualizados: atualizados.size, jaExistiam: jaExistiam.size };
+  },
+  async buscarTickets(numeros) {
+    const unicos = Array.from(new Set((numeros || []).filter(Boolean)));
+    if (!unicos.length) return {};
+    let fonte;
+    if (OFFLINE_MODE) fonte = localDB_read().ticketsNotas || {};
+    else {
+      const cache = STATE._baldesTickets = STATE._baldesTickets || {};
+      const faltam = Array.from(new Set(unicos.map(n => this._baldeTicket(n)))).filter(b => !(b in cache));
+      for (let i = 0; i < faltam.length; i += 30) {
+        const chunk = faltam.slice(i, i + 30);
+        const snap = await db.collection('ticketsNotas').where(firebase.firestore.FieldPath.documentId(), 'in', chunk).get();
+        chunk.forEach(b => { cache[b] = {}; });
+        snap.docs.forEach(d => { cache[d.id] = JSON.parse(d.data().dados || '{}'); });
+      }
+      fonte = cache;
+    }
+    const out = {};
+    unicos.forEach(n => { const b = fonte[this._baldeTicket(n)]; if (b && b[n] && b[n].length) out[n] = b[n]; });
+    return out;
   },
   async buscarPlanilhaNotas(numeros) {
     const unicos = Array.from(new Set((numeros || []).filter(Boolean)));
@@ -1388,6 +1463,128 @@ function detectarColunasPlanilhaNotas(headerVals) {
 }
 
 // Lê a planilha e agrupa por nota: { "962663": { canal, frete, valorNF, pedido, cidade, uf, itens:[{cProd,qCom}] } }
+// ----- Base de tickets (Ticket - ….xlsx): NF de compra, Tipo NF, Nº NF, Motivos, Custas, Status… -----
+// número de NF da base de tickets: vem como "956428,00" e às vezes várias separadas por ";"
+function nfsDaCelulaTicket(v) {
+  if (v === null || v === undefined) return [];
+  return Array.from(new Set(String(v).split(/[;|\/]+/).map(t => normNumeroNF(t.trim().replace(/[.,]0+$/, ''))).filter(Boolean)));
+}
+function colunasBaseTickets(headerRow) {
+  const h = (headerRow || []).map(v => normalizaCabecalho(v).replace(/\*/g, '').trim());
+  const acha = (pred) => h.findIndex(pred);
+  const cols = {
+    nfCompra: acha(x => x.includes('NF DE COMPRA')),
+    tipo: acha(x => x.startsWith('TIPO NF') || x === 'TIPO'),
+    nfs: acha(x => /^N\S{0,2} ?NF$|^NUMERO( DA)? NF$|^NF$/.test(x)),
+    motivo: acha(x => x.startsWith('MOTIVO')),
+    custas: acha(x => x.includes('CUSTAS')),
+    status: acha(x => x === 'STATUS'),
+    abertoEm: acha(x => x.startsWith('ABERTO')),
+    criadoPor: acha(x => x.startsWith('CRIADO')),
+    nfdRetorno: acha(x => x.includes('NFD COM RETORNO')),
+  };
+  return cols;
+}
+function ehGridBaseTickets(grid) {
+  for (let r = 0; r < Math.min(grid.length, 10); r++) {
+    const c = colunasBaseTickets(grid[r]);
+    if (c.nfs >= 0 && (c.custas >= 0 || (c.nfCompra >= 0 && c.motivo >= 0))) return r;
+  }
+  return -1;
+}
+async function ehPlanilhaTickets(file) {
+  try { const wb = await readWorkbookFile(file); return wb.SheetNames.some(n => ehGridBaseTickets(sheetToGrid(wb, n)) >= 0); } catch { return false; }
+}
+function dataTicket(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (typeof v === 'number') { const d = new Date(Math.round((v - 25569) * 86400000)); return isNaN(d) ? String(v) : d.toISOString().slice(0, 16); }
+  return String(v).trim();
+}
+async function lerBaseTickets(file) {
+  const wb = await readWorkbookFile(file);
+  for (const nome of wb.SheetNames) {
+    const grid = sheetToGrid(wb, nome);
+    const hr = ehGridBaseTickets(grid);
+    if (hr < 0) continue;
+    const cols = colunasBaseTickets(grid[hr]);
+    const txt = (row, c) => { if (c < 0) return null; const v = row[c]; return v === null || v === undefined ? null : (String(v).trim() || null); };
+    const tickets = []; const vistos = new Set(); let linhas = 0, repetidasNoArquivo = 0;
+    for (let r = hr + 1; r < grid.length; r++) {
+      const row = grid[r] || [];
+      if (row.every(v => v === null || v === undefined || v === '')) continue;
+      linhas++;
+      const t = {
+        nfCompra: nfsDaCelulaTicket(cols.nfCompra >= 0 ? row[cols.nfCompra] : null),
+        tipo: txt(row, cols.tipo), nfs: nfsDaCelulaTicket(cols.nfs >= 0 ? row[cols.nfs] : null),
+        motivo: txt(row, cols.motivo), custas: txt(row, cols.custas), status: txt(row, cols.status),
+        abertoEm: dataTicket(cols.abertoEm >= 0 ? row[cols.abertoEm] : null), criadoPor: txt(row, cols.criadoPor), nfdRetorno: txt(row, cols.nfdRetorno),
+      };
+      t.id = `${t.nfCompra.join('-')}|${t.nfs.join('-')}|${t.abertoEm || ''}`;
+      if (vistos.has(t.id)) { repetidasNoArquivo++; continue; }
+      vistos.add(t.id);
+      tickets.push(t);
+    }
+    return { tickets, linhas, aba: nome, repetidasNoArquivo };
+  }
+  throw new Error('Não reconheci a base de tickets (colunas "Nº NF" e "Custas para transportadora").');
+}
+// marca os CT-es cuja nota (coluna "Nº NF" da base) tem ticket — marcador "Custas transportadora"
+function aplicarTicketsNosItens(itens, mapa) {
+  let marcados = 0;
+  itens.forEach(x => {
+    const vistos = new Set(); const lista = [];
+    numerosNFDoItem(x).forEach(n => (mapa[n] || []).forEach(t => {
+      if (vistos.has(t.id)) return; vistos.add(t.id);
+      lista.push({ id: t.id, nf: n, nfCompra: t.nfCompra, nfs: t.nfs, tipo: t.tipo, motivo: t.motivo, custas: t.custas, status: t.status, abertoEm: t.abertoEm });
+    }));
+    if (lista.length) { x.ticketsCustas = lista; marcados++; }
+    else if (x.ticketsCustas && Object.keys(mapa).length) delete x.ticketsCustas;
+  });
+  return { marcados };
+}
+async function aplicarTicketsAoLote(v) {
+  if (!v) return { marcados: 0 };
+  const todos = [...(v.resultados || []), ...(v.reentregas || []), ...(v.outrosFluxos || [])];
+  const numeros = Array.from(new Set(todos.flatMap(numerosNFDoItem)));
+  if (!numeros.length) return { marcados: 0 };
+  const mapa = await DataLayer.buscarTickets(numeros).catch(e => { console.error('[Tickets] falha ao buscar:', e); return null; });
+  if (!mapa) return { marcados: 0 };
+  todos.forEach(x => { if (!numerosNFDoItem(x).some(n => mapa[n])) delete x.ticketsCustas; });
+  return aplicarTicketsNosItens(todos, mapa);
+}
+function badgeTickets(r) {
+  const l = r.ticketsCustas;
+  if (!l || !l.length) return '';
+  const det = l.map(t => `NF ${t.nf}: ${t.custas || '—'} · ${t.tipo || '—'} · ${t.motivo || '—'} · status ${t.status || '—'}${t.abertoEm ? ' · aberto em ' + t.abertoEm.replace('T', ' ') : ''}${t.nfCompra?.length ? ' · NF de compra ' + t.nfCompra.join(', ') : ''}`).join('\n');
+  const comCusta = l.some(t => t.custas && !/^SEM CUSTAS/i.test(normalizaCabecalho(t.custas)));
+  return ` <span title="Ticket na base de tickets:\n${escapeHtml(det)}" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border whitespace-nowrap ${comCusta ? 'bg-fuchsia-50 text-fuchsia-700 border-fuchsia-300' : 'bg-violet-50 text-violet-700 border-violet-200'}">🎫 Custas transportadora${l.length > 1 ? ` (${l.length})` : ''}</span>`;
+}
+async function processarBaseTickets(file, progressBoxId = 'progressNFeBox') {
+  const progressBox = $('#' + progressBoxId);
+  if (progressBox) { progressBox.classList.remove('hidden'); progressBox.textContent = 'Lendo base de tickets…'; }
+  const esconder = () => progressBox && progressBox.classList.add('hidden');
+  try {
+    const { tickets, linhas, aba, repetidasNoArquivo } = await lerBaseTickets(file);
+    if (!tickets.length) { esconder(); toast('Nenhum ticket encontrado na planilha.', 'error'); return; }
+    if (progressBox) progressBox.textContent = `Guardando ${tickets.length} ticket(s)…`;
+    const { novos, atualizados, jaExistiam } = await DataLayer.salvarTickets(tickets, file.name);
+    let msg = `Base de tickets "${aba}": ${linhas} linha(s) — ${novos} ticket(s) novo(s) salvo(s)${atualizados ? `, ${atualizados} já existiam e tiveram status/custas atualizados` : ''}${jaExistiam ? `, ${jaExistiam} já existiam (sem duplicar)` : ''}${repetidasNoArquivo ? `, ${repetidasNoArquivo} linha(s) repetida(s) no próprio arquivo ignorada(s)` : ''}.`;
+    const v = STATE.ultimaValidacao;
+    if (v && v.resultados?.length) {
+      const { marcados } = await aplicarTicketsAoLote(v);
+      renderResultadosValidacao();
+      if (v.historicoId) DataLayer.substituirValidacao(v.historicoId, montarRegistroHistorico(v.nomeArquivo, v)).catch(e => console.error('[Histórico] falha ao atualizar:', e));
+      msg += ` ${marcados} CT-e(s) do lote aberto marcado(s) com "Custas transportadora".`;
+    } else msg += ' Os CT-es dessas notas vão ser marcados sozinhos quando forem validados.';
+    esconder();
+    toast(msg, 'success');
+  } catch (e) {
+    console.error(e);
+    esconder();
+    toast(mensagemErroFirebase ? mensagemErroFirebase(e, 'importar a base de tickets') : 'Erro ao ler a base de tickets: ' + (e.message || e), 'error');
+  }
+}
+
 async function lerPlanilhaNotas(file) {
   const wb = await readWorkbookFile(file);
   let melhor = null;
@@ -1503,7 +1700,9 @@ async function aplicarPlanilhaAoLote(v) {
   const numeros = Array.from(new Set(todos.flatMap(numerosNFDoItem)));
   if (!numeros.length) return { comCanal: 0, freteDaPlanilha: 0 };
   const mapa = await DataLayer.buscarPlanilhaNotas(numeros).catch(e => { console.error('[Planilha de notas] falha ao buscar:', e); return {}; });
-  return aplicarPlanilhaNosItens(todos, mapa);
+  const res = aplicarPlanilhaNosItens(todos, mapa);
+  await aplicarTicketsAoLote(v).catch(e => console.error('[Tickets]', e)); // marcador "Custas transportadora"
+  return res;
 }
 
 // Cruza os resultados já validados com as notas fiscais importadas, pela CHAVE da NF-e
@@ -2271,7 +2470,7 @@ function exportResultadosParaXlsx(resultados, semParceiro, parceirosEnvolvidos, 
   resultados.forEach(r => r.calc.componentes.forEach(c => nomesRegras.add(c.nome)));
   const listaRegras = Array.from(nomesRegras);
   listaRegras.forEach(n => { headerDetalhe.push(`${n} Cobrado`, `${n} Calculado`); });
-  headerDetalhe.push('TOTAL Cobrado (R$)', 'TOTAL Calculado (R$)', 'Divergência (calculado − cobrado) (R$)', 'Status', 'Frete Cliente (NF-e) (R$)', 'Margem Cliente x Transportadora (R$)');
+  headerDetalhe.push('TOTAL Cobrado (R$)', 'TOTAL Calculado (R$)', 'Divergência (calculado − cobrado) (R$)', 'Status', 'Frete Cliente (NF-e) (R$)', 'Margem Cliente x Transportadora (R$)', 'Ticket — custas transportadora');
 
   const linhasDetalhe = [headerDetalhe];
   resultados
@@ -2290,7 +2489,8 @@ function exportResultadosParaXlsx(resultados, semParceiro, parceirosEnvolvidos, 
         row.push(achado.valor !== undefined ? achado.valor : '');
         row.push(comp && comp.aplicavel ? comp.valor : (comp && comp.manual ? 'manual' : ''));
       });
-      row.push(r.cobrado, r.calculado, difExibida(r.divergencia) ?? '', r.calc.status, r.valorFreteCliente ?? '', r.divergenciaCliente ?? '');
+      row.push(r.cobrado, r.calculado, difExibida(r.divergencia) ?? '', r.calc.status, r.valorFreteCliente ?? '', r.divergenciaCliente ?? '',
+        (r.ticketsCustas || []).map(t => `NF ${t.nf}: ${t.custas || ''} / ${t.tipo || ''} / ${t.motivo || ''} / ${t.status || ''}`).join(' | '));
       linhasDetalhe.push(row);
     });
 
@@ -2601,7 +2801,7 @@ function renderValidar() {
           <input type="file" id="folderNFe" webkitdirectory directory multiple class="hidden">
           <svg class="w-9 h-9 mx-auto text-ink-300 mb-2" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
           <div class="text-sm font-medium text-ink-700">Notas Fiscais (frete do cliente)</div>
-          <div class="text-xs text-ink-400 mt-1">Arraste aqui o .zip, os XMLs, a pasta inteira <strong>ou a planilha Excel das notas</strong> (NF, Canal, Frete da NF…) — pode subir a qualquer momento, mesmo antes de validar CT-es. Fica salvo e casa sozinho depois.</div>
+          <div class="text-xs text-ink-400 mt-1">Arraste aqui o .zip, os XMLs, a pasta inteira <strong>ou a planilha Excel das notas</strong> (NF, Canal, Frete da NF…) <strong>e a base de tickets</strong> (Ticket - ….xlsx) — pode subir a qualquer momento, mesmo antes de validar CT-es. Fica salvo e casa sozinho depois.</div>
           <div class="flex items-center justify-center gap-2 mt-4">
             <button type="button" data-acao="arquivos" data-alvo="nfe" class="btn-upload px-3 py-1.5 rounded-lg border border-ink-200 bg-white text-xs font-medium text-ink-700 hover:border-purple-400 hover:text-purple-700">Selecionar arquivos (.zip, .xml ou Excel)</button>
             <button type="button" data-acao="pasta" data-alvo="nfe" class="btn-upload px-3 py-1.5 rounded-lg border border-ink-200 bg-white text-xs font-medium text-ink-700 hover:border-purple-400 hover:text-purple-700">Selecionar pasta</button>
@@ -2681,6 +2881,7 @@ function trimResultadoParaHistorico(r) {
     divergencia: r.divergencia,
     tipoOperacao: r.tipoOperacao,
     origemDivergente: r.origemDivergente || null,
+    ticketsCustas: r.ticketsCustas || null,
     valorFreteCliente: r.valorFreteCliente,
     divergenciaCliente: r.divergenciaCliente,
     nfeVinculada: r.nfeVinculada,
@@ -3316,7 +3517,10 @@ function processarArquivosNotas(arquivos, progressBoxId) {
   const xmls = arquivos.filter(f => !/\.(xlsx|xls|xlsm|csv)$/i.test(f.name));
   (async () => {
     if (xmls.length) await processarNotasFiscais(xmls, progressBoxId);
-    for (const pl of planilhas) await processarPlanilhaNotas(pl, progressBoxId);
+    for (const pl of planilhas) {
+      if (await ehPlanilhaTickets(pl)) await processarBaseTickets(pl, progressBoxId);
+      else await processarPlanilhaNotas(pl, progressBoxId);
+    }
   })();
 }
 
@@ -3387,7 +3591,7 @@ function passaFiltrosResultado(x, f, ehSemParceiro) {
   if (f.parceiro && parceiroNome !== f.parceiro) return false;
   if (f.uf && (cte.destUF || '') !== f.uf) return false;
   if (f.busca) {
-    const alvo = normBusca([x.origemDivergente ? 'ORIGEM DIVERGENTE ERRO DE ORIGEM' : '', cte.nCT, cte.destMun, cte.destUF, ...(cte.notasFiscais || []).map(n => n.numero), x.pedido, canal, parceiroNome, ehSemParceiro ? cte.emitNome : ''].join(' '));
+    const alvo = normBusca([x.origemDivergente ? 'ORIGEM DIVERGENTE ERRO DE ORIGEM' : '', x.ticketsCustas && x.ticketsCustas.length ? 'CUSTAS TRANSPORTADORA TICKET ' + x.ticketsCustas.map(t => [t.custas, t.motivo, t.tipo, t.status].join(' ')).join(' ') : '', cte.nCT, cte.destMun, cte.destUF, ...(cte.notasFiscais || []).map(n => n.numero), x.pedido, canal, parceiroNome, ehSemParceiro ? cte.emitNome : ''].join(' '));
     if (!normBusca(f.busca).trim().split(/\s+/).every(t => alvo.includes(t))) return false;
   }
   return true;
@@ -3494,7 +3698,7 @@ function renderResultadosValidacao() {
     <div class="flex items-center justify-between mb-4">
       <div class="text-sm text-ink-500">
         <span class="font-medium text-ink-800">${escapeHtml(nomeArquivo)}</span> ·
-        ${resultados.length} CT-e(s) validado(s)${devolucoes.length ? ` (${devolucoes.length} devolução)` : ''}${(() => { const q = resultados.filter(r => r.origemDivergente).length; return q ? ` · <span class="text-orange-700" title="Digite &quot;origem&quot; na busca pra ver só esses">${q} com erro de origem (validados normalmente)</span>` : ''; })()}${semParceiro.length ? ` · ${semParceiro.length} sem parceiro cadastrado` : ''}${outrosFluxos.length ? ` · ${outrosFluxos.length} trajeto atípico` : ''}${reentregas.length ? ` · ${reentregas.length} reentrega` : ''}${nfeImportada ? ` · ${comNfe.length} com nota fiscal casada` : ''}${duplicadosIgnorados ? ` · <span class="text-amber-600">${duplicadosIgnorados} duplicado(s) ignorado(s)</span>` : ''}
+        ${resultados.length} CT-e(s) validado(s)${devolucoes.length ? ` (${devolucoes.length} devolução)` : ''}${(() => { const q = resultados.filter(r => r.origemDivergente).length; return q ? ` · <span class="text-orange-700" title="Digite &quot;origem&quot; na busca pra ver só esses">${q} com erro de origem (validados normalmente)</span>` : ''; })()}${(() => { const q = resultados.filter(r => r.ticketsCustas && r.ticketsCustas.length).length; return q ? ` · <span class="text-violet-700" title="Digite &quot;custas&quot; na busca pra ver só esses">🎫 ${q} com ticket (custas transportadora)</span>` : ''; })()}${semParceiro.length ? ` · ${semParceiro.length} sem parceiro cadastrado` : ''}${outrosFluxos.length ? ` · ${outrosFluxos.length} trajeto atípico` : ''}${reentregas.length ? ` · ${reentregas.length} reentrega` : ''}${nfeImportada ? ` · ${comNfe.length} com nota fiscal casada` : ''}${duplicadosIgnorados ? ` · <span class="text-amber-600">${duplicadosIgnorados} duplicado(s) ignorado(s)</span>` : ''}
       </div>
       <div class="flex items-center gap-4">
         ${vAtual.historicoId
@@ -3837,7 +4041,7 @@ function renderTabelaResultados(lista, filtro) {
                 <td class="px-4 py-3 text-right num text-ink-700">${r.valorFreteCliente != null ? fmtBRL(r.valorFreteCliente) : '<span class="text-ink-300">sem NF-e</span>'}${r.qtdNotasCte > 1 ? `<div class="text-[10px] ${r.qtdNotasComFrete < r.qtdNotasCte ? 'text-amber-600 font-semibold' : 'text-ink-400'}" title="${r.qtdNotasComFrete < r.qtdNotasCte ? 'Falta o frete do cliente de alguma nota deste CT-e — importe o XML da NF-e ou a planilha' : 'Soma do frete de todas as notas do CT-e'}">${r.qtdNotasComFrete || 0}/${r.qtdNotasCte} NFs</div>` : ''}</td>
                 <td class="px-4 py-3 text-right num font-semibold ${r.divergenciaCliente == null ? 'text-ink-300' : margemClienteEfetiva(r) < 0 ? 'text-red-600' : 'text-emerald-600'}" ${zeraMargem(r) && r.divergenciaCliente ? `title="Analisado como ${rotuloClassif(r)} — margem original ${fmtBRL(r.divergenciaCliente)} considerada R$ 0,00"` : ''}>${r.divergenciaCliente != null ? (zeraMargem(r) && r.divergenciaCliente ? `${fmtBRL(0)} <span class="line-through text-ink-300 font-normal text-[11px]">${fmtBRL(r.divergenciaCliente)}</span>` : (r.divergenciaCliente>0?'+':'') + fmtBRL(r.divergenciaCliente)) : '—'}</td>
               `) : ''}
-              <td class="px-4 py-3">${r.tabelaAlternativa ? `<span title="Calculado com a tabela em rascunho: ${escapeHtml(r.tabelaAlternativa.nome)}" class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full border bg-amber-50 text-amber-700 border-amber-200 mr-1">TABELA ANTIGA</span>` : ''}${statusBadge(r.calc.status)}${calcularReconciliacaoXml(r).temPendencia ? ' <span title="Existe cobrança no XML que nenhuma regra cadastrada reconhece" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border bg-red-50 text-red-700 border-red-200">$ não cadastrado</span>' : ''}${badgeAnalise(r)}</td>
+              <td class="px-4 py-3">${r.tabelaAlternativa ? `<span title="Calculado com a tabela em rascunho: ${escapeHtml(r.tabelaAlternativa.nome)}" class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full border bg-amber-50 text-amber-700 border-amber-200 mr-1">TABELA ANTIGA</span>` : ''}${statusBadge(r.calc.status)}${calcularReconciliacaoXml(r).temPendencia ? ' <span title="Existe cobrança no XML que nenhuma regra cadastrada reconhece" class="text-[11px] font-medium px-1.5 py-0.5 rounded-full border bg-red-50 text-red-700 border-red-200">$ não cadastrado</span>' : ''}${badgeAnalise(r)}${badgeTickets(r)}</td>
               <td class="px-4 py-3 text-right">
                 <button onclick="abrirDetalheCte(${resultadoIndexGlobal(r)})" class="text-xs text-brand-600 hover:text-brand-700 font-medium">Detalhes</button>
               </td>
@@ -4506,7 +4710,8 @@ function abrirDetalheCte(idx) {
     else if (r.nfeVinculada) partes.push(`Nota do cliente casada: NF ${escapeHtml(r.nfeVinculada.nNF || '')} (${r.nfeVinculada.fonte === 'planilha' ? 'planilha Excel' : 'XML da NF-e'})`);
     else partes.push('Nenhuma nota do cliente (XML ou planilha) casada com este CT-e ainda');
     partes.push(r.reposicao ? `<strong class="text-amber-700">REPOSIÇÃO</strong> — ${escapeHtml(r.obsFluxo || 'FLUXO')}` : '"FLUXO"/"REPOSIÇÃO" não encontrado nas observações da nota/CT-e');
-    return `<div class="mt-1.5 text-[11px] text-ink-400 bg-ink-50 border border-ink-200 rounded-lg px-2.5 py-1.5">${partes.join(' · ')}</div>`;
+    const tks = (r.ticketsCustas || []).map(t => `<div class="mt-1 text-violet-800">🎫 <strong>Custas transportadora</strong> — NF ${escapeHtml(t.nf)}: ${escapeHtml(t.custas || '—')} · ${escapeHtml(t.tipo || '—')} · ${escapeHtml(t.motivo || '—')} · status ${escapeHtml(t.status || '—')}${t.abertoEm ? ' · aberto em ' + escapeHtml(t.abertoEm.replace('T', ' ')) : ''}${t.nfCompra?.length ? ' · NF de compra ' + escapeHtml(t.nfCompra.join(', ')) : ''}</div>`).join('');
+    return `<div class="mt-1.5 text-[11px] text-ink-400 bg-ink-50 border border-ink-200 rounded-lg px-2.5 py-1.5">${partes.join(' · ')}${tks}</div>`;
   })();
   const avisoReconciliacao = reconciliacao.temPendencia ? `
     <div class="mt-3 text-xs px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200">
