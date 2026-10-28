@@ -201,7 +201,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-28-base-tickets';
+const APP_VERSION = '2026-10-28-campo-tickets';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -2780,7 +2780,7 @@ function renderValidar() {
 
     <div id="boxFatura" class="mb-4"></div>
 
-    <div class="grid grid-cols-2 gap-4">
+    <div class="grid grid-cols-3 gap-4">
       <div>
         <div id="uploadZone" class="bg-white rounded-2xl shadow-panel border-2 border-dashed border-ink-200 p-8 text-center cursor-pointer hover:border-brand-400 hover:bg-brand-50/30 transition-colors h-full">
           <input type="file" id="fileZip" accept=".zip,.xml" multiple class="hidden">
@@ -2801,10 +2801,22 @@ function renderValidar() {
           <input type="file" id="folderNFe" webkitdirectory directory multiple class="hidden">
           <svg class="w-9 h-9 mx-auto text-ink-300 mb-2" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
           <div class="text-sm font-medium text-ink-700">Notas Fiscais (frete do cliente)</div>
-          <div class="text-xs text-ink-400 mt-1">Arraste aqui o .zip, os XMLs, a pasta inteira <strong>ou a planilha Excel das notas</strong> (NF, Canal, Frete da NF…) <strong>e a base de tickets</strong> (Ticket - ….xlsx) — pode subir a qualquer momento, mesmo antes de validar CT-es. Fica salvo e casa sozinho depois.</div>
+          <div class="text-xs text-ink-400 mt-1">Arraste aqui o .zip, os XMLs, a pasta inteira <strong>ou a planilha Excel das notas</strong> (NF, Canal, Frete da NF…) — pode subir a qualquer momento, mesmo antes de validar CT-es. Fica salvo e casa sozinho depois.</div>
           <div class="flex items-center justify-center gap-2 mt-4">
             <button type="button" data-acao="arquivos" data-alvo="nfe" class="btn-upload px-3 py-1.5 rounded-lg border border-ink-200 bg-white text-xs font-medium text-ink-700 hover:border-purple-400 hover:text-purple-700">Selecionar arquivos (.zip, .xml ou Excel)</button>
             <button type="button" data-acao="pasta" data-alvo="nfe" class="btn-upload px-3 py-1.5 rounded-lg border border-ink-200 bg-white text-xs font-medium text-ink-700 hover:border-purple-400 hover:text-purple-700">Selecionar pasta</button>
+          </div>
+        </div>
+      </div>
+      <div>
+        <div id="uploadZoneTickets" class="bg-white rounded-2xl shadow-panel border-2 border-dashed border-ink-200 p-8 text-center cursor-pointer hover:border-violet-400 hover:bg-violet-50/30 transition-colors h-full">
+          <input type="file" id="fileTickets" accept=".xlsx,.xls,.xlsm,.csv" multiple class="hidden">
+          <input type="file" id="folderTickets" webkitdirectory directory multiple class="hidden">
+          <div class="text-3xl mb-1">🎫</div>
+          <div class="text-sm font-medium text-ink-700">Relatório de Tickets (custas transportadora)</div>
+          <div class="text-xs text-ink-400 mt-1">Arraste aqui o <strong>Ticket - ….xlsx</strong>. Fica salvo sem duplicar, e os CT-es das notas da coluna "Nº NF" ganham o marcador "Custas transportadora" — agora ou quando forem validados.</div>
+          <div class="flex items-center justify-center gap-2 mt-4">
+            <button type="button" data-acao="arquivos" data-alvo="tickets" class="btn-upload px-3 py-1.5 rounded-lg border border-ink-200 bg-white text-xs font-medium text-ink-700 hover:border-violet-400 hover:text-violet-700">Selecionar relatório (Excel)</button>
           </div>
         </div>
       </div>
@@ -2851,6 +2863,17 @@ function renderValidar() {
   $('#uploadZone').addEventListener('click', (e) => { if (!STATE._faturaAtual) { e.stopImmediatePropagation(); exigirFatura(); } }, true);
   renderBoxFatura();
   ligarZonaUpload($('#uploadZoneNFe'), $('#fileZipNFe'), $('#folderNFe'), ['border-purple-400','bg-purple-50/30'], (arqs) => processarArquivosNotas(arqs, 'progressNFeBoxInicial'));
+  ligarZonaUpload($('#uploadZoneTickets'), $('#fileTickets'), $('#folderTickets'), ['border-violet-400','bg-violet-50/30'], (arqs) => processarArquivosTickets(arqs, 'progressNFeBoxInicial'));
+}
+
+// campo exclusivo do relatório de tickets: só aceita a base de tickets (Excel)
+async function processarArquivosTickets(arquivos, progressBoxId) {
+  const planilhas = arquivos.filter(f => /\.(xlsx|xls|xlsm|csv)$/i.test(f.name));
+  if (!planilhas.length) { toast('Envie o relatório de tickets em Excel (.xlsx).', 'warn'); return; }
+  for (const pl of planilhas) {
+    if (await ehPlanilhaTickets(pl)) await processarBaseTickets(pl, progressBoxId);
+    else toast(`"${pl.name}" não parece o relatório de tickets — não achei as colunas "Nº NF" e "Custas para transportadora". Se for a planilha de notas, use o campo de Notas Fiscais.`, 'error');
+  }
 }
 
 // Guarda só o necessário pra reabrir a tela de comparação depois (sem duplicar a
@@ -3712,6 +3735,8 @@ function renderResultadosValidacao() {
           ${nfeImportada ? 'Reimportar Notas Fiscais' : 'Importar Notas Fiscais'} <span class="text-ink-400 font-normal">(XML ou Excel)</span>
         </button>
         <input type="file" id="fileNFe" accept=".zip,.xml,.xlsx,.xls,.csv" multiple class="hidden">
+        <button id="btnImportarTickets" title="Relatório de tickets (custas transportadora) — marca os CT-es deste lote cujas notas têm ticket" class="text-sm font-medium text-violet-700 hover:text-violet-800">🎫 Importar Tickets</button>
+        <input type="file" id="fileTicketsRes" accept=".xlsx,.xls,.xlsm,.csv" multiple class="hidden">
         <input type="file" id="folderNFeRes" webkitdirectory directory multiple class="hidden">
         <button id="btnImportarNFePasta" class="text-sm font-medium text-ink-600 hover:text-ink-800">(pasta)</button>
         <button id="btnRecalcular" title="Refaz o cálculo deste lote com o cadastro atual dos parceiros (tabelas, taxas, abrangência) e atualiza o Histórico — sem precisar subir os XMLs de novo" class="text-sm font-medium text-ink-600 hover:text-ink-800">Recalcular com cadastro atual</button>
@@ -3813,6 +3838,12 @@ function renderResultadosValidacao() {
   });
 
   $('#btnImportarNFe').addEventListener('click', () => $('#fileNFe').click());
+  $('#btnImportarTickets').addEventListener('click', () => $('#fileTicketsRes').click());
+  $('#fileTicketsRes').addEventListener('change', (e) => {
+    const arquivos = Array.from(e.target.files || []);
+    e.target.value = '';
+    if (arquivos.length) processarArquivosTickets(arquivos, 'progressNFeBox');
+  });
   $('#btnImportarNFePasta').addEventListener('click', () => $('#folderNFeRes').click());
   ['#fileNFe', '#folderNFeRes'].forEach(sel => $(sel).addEventListener('change', (e) => {
     const arquivos = Array.from(e.target.files || []);
