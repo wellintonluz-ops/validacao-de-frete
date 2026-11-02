@@ -210,7 +210,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-11-02-dashboard-mensal';
+const APP_VERSION = '2026-11-02-dashboard-transportadora';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -2702,6 +2702,99 @@ function dadosIndicadores() {
   return { meses, parceiros: Array.from(parceiros).filter(p => p !== '(vários)').sort(), lotesAprox, qtdLotes: historico.length };
 }
 
+// Faturamento por transportadora, mês a mês (mesma base e filtros do Dashboard)
+function dadosPorTransportadora() {
+  const historico = STATE._histDashboard || [];
+  const f = STATE._filtrosDash || {};
+  const dentro = m => m === 'sem-data' || ((!f.de || m >= f.de) && (!f.ate || m <= f.ate));
+  const mapa = {}; const mesesSet = new Set();
+  const cel = (p, m) => { mesesSet.add(m); const t = mapa[p] = mapa[p] || {}; return t[m] = t[m] || { qtd: 0, cobrado: 0, pagou: 0, ressarcido: 0, aprox: false }; };
+  historico.forEach(h => {
+    const r = h.resumo || {};
+    if (r.porMes && Object.keys(r.porMes).length) {
+      Object.entries(r.porMes).forEach(([m, ps]) => { if (!dentro(m)) return; Object.entries(ps).forEach(([p, o]) => { if (f.transp && p !== f.transp) return; const c = cel(p, m); c.qtd += o.qtd || 0; c.cobrado += o.cobrado || 0; c.pagou += o.pagou || 0; }); });
+    } else if (r.totalCobrado != null) {
+      const m = (h.criadoEm || '').slice(0, 7) || 'sem-data';
+      if (!dentro(m)) return;
+      const p = r.parceiros && r.parceiros.length === 1 ? r.parceiros[0] : '(vários — lote antigo)';
+      if (f.transp && p !== f.transp) return;
+      const c = cel(p, m); c.qtd += r.total || 0; c.cobrado += r.totalCobrado || 0; c.pagou += r.totalClientePagou || 0; c.aprox = true;
+    }
+  });
+  ressarcimentosTransportadora(null).pagos.forEach(e => {
+    const p = (e.parceiroNome || '(sem parceiro)').replace(/[.~*/\[\]]/g, ' ').trim();
+    const m = /^\d{4}-\d{2}/.test(e.dhEmi || '') ? e.dhEmi.slice(0, 7) : 'sem-data';
+    if (!dentro(m) || (f.transp && p !== f.transp)) return;
+    cel(p, m).ressarcido += e.valor;
+  });
+  const meses = Array.from(mesesSet).sort();
+  const linhas = Object.entries(mapa).map(([p, ms]) => {
+    const tot = { qtd: 0, cobrado: 0, pagou: 0, ressarcido: 0 };
+    Object.values(ms).forEach(c => { ['cobrado', 'pagou', 'ressarcido'].forEach(k => { c[k] = clamp2(c[k]); tot[k] += c[k]; }); tot.qtd += c.qtd; c.faturado = clamp2(c.pagou - c.cobrado); c.faturadoAposRess = clamp2(c.faturado + c.ressarcido); });
+    ['cobrado', 'pagou', 'ressarcido'].forEach(k => { tot[k] = clamp2(tot[k]); });
+    tot.faturado = clamp2(tot.pagou - tot.cobrado); tot.faturadoAposRess = clamp2(tot.faturado + tot.ressarcido);
+    return { parceiro: p, meses: ms, tot };
+  }).sort((a, b) => a.tot.faturado - b.tot.faturado); // pior resultado primeiro
+  return { meses, linhas };
+}
+const METRICAS_TRANSP = [
+  { valor: 'faturado', label: 'Faturado (cliente pagou − cobrado)' },
+  { valor: 'faturadoAposRess', label: 'Faturado após ressarcimentos' },
+  { valor: 'pct', label: '% do faturado sobre o cobrado' },
+  { valor: 'cobrado', label: 'Cobrado (transportadora)' },
+  { valor: 'pagou', label: 'Cliente pagou' },
+];
+function valorMetrica(c, met) { if (!c) return null; if (met === 'pct') return c.cobrado ? clamp2(c.faturado / c.cobrado * 100) : null; return c[met]; }
+function fmtMetrica(v, met) { if (v === null || v === undefined) return '—'; return met === 'pct' ? `${v.toLocaleString('pt-BR', { maximumFractionDigits: 1 })}%` : fmtBRL(v); }
+
+function renderTabelaPorTransportadora() {
+  const { meses, linhas } = dadosPorTransportadora();
+  if (!linhas.length) return '';
+  const met = (STATE._filtrosDash || {}).metricaTransp || 'faturado';
+  const comSinal = ['faturado', 'faturadoAposRess', 'pct'].includes(met);
+  // fundo da célula: vermelho quando negativo, verde quando positivo (intensidade pelo tamanho)
+  const maxAbs = Math.max(1, ...linhas.flatMap(l => meses.map(m => Math.abs(valorMetrica(l.meses[m], met) || 0))));
+  const fundo = v => {
+    if (!comSinal || v === null || Math.abs(v) < 0.005) return '';
+    const a = (0.08 + 0.32 * Math.min(1, Math.abs(v) / maxAbs)).toFixed(2);
+    return v < 0 ? `background: rgba(220,38,38,${a})` : `background: rgba(5,150,105,${a})`;
+  };
+  const cor = v => !comSinal || v === null ? 'text-ink-700' : v < -0.005 ? 'text-red-700' : v > 0.005 ? 'text-emerald-700' : 'text-ink-500';
+  const totMes = m => { const c = { cobrado: 0, pagou: 0, ressarcido: 0 }; linhas.forEach(l => { const x = l.meses[m]; if (x) ['cobrado', 'pagou', 'ressarcido'].forEach(k => { c[k] += x[k]; }); }); ['cobrado', 'pagou', 'ressarcido'].forEach(k => { c[k] = clamp2(c[k]); }); c.faturado = clamp2(c.pagou - c.cobrado); c.faturadoAposRess = clamp2(c.faturado + c.ressarcido); return c; };
+  const totGeral = (() => { const c = { cobrado: 0, pagou: 0, ressarcido: 0 }; linhas.forEach(l => ['cobrado', 'pagou', 'ressarcido'].forEach(k => { c[k] += l.tot[k]; })); ['cobrado', 'pagou', 'ressarcido'].forEach(k => { c[k] = clamp2(c[k]); }); c.faturado = clamp2(c.pagou - c.cobrado); c.faturadoAposRess = clamp2(c.faturado + c.ressarcido); return c; })();
+  return `
+    <div class="bg-white rounded-2xl shadow-panel border border-ink-100 p-6 mt-6">
+      <div class="flex items-center justify-between flex-wrap gap-3 mb-1">
+        <h2 class="font-semibold text-ink-900">Faturamento por transportadora, mês a mês</h2>
+        <label class="text-xs text-ink-500 flex items-center gap-2">Mostrar
+          <select data-filtro-dash="metricaTransp" class="border border-ink-200 rounded-lg px-2 py-1.5">${METRICAS_TRANSP.map(x => `<option value="${x.valor}" ${met === x.valor ? 'selected' : ''}>${x.label}</option>`).join('')}</select>
+        </label>
+      </div>
+      <p class="text-xs text-ink-400 mb-4">Ordenado do pior para o melhor faturado no período. Verde = cliente pagou mais do que a transportadora cobrou; vermelho = prejuízo no frete.</p>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead><tr class="text-ink-500 text-[11px] uppercase tracking-wide border-b border-ink-100">
+            <th class="text-left font-semibold px-3 py-2 sticky left-0 bg-white">Transportadora</th>
+            ${meses.map(m => `<th class="text-right font-semibold px-3 py-2 whitespace-nowrap">${rotuloMes(m)}</th>`).join('')}
+            <th class="text-right font-semibold px-3 py-2 bg-ink-50">Total</th>
+          </tr></thead>
+          <tbody class="divide-y divide-ink-50">
+            ${linhas.map(l => `<tr>
+              <td class="px-3 py-2 text-ink-800 font-medium whitespace-nowrap sticky left-0 bg-white">${escapeHtml(l.parceiro)}<div class="text-[10px] text-ink-400 font-normal">${l.tot.qtd.toLocaleString('pt-BR')} CT-e(s)</div></td>
+              ${meses.map(m => { const c = l.meses[m]; const v = valorMetrica(c, met); return `<td class="px-3 py-2 text-right num whitespace-nowrap ${cor(v)}" style="${fundo(v)}" title="${c ? `${escapeHtml(l.parceiro)} · ${rotuloMes(m)}\nCT-es: ${c.qtd}\nCobrado: ${fmtBRL(c.cobrado)}\nCliente pagou: ${fmtBRL(c.pagou)}\nFaturado: ${fmtBRL(c.faturado)}${c.ressarcido ? `\nRessarcido: ${fmtBRL(c.ressarcido)}` : ''}${c.aprox ? '\n(lote antigo — mês de importação)' : ''}` : 'sem CT-e no mês'}">${fmtMetrica(v, met)}${c && c.aprox ? '<span class="text-amber-600">*</span>' : ''}</td>`; }).join('')}
+              <td class="px-3 py-2 text-right num font-semibold whitespace-nowrap bg-ink-50 ${cor(valorMetrica(l.tot, met))}">${fmtMetrica(valorMetrica(l.tot, met), met)}</td>
+            </tr>`).join('')}
+          </tbody>
+          <tfoot><tr class="border-t-2 border-ink-200 font-semibold">
+            <td class="px-3 py-2 text-ink-800 sticky left-0 bg-white">Total</td>
+            ${meses.map(m => { const v = valorMetrica(totMes(m), met); return `<td class="px-3 py-2 text-right num whitespace-nowrap ${cor(v)}">${fmtMetrica(v, met)}</td>`; }).join('')}
+            <td class="px-3 py-2 text-right num whitespace-nowrap bg-ink-50 ${cor(valorMetrica(totGeral, met))}">${fmtMetrica(valorMetrica(totGeral, met), met)}</td>
+          </tr></tfoot>
+        </table>
+      </div>
+    </div>`;
+}
+
 function graficoMensalSvg(meses) {
   const ms = meses.filter(x => x.mes !== 'sem-data');
   if (!ms.length) return '';
@@ -2816,7 +2909,8 @@ function desenharIndicadores() {
           <td class="px-4 py-3 text-right num text-amber-700">${fmtBRL(tot.aRecuperar)}</td>
         </tr></tfoot>
       </table>
-    </div>`}
+    </div>
+    ${renderTabelaPorTransportadora()}`}
     ${lotesAprox ? `<div class="mt-4 text-xs px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200 flex items-center justify-between gap-3">
       <span>* ${lotesAprox} lote(s) salvo(s) antes deste painel ainda não têm a quebra por mês de emissão — entraram inteiros no mês em que foram importados${f.transp ? ' (e só aparecem no filtro de transportadora quando o lote é de uma transportadora só)' : ''}.</span>
       <button id="btnDetalharLotesAntigos" class="shrink-0 bg-white border border-amber-300 hover:bg-amber-100 font-medium rounded-lg px-3 py-1.5">Separar por mês agora</button>
@@ -2838,6 +2932,14 @@ function exportarIndicadoresXlsx(meses, tot) {
   linhas.push([]); linhas.push([`Transportadora: ${f.transp || 'todas'} · Período: ${f.de || 'início'} a ${f.ate || 'hoje'} · mês de emissão do CT-e`]);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(linhas), 'Mês a mês');
+  // por transportadora: uma linha por transportadora × mês
+  const pt = dadosPorTransportadora();
+  const lt = [['Transportadora', 'Mês', 'CT-es', 'Cobrado (R$)', 'Cliente pagou (R$)', 'Faturado (R$)', '% sobre cobrado', 'Ressarcido (R$)', 'Faturado após ressarcimentos (R$)']];
+  pt.linhas.forEach(l => {
+    pt.meses.forEach(m => { const c = l.meses[m]; if (c) lt.push([l.parceiro, rotuloMes(m) + (c.aprox ? ' *' : ''), c.qtd, c.cobrado, c.pagou, c.faturado, c.cobrado ? clamp2(c.faturado / c.cobrado * 100) : '', c.ressarcido, c.faturadoAposRess]); });
+    lt.push([l.parceiro, 'Total', l.tot.qtd, l.tot.cobrado, l.tot.pagou, l.tot.faturado, l.tot.cobrado ? clamp2(l.tot.faturado / l.tot.cobrado * 100) : '', l.tot.ressarcido, l.tot.faturadoAposRess]);
+  });
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(lt), 'Por transportadora');
   const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
   downloadBlob(new Blob([out], { type: 'application/octet-stream' }), `Dashboard_Fretes${f.transp ? '_' + f.transp.split(' ')[0] : ''}.xlsx`);
 }
