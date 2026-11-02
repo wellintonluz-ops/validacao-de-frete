@@ -119,6 +119,10 @@ tailwind.config = {
         <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
         Histórico
       </button>
+      <button data-view="indicadores" class="nav-btn w-full flex items-center gap-2.5 px-3 py-2 rounded-lg hover:bg-white/5 transition-colors">
+        <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 3v18h18M7 15l4-4 3 3 6-6"/></svg>
+        Dashboard
+      </button>
       <button data-view="tratativas" class="nav-btn w-full flex items-center gap-2.5 px-3 py-2 rounded-lg hover:bg-white/5 transition-colors">
         <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 10h8M8 14h5m-9 7l2.5-2.5H19a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2h.5"/></svg>
         <span class="flex-1 text-left">Análises</span>
@@ -172,6 +176,11 @@ tailwind.config = {
       <div id="historicoContent"></div>
     </section>
 
+    <!-- DASHBOARD MENSAL -->
+    <section id="view-indicadores" class="view hidden p-8 fade-in">
+      <div id="indicadoresContent"></div>
+    </section>
+
     <!-- TRATATIVAS COM TRANSPORTADORA -->
     <section id="view-tratativas" class="view hidden p-8 fade-in">
       <div id="tratativasContent"></div>
@@ -201,7 +210,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-10-28-tickets-com-custas';
+const APP_VERSION = '2026-11-02-dashboard-mensal';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -455,6 +464,11 @@ const DataLayer = {
     const sinc = await dadosSincronizados('historico');
     if (sinc) return sinc;
     const snap = await db.collection('validacoes').orderBy('criadoEm', 'desc').limit(30).get();
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  },
+  async listHistoricoCompleto() {
+    if (OFFLINE_MODE) return (localDB_read().historico || []);
+    const snap = await comTimeout(db.collection('validacoes').orderBy('criadoEm', 'desc').get(), 60000, 'ler o histórico');
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
   },
   async saveValidacao(registro) {
@@ -2614,9 +2628,238 @@ function goToView(name) {
   if (name === 'parceiros') renderParceirosList();
   if (name === 'parceiro-form') renderParceiroForm();
   if (name === 'historico') renderHistorico();
+  if (name === 'indicadores') renderIndicadores();
   if (name === 'tratativas') renderTratativas();
   if (name === 'produtos') renderProdutos();
   window.scrollTo(0, 0);
+}
+
+// ---------------------------------------------------------------------
+// DASHBOARD MENSAL — Cobrado × Cliente pagou × Faturado, mês a mês (emissão do CT-e)
+// ---------------------------------------------------------------------
+const MESES_CURTOS = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'];
+function rotuloMes(m) { if (!/^\d{4}-\d{2}$/.test(m)) return 'Sem data'; return `${MESES_CURTOS[parseInt(m.slice(5), 10) - 1]}/${m.slice(2, 4)}`; }
+
+async function renderIndicadores() {
+  const el = $('#indicadoresContent');
+  el.innerHTML = `<h1 class="text-2xl font-bold text-ink-900">Dashboard</h1><p class="text-sm text-ink-400 mt-0.5 mb-6">Carregando o histórico…</p>${skeletonRows ? skeletonRows() : ''}`;
+  let historico;
+  try {
+    if (!STATE._revisoesCarregadas) await carregarRevisoes();
+    historico = await DataLayer.listHistoricoCompleto();
+  } catch (e) {
+    console.error(e);
+    el.innerHTML = `<div class="bg-red-50 border border-red-200 text-red-700 rounded-2xl p-4 text-sm">${escapeHtml(mensagemErroFirebase(e, 'carregar o histórico'))}</div>`;
+    return;
+  }
+  STATE._histDashboard = historico;
+  desenharIndicadores();
+}
+
+function dadosIndicadores() {
+  const historico = STATE._histDashboard || [];
+  const f = STATE._filtrosDash = STATE._filtrosDash || {};
+  const porMes = {};
+  const parceiros = new Set();
+  let lotesAprox = 0;
+  const soma = (m, p, o, aprox) => {
+    if (f.transp && p !== f.transp) return;
+    const x = porMes[m] = porMes[m] || { mes: m, qtd: 0, cobrado: 0, pagou: 0, ressarcido: 0, aRecuperar: 0, aprox: false };
+    x.qtd += o.qtd || 0; x.cobrado += o.cobrado || 0; x.pagou += o.pagou || 0;
+    if (aprox) x.aprox = true;
+  };
+  historico.forEach(h => {
+    const r = h.resumo || {};
+    if (r.porMes && Object.keys(r.porMes).length) {
+      Object.entries(r.porMes).forEach(([m, ps]) => Object.entries(ps).forEach(([p, o]) => { parceiros.add(p); soma(m, p, o, false); }));
+    } else if (r.totalCobrado != null) {
+      // lote antigo, sem a quebra por mês: entra inteiro no mês de importação (aproximado)
+      lotesAprox++;
+      const m = (h.criadoEm || '').slice(0, 7) || 'sem-data';
+      const ps = r.parceiros && r.parceiros.length === 1 ? r.parceiros[0] : null;
+      (r.parceiros || []).forEach(p => parceiros.add(p));
+      if (f.transp && ps !== f.transp) return;
+      soma(m, ps || '(vários)', { qtd: r.total || 0, cobrado: r.totalCobrado || 0, pagou: r.totalClientePagou || 0 }, true);
+    }
+  });
+  // ressarcimentos e cobrança indevida em aberto (Análises), pelo mês de emissão do CT-e
+  const ress = ressarcimentosTransportadora(null);
+  const somaRess = (lista, campo) => lista.forEach(e => {
+    if (f.transp && e.parceiroNome !== f.transp) return;
+    const m = /^\d{4}-\d{2}/.test(e.dhEmi || '') ? e.dhEmi.slice(0, 7) : 'sem-data';
+    const x = porMes[m] = porMes[m] || { mes: m, qtd: 0, cobrado: 0, pagou: 0, ressarcido: 0, aRecuperar: 0, aprox: false };
+    x[campo] += e.valor;
+  });
+  somaRess(ress.pagos, 'ressarcido'); somaRess(ress.abertos, 'aRecuperar');
+  let meses = Object.values(porMes).sort((a, b) => a.mes.localeCompare(b.mes));
+  if (f.de) meses = meses.filter(x => x.mes === 'sem-data' || x.mes >= f.de);
+  if (f.ate) meses = meses.filter(x => x.mes === 'sem-data' || x.mes <= f.ate);
+  meses.forEach(x => {
+    ['cobrado', 'pagou', 'ressarcido', 'aRecuperar'].forEach(k => { x[k] = clamp2(x[k]); });
+    x.faturado = clamp2(x.pagou - x.cobrado);
+    x.faturadoAposRess = clamp2(x.faturado + x.ressarcido);
+  });
+  return { meses, parceiros: Array.from(parceiros).filter(p => p !== '(vários)').sort(), lotesAprox, qtdLotes: historico.length };
+}
+
+function graficoMensalSvg(meses) {
+  const ms = meses.filter(x => x.mes !== 'sem-data');
+  if (!ms.length) return '';
+  const W = 1000, H = 300, ml = 70, mr = 16, mt = 16, mb = 34;
+  const maxV = Math.max(1, ...ms.flatMap(x => [x.cobrado, x.pagou, x.faturado, x.faturadoAposRess]));
+  const minV = Math.min(0, ...ms.flatMap(x => [x.faturado, x.faturadoAposRess]));
+  const y = v => mt + (maxV - v) / (maxV - minV) * (H - mt - mb);
+  const gw = (W - ml - mr) / ms.length, bw = Math.min(28, gw * 0.32);
+  const cx = i => ml + gw * i + gw / 2;
+  const passo = (() => { const bruto = (maxV - minV) / 5; const p = Math.pow(10, Math.floor(Math.log10(bruto))); return [1, 2, 2.5, 5, 10].map(k => k * p).find(k => k >= bruto); })();
+  const ticks = []; for (let v = Math.ceil(minV / passo) * passo; v <= maxV + 1e-9; v += passo) ticks.push(Math.abs(v) < 1e-9 ? 0 : v);
+  const fmtK = v => Math.abs(v) >= 1000 ? (v / 1000).toLocaleString('pt-BR', { maximumFractionDigits: 1 }) + ' mil' : v.toLocaleString('pt-BR', { maximumFractionDigits: 0 });
+  const linha = (campo) => ms.map((x, i) => `${i ? 'L' : 'M'}${cx(i).toFixed(1)},${y(x[campo]).toFixed(1)}`).join(' ');
+  const temRess = ms.some(x => x.ressarcido);
+  return `
+    <svg viewBox="0 0 ${W} ${H}" class="w-full h-auto" role="img" aria-label="Cobrado, cliente pagou e faturado por mês">
+      ${ticks.map(v => `<line x1="${ml}" x2="${W - mr}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}" stroke="${v === 0 ? '#94a3b8' : '#eef1f5'}" stroke-width="1"/>
+        <text x="${ml - 8}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end" font-size="11" fill="#94a3b8">${fmtK(v)}</text>`).join('')}
+      ${ms.map((x, i) => `
+        <rect x="${(cx(i) - bw - 2).toFixed(1)}" y="${y(Math.max(0, x.cobrado)).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0, y(0) - y(x.cobrado)).toFixed(1)}" rx="3" fill="#64748b"><title>${rotuloMes(x.mes)} — Cobrado ${fmtBRL(x.cobrado)}</title></rect>
+        <rect x="${(cx(i) + 2).toFixed(1)}" y="${y(Math.max(0, x.pagou)).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0, y(0) - y(x.pagou)).toFixed(1)}" rx="3" fill="#8b5cf6"><title>${rotuloMes(x.mes)} — Cliente pagou ${fmtBRL(x.pagou)}</title></rect>
+        <text x="${cx(i).toFixed(1)}" y="${H - 12}" text-anchor="middle" font-size="11" fill="#64748b">${rotuloMes(x.mes)}${x.aprox ? '*' : ''}</text>`).join('')}
+      ${temRess ? `<path d="${linha('faturadoAposRess')}" fill="none" stroke="#10b981" stroke-width="2" stroke-dasharray="5 4"/>` : ''}
+      <path d="${linha('faturado')}" fill="none" stroke="#0f172a" stroke-width="2.5"/>
+      ${ms.map((x, i) => `<circle cx="${cx(i).toFixed(1)}" cy="${y(x.faturado).toFixed(1)}" r="4.5" fill="${x.faturado < 0 ? '#dc2626' : '#059669'}" stroke="#fff" stroke-width="1.5"><title>${rotuloMes(x.mes)} — Faturado ${fmtBRL(x.faturado)}${x.ressarcido ? ` · após ressarcimentos ${fmtBRL(x.faturadoAposRess)}` : ''}</title></circle>`).join('')}
+    </svg>
+    <div class="flex flex-wrap items-center gap-4 text-xs text-ink-500 mt-2">
+      <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-sm" style="background:#64748b"></span>Cobrado (transportadora)</span>
+      <span class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-sm" style="background:#8b5cf6"></span>Cliente pagou</span>
+      <span class="flex items-center gap-1.5"><span class="w-4 h-0.5" style="background:#0f172a"></span>Faturado (ponto verde = positivo, vermelho = negativo)</span>
+      ${temRess ? `<span class="flex items-center gap-1.5"><span class="w-4 border-t-2 border-dashed" style="border-color:#10b981"></span>Faturado após ressarcimentos</span>` : ''}
+    </div>`;
+}
+
+function desenharIndicadores() {
+  const el = $('#indicadoresContent');
+  const f = STATE._filtrosDash = STATE._filtrosDash || {};
+  const { meses, parceiros, lotesAprox, qtdLotes } = dadosIndicadores();
+  const tot = meses.reduce((a, x) => { ['qtd', 'cobrado', 'pagou', 'faturado', 'ressarcido', 'faturadoAposRess', 'aRecuperar'].forEach(k => { a[k] = clamp2((a[k] || 0) + (x[k] || 0)); }); return a; }, {});
+  const cor = v => v < -0.005 ? 'text-red-600' : v > 0.005 ? 'text-emerald-600' : 'text-ink-600';
+  const pct = (v, base) => base ? `${(v / base * 100).toLocaleString('pt-BR', { maximumFractionDigits: 1 })}%` : '—';
+  const opt = (v, l, atual) => `<option value="${escapeHtml(v)}" ${atual === v ? 'selected' : ''}>${escapeHtml(l)}</option>`;
+  const card = (titulo, valor, sub, cls) => `<div class="bg-white rounded-2xl shadow-panel border border-ink-100 p-5"><div class="text-xs text-ink-400 font-medium mb-2">${titulo}</div><div class="text-2xl font-bold num ${cls}">${valor}</div><div class="text-[11px] text-ink-300 mt-1">${sub}</div></div>`;
+  el.innerHTML = `
+    <div class="flex items-center justify-between mb-1">
+      <h1 class="text-2xl font-bold text-ink-900">Dashboard</h1>
+      <div class="flex items-center gap-3">
+        <button id="btnExportarDash" class="text-sm font-medium text-brand-600 hover:text-brand-700">Exportar Excel</button>
+        <button id="btnAtualizarDash" class="text-sm font-medium text-ink-600 hover:text-ink-800">Atualizar</button>
+      </div>
+    </div>
+    <p class="text-sm text-ink-400 mb-6">Cobrado pela transportadora × pago pelo cliente × faturado, mês a mês — pelo <strong>mês de emissão do CT-e</strong>, somando todos os lotes do Histórico (${qtdLotes}).</p>
+
+    <div class="mb-6 bg-white rounded-2xl border border-ink-100 px-4 py-3 flex flex-wrap items-end gap-4 text-xs">
+      <label class="text-ink-500">Transportadora
+        <select data-filtro-dash="transp" class="block mt-1 border border-ink-200 rounded-lg px-2 py-1.5 max-w-[260px]">${opt('', 'Todas', f.transp || '')}${parceiros.map(p => opt(p, p, f.transp)).join('')}</select>
+      </label>
+      <label class="text-ink-500">De (mês)<input type="month" data-filtro-dash="de" value="${escapeHtml(f.de || '')}" class="block mt-1 border border-ink-200 rounded-lg px-2 py-1.5"></label>
+      <label class="text-ink-500">Até (mês)<input type="month" data-filtro-dash="ate" value="${escapeHtml(f.ate || '')}" class="block mt-1 border border-ink-200 rounded-lg px-2 py-1.5"></label>
+      ${f.transp || f.de || f.ate ? '<button id="btnLimparDash" class="text-brand-600 hover:text-brand-700 font-medium self-center">Limpar filtros</button>' : ''}
+    </div>
+
+    ${!meses.length ? emptyState('Nada pra mostrar ainda', 'Salve lotes na aba Validar Fretes — eles aparecem aqui, mês a mês.') : `
+    <div class="grid grid-cols-5 gap-4 mb-6">
+      ${card('Cobrado (transportadora)', fmtBRL(tot.cobrado), `${(tot.qtd || 0).toLocaleString('pt-BR')} CT-e(s)`, 'text-ink-800')}
+      ${card('Cliente pagou', fmtBRL(tot.pagou), `${pct(tot.pagou, tot.cobrado)} do cobrado`, 'text-violet-700')}
+      ${card('Faturado', fmtBRL(tot.faturado), 'cliente pagou − cobrado', cor(tot.faturado))}
+      ${card('Ressarcido pela transportadora', fmtBRL(tot.ressarcido), `${fmtBRL(tot.aRecuperar)} ainda a recuperar`, 'text-emerald-700')}
+      ${card('Faturado após ressarcimentos', fmtBRL(tot.faturadoAposRess), 'faturado + ressarcido', cor(tot.faturadoAposRess))}
+    </div>
+
+    <div class="bg-white rounded-2xl shadow-panel border border-ink-100 p-6 mb-6">
+      <h2 class="font-semibold text-ink-900 mb-3">Mês a mês</h2>
+      ${graficoMensalSvg(meses)}
+    </div>
+
+    <div class="bg-white rounded-2xl shadow-panel border border-ink-100 overflow-hidden">
+      <table class="w-full text-sm">
+        <thead><tr class="bg-ink-50 text-ink-500 text-[11px] uppercase tracking-wide">
+          <th class="text-left font-semibold px-4 py-3">Mês</th>
+          <th class="text-right font-semibold px-4 py-3">CT-es</th>
+          <th class="text-right font-semibold px-4 py-3">Cobrado</th>
+          <th class="text-right font-semibold px-4 py-3">Cliente pagou</th>
+          <th class="text-right font-semibold px-4 py-3">Faturado</th>
+          <th class="text-right font-semibold px-4 py-3">% sobre cobrado</th>
+          <th class="text-right font-semibold px-4 py-3" title="Cobrança indevida (Erro da transportadora) com status Resolvido - Pago — diferença sem ICMS">Ressarcido</th>
+          <th class="text-right font-semibold px-4 py-3">Faturado após ressarc.</th>
+          <th class="text-right font-semibold px-4 py-3" title="Cobrança indevida ainda não resolvida (Pendente / Em tratativa / Resolvido - Custo)">A recuperar</th>
+        </tr></thead>
+        <tbody class="divide-y divide-ink-100">
+          ${meses.slice().reverse().map(x => `<tr class="hover:bg-ink-50/60">
+            <td class="px-4 py-2.5 text-ink-700 font-medium">${rotuloMes(x.mes)}${x.aprox ? ' <span class="text-[10px] text-amber-600" title="Inclui lote antigo sem a quebra por mês — entrou inteiro no mês em que foi importado">*</span>' : ''}</td>
+            <td class="px-4 py-2.5 text-right num text-ink-600">${x.qtd.toLocaleString('pt-BR')}</td>
+            <td class="px-4 py-2.5 text-right num text-ink-700">${fmtBRL(x.cobrado)}</td>
+            <td class="px-4 py-2.5 text-right num text-ink-700">${fmtBRL(x.pagou)}</td>
+            <td class="px-4 py-2.5 text-right num font-semibold ${cor(x.faturado)}">${fmtBRL(x.faturado)}</td>
+            <td class="px-4 py-2.5 text-right num ${cor(x.faturado)}">${pct(x.faturado, x.cobrado)}</td>
+            <td class="px-4 py-2.5 text-right num text-emerald-700">${x.ressarcido ? fmtBRL(x.ressarcido) : '—'}</td>
+            <td class="px-4 py-2.5 text-right num font-semibold ${cor(x.faturadoAposRess)}">${fmtBRL(x.faturadoAposRess)}</td>
+            <td class="px-4 py-2.5 text-right num text-amber-700">${x.aRecuperar ? fmtBRL(x.aRecuperar) : '—'}</td>
+          </tr>`).join('')}
+        </tbody>
+        <tfoot><tr class="bg-ink-50 font-semibold">
+          <td class="px-4 py-3 text-ink-800">Total</td>
+          <td class="px-4 py-3 text-right num">${(tot.qtd || 0).toLocaleString('pt-BR')}</td>
+          <td class="px-4 py-3 text-right num">${fmtBRL(tot.cobrado)}</td>
+          <td class="px-4 py-3 text-right num">${fmtBRL(tot.pagou)}</td>
+          <td class="px-4 py-3 text-right num ${cor(tot.faturado)}">${fmtBRL(tot.faturado)}</td>
+          <td class="px-4 py-3 text-right num ${cor(tot.faturado)}">${pct(tot.faturado, tot.cobrado)}</td>
+          <td class="px-4 py-3 text-right num text-emerald-700">${fmtBRL(tot.ressarcido)}</td>
+          <td class="px-4 py-3 text-right num ${cor(tot.faturadoAposRess)}">${fmtBRL(tot.faturadoAposRess)}</td>
+          <td class="px-4 py-3 text-right num text-amber-700">${fmtBRL(tot.aRecuperar)}</td>
+        </tr></tfoot>
+      </table>
+    </div>`}
+    ${lotesAprox ? `<div class="mt-4 text-xs px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200 flex items-center justify-between gap-3">
+      <span>* ${lotesAprox} lote(s) salvo(s) antes deste painel ainda não têm a quebra por mês de emissão — entraram inteiros no mês em que foram importados${f.transp ? ' (e só aparecem no filtro de transportadora quando o lote é de uma transportadora só)' : ''}.</span>
+      <button id="btnDetalharLotesAntigos" class="shrink-0 bg-white border border-amber-300 hover:bg-amber-100 font-medium rounded-lg px-3 py-1.5">Separar por mês agora</button>
+    </div>` : ''}
+    <p class="text-xs text-ink-300 mt-3">Faturado = soma do que o cliente pagou − soma do que a transportadora cobrou (mesma regra do Histórico: devolução, reposição, redespacho, uso e consumo e complemento de taxa entram só no cobrado). Ressarcido / A recuperar vêm da aba Análises (Erro da transportadora, diferença sem ICMS).</p>
+  `;
+  $$('[data-filtro-dash]').forEach(i => i.addEventListener('change', () => { STATE._filtrosDash[i.dataset.filtroDash] = i.value; desenharIndicadores(); }));
+  const lim = $('#btnLimparDash'); if (lim) lim.addEventListener('click', () => { STATE._filtrosDash = {}; desenharIndicadores(); });
+  $('#btnAtualizarDash').addEventListener('click', renderIndicadores);
+  $('#btnExportarDash').addEventListener('click', () => exportarIndicadoresXlsx(meses, tot));
+  const btnAnt = $('#btnDetalharLotesAntigos'); if (btnAnt) btnAnt.addEventListener('click', detalharLotesAntigosPorMes);
+}
+
+function exportarIndicadoresXlsx(meses, tot) {
+  const f = STATE._filtrosDash || {};
+  const linhas = [['Mês', 'CT-es', 'Cobrado (R$)', 'Cliente pagou (R$)', 'Faturado (R$)', '% sobre cobrado', 'Ressarcido (R$)', 'Faturado após ressarcimentos (R$)', 'A recuperar (R$)']];
+  meses.forEach(x => linhas.push([rotuloMes(x.mes) + (x.aprox ? ' *' : ''), x.qtd, x.cobrado, x.pagou, x.faturado, x.cobrado ? clamp2(x.faturado / x.cobrado * 100) : '', x.ressarcido, x.faturadoAposRess, x.aRecuperar]));
+  linhas.push(['Total', tot.qtd || 0, tot.cobrado || 0, tot.pagou || 0, tot.faturado || 0, tot.cobrado ? clamp2(tot.faturado / tot.cobrado * 100) : '', tot.ressarcido || 0, tot.faturadoAposRess || 0, tot.aRecuperar || 0]);
+  linhas.push([]); linhas.push([`Transportadora: ${f.transp || 'todas'} · Período: ${f.de || 'início'} a ${f.ate || 'hoje'} · mês de emissão do CT-e`]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(linhas), 'Mês a mês');
+  const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+  downloadBlob(new Blob([out], { type: 'application/octet-stream' }), `Dashboard_Fretes${f.transp ? '_' + f.transp.split(' ')[0] : ''}.xlsx`);
+}
+
+// lotes salvos antes do painel: lê o detalhe gravado e grava a quebra por mês (1 gravação por lote)
+async function detalharLotesAntigosPorMes() {
+  const btn = $('#btnDetalharLotesAntigos');
+  const alvos = (STATE._histDashboard || []).filter(h => !(h.resumo && h.resumo.porMes && Object.keys(h.resumo.porMes).length) && h.detalheDisponivel);
+  if (!alvos.length) { toast('Os lotes antigos não têm o detalhe por CT-e gravado — dá pra separar por mês só reabrindo o lote com os XMLs.', 'warn'); return; }
+  let ok = 0, falhas = 0;
+  for (const h of alvos) {
+    if (btn) btn.textContent = `Separando… ${ok + falhas + 1}/${alvos.length}`;
+    try {
+      const det = await DataLayer.carregarDetalheHistorico(h);
+      const porMes = resumoPorMes({ resultados: det.resultados || [], semParceiro: det.semParceiro || [], outrosFluxos: det.outrosFluxos || [], reentregas: det.reentregas || [] });
+      await comTimeout(DataLayer.atualizarResumoHistorico(h.id, { porMes }), 20000, 'atualizar o Histórico');
+      h.resumo = { ...(h.resumo || {}), porMes };
+      ok++;
+    } catch (e) { console.error('[Dashboard] lote', h.id, e); falhas++; }
+  }
+  toast(`${ok} lote(s) separado(s) por mês de emissão${falhas ? ` · ${falhas} com falha (veja o console)` : ''}.`, falhas ? 'warn' : 'success');
+  desenharIndicadores();
 }
 
 async function carregarRevisoes() {
@@ -2969,6 +3212,7 @@ function montarRegistroHistorico(nomeLote, v) {
     totalClientePagou: resumoFin.totalClientePagou,
     ajusteSemErro: resumoFin.ajusteSemErro,
     faturado: resumoFin.faturado,
+    porMes: resumoPorMes({ resultados, semParceiro, outrosFluxos, reentregas }),
   };
   return {
     nomeArquivo: nomeLote, numeroFatura: v.numeroFatura || null, vencimentoFatura: v.vencimentoFatura || null, resumo,
@@ -2985,15 +3229,32 @@ function montarRegistroHistorico(nomeLote, v) {
 // seriam bloqueados como duplicados). Atualiza a tela, o Histórico e os CT-es salvos.
 // Recalcula o resumo (divergências, Faturado…) do lote aberto e grava no Histórico se mudou —
 // usado quando uma análise "Sem erro" muda o que conta como diferença.
+// Quebra o Cobrado e o Cliente pagou do lote por MÊS DE EMISSÃO do CT-e e por transportadora
+// ({ '2026-09': { 'FRETEX': { qtd, cobrado, pagou } } }) — mesmas regras do Faturado do lote
+function resumoPorMes({ resultados = [], semParceiro = [], outrosFluxos = [], reentregas = [] }) {
+  const out = {};
+  const add = (dhEmi, parceiro, cobrado, pagou) => {
+    const m = /^\d{4}-\d{2}/.test(dhEmi || '') ? dhEmi.slice(0, 7) : 'sem-data';
+    const p = (parceiro || '(sem parceiro)').replace(/[.~*/\[\]]/g, ' ').trim() || '(sem parceiro)';
+    const o = (out[m] = out[m] || {})[p] = out[m][p] || { qtd: 0, cobrado: 0, pagou: 0 };
+    o.qtd++; o.cobrado = clamp2(o.cobrado + (cobrado || 0)); o.pagou = clamp2(o.pagou + (pagou || 0));
+  };
+  resultados.forEach(r => add(r.cte.dhEmi, r.parceiro?.nome, r.cobrado, (!ehPrejuizoTotal(r) && r.valorFreteCliente != null) ? r.valorFreteCliente : 0));
+  reentregas.forEach(x => add(x.cte.dhEmi, x.parceiro?.nome, x.cte.vTPrest, 0));
+  outrosFluxos.forEach(x => add(x.cte.dhEmi, x.parceiro?.nome, x.cte.vTPrest, 0));
+  semParceiro.forEach(c => add(c.dhEmi, '(sem parceiro)', c.vTPrest, 0));
+  return out;
+}
+
 async function atualizarResumoDoLoteNoHistorico() {
   const v = STATE.ultimaValidacao;
   if (!v || !v.historicoId || !v.resultados?.length) return;
   // sem as análises carregadas não dá pra saber quem é "Sem erro" — não mexe no Histórico
   if (!STATE._revisoesCarregadas) return;
   const novo = montarRegistroHistorico(v.nomeArquivo, v).resumo;
-  const campos = ['qtdDivergenciaMaior', 'qtdDivergenciaMenor', 'valorDivergenteMaior', 'valorDivergenteMenor', 'totalCobrado', 'totalClientePagou', 'faturado', 'ajusteSemErro'];
+  const campos = ['qtdDivergenciaMaior', 'qtdDivergenciaMenor', 'valorDivergenteMaior', 'valorDivergenteMenor', 'totalCobrado', 'totalClientePagou', 'faturado', 'ajusteSemErro', 'porMes'];
   const anterior = v._resumoGravado || {};
-  if (campos.every(k => anterior[k] === novo[k])) return;
+  if (campos.every(k => JSON.stringify(anterior[k] ?? null) === JSON.stringify(novo[k] ?? null))) return;
   const patch = {}; campos.forEach(k => { patch[k] = novo[k] ?? null; });
   try {
     await comTimeout(DataLayer.atualizarResumoHistorico(v.historicoId, patch), 20000, 'atualizar o Histórico');
@@ -3552,8 +3813,24 @@ function processarArquivosNotas(arquivos, progressBoxId) {
   })();
 }
 
+// Cobrança indevida que a transportadora já ressarciu: análises "Erro da transportadora" com status
+// "Resolvido - Pago" (valor da diferença sem ICMS). Opcionalmente só dos CT-es informados.
+function ressarcimentosTransportadora(chaves) {
+  const filtro = chaves ? new Set(chaves) : null;
+  const pagos = [], abertos = [];
+  todasEntradasAnalise().forEach(e => {
+    if (e.classificacao !== 'transportadora' || (filtro && !filtro.has(e.chave))) return;
+    const v = valorAnalise(e);
+    if (!(v < 0)) return;
+    ((e.statusTratativa || 'pendente') === 'resolvido_pago' ? pagos : abertos).push({ ...e, valor: clamp2(-v) });
+  });
+  return { pagos, abertos, totalPago: clamp2(pagos.reduce((a, x) => a + x.valor, 0)), totalAberto: clamp2(abertos.reduce((a, x) => a + x.valor, 0)) };
+}
+
 function renderResumoFinanceiro(r) {
   const positivo = r.faturado >= 0;
+  const ress = r.ressarcido || 0;
+  const aposRess = clamp2((r.faturado || 0) + ress);
   return `
     <div class="mb-5 bg-white rounded-2xl shadow-panel border border-ink-100 p-5">
       <div class="flex items-center justify-between flex-wrap gap-4">
@@ -3575,9 +3852,20 @@ function renderResumoFinanceiro(r) {
           </div>` : ''}
           <div class="text-ink-300 text-xl">=</div>
           <div>
-            <div class="text-[11px] text-ink-400 font-medium uppercase tracking-wide">Faturado</div>
+            <div class="text-[11px] text-ink-400 font-medium uppercase tracking-wide">Faturado${ress ? ' (como cobrado)' : ''}</div>
             <div class="text-xl font-bold num ${positivo ? 'text-emerald-600' : 'text-red-600'}">${positivo ? '' : '-'}${fmtBRL(Math.abs(r.faturado))}</div>
           </div>
+          ${ress ? `
+          <div class="text-ink-300 text-xl">+</div>
+          <div title="Cobrança indevida (Erro da transportadora) já ressarcida: análises com status Resolvido - Pago — diferença sem ICMS">
+            <div class="text-[11px] text-emerald-600 font-medium uppercase tracking-wide">Ressarcido pela transportadora</div>
+            <div class="text-xl font-bold num text-emerald-700">${fmtBRL(ress)}</div>
+          </div>
+          <div class="text-ink-300 text-xl">=</div>
+          <div>
+            <div class="text-[11px] text-ink-400 font-medium uppercase tracking-wide">Faturado após ressarcimentos</div>
+            <div class="text-xl font-bold num ${aposRess >= 0 ? 'text-emerald-600' : 'text-red-600'}">${fmtBRL(aposRess)}</div>
+          </div>` : ''}
         </div>
         <div class="text-[11px] text-ink-300 max-w-sm">
           Faturado = soma do que o cliente pagou − soma do que a transportadora cobrou, sobre o lote inteiro. Devolução, reversa e reentrega entram só no "Cobrado" (o cliente não paga nada nesses casos).
@@ -3767,7 +4055,7 @@ function renderResultadosValidacao() {
 
     ${renderBarraFiltros(vAtual, filtrosRes, qtdFiltrada, qtdTotalLote)}
 
-    ${renderResumoFinanceiro(resumoFin)}
+    ${renderResumoFinanceiro({ ...resumoFin, ressarcido: ressarcimentosTransportadora(resultados.map(r => r.cte.chave)).totalPago })}
 
     <div class="grid grid-cols-5 gap-3 mb-3">
       ${filtroCard('todos', 'Todos os CT-es', qtdFiltrada, fmtBRL(cobradoFiltrado) + ' cobrado', 'ink')}
