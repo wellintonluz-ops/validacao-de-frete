@@ -210,7 +210,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-11-02-dashboard-transportadora';
+const APP_VERSION = '2026-11-02-cobrado-transportadora';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -2705,7 +2705,7 @@ function dadosIndicadores() {
 // Faturamento por transportadora, mês a mês (mesma base e filtros do Dashboard)
 function dadosPorTransportadora() {
   const historico = STATE._histDashboard || [];
-  const f = STATE._filtrosDash || {};
+  const f = { ...(STATE._filtrosDash || {}), transp: '' }; // sempre todas as transportadoras
   const dentro = m => m === 'sem-data' || ((!f.de || m >= f.de) && (!f.ate || m <= f.ate));
   const mapa = {}; const mesesSet = new Set();
   const cel = (p, m) => { mesesSet.add(m); const t = mapa[p] = mapa[p] || {}; return t[m] = t[m] || { qtd: 0, cobrado: 0, pagou: 0, ressarcido: 0, aprox: false }; };
@@ -2734,61 +2734,42 @@ function dadosPorTransportadora() {
     ['cobrado', 'pagou', 'ressarcido'].forEach(k => { tot[k] = clamp2(tot[k]); });
     tot.faturado = clamp2(tot.pagou - tot.cobrado); tot.faturadoAposRess = clamp2(tot.faturado + tot.ressarcido);
     return { parceiro: p, meses: ms, tot };
-  }).sort((a, b) => a.tot.faturado - b.tot.faturado); // pior resultado primeiro
+  }).sort((a, b) => b.tot.cobrado - a.tot.cobrado); // quem mais cobrou primeiro
   return { meses, linhas };
 }
-const METRICAS_TRANSP = [
-  { valor: 'faturado', label: 'Faturado (cliente pagou − cobrado)' },
-  { valor: 'faturadoAposRess', label: 'Faturado após ressarcimentos' },
-  { valor: 'pct', label: '% do faturado sobre o cobrado' },
-  { valor: 'cobrado', label: 'Cobrado (transportadora)' },
-  { valor: 'pagou', label: 'Cliente pagou' },
-];
-function valorMetrica(c, met) { if (!c) return null; if (met === 'pct') return c.cobrado ? clamp2(c.faturado / c.cobrado * 100) : null; return c[met]; }
-function fmtMetrica(v, met) { if (v === null || v === undefined) return '—'; return met === 'pct' ? `${v.toLocaleString('pt-BR', { maximumFractionDigits: 1 })}%` : fmtBRL(v); }
-
 function renderTabelaPorTransportadora() {
   const { meses, linhas } = dadosPorTransportadora();
   if (!linhas.length) return '';
-  const met = (STATE._filtrosDash || {}).metricaTransp || 'faturado';
-  const comSinal = ['faturado', 'faturadoAposRess', 'pct'].includes(met);
-  // fundo da célula: vermelho quando negativo, verde quando positivo (intensidade pelo tamanho)
-  const maxAbs = Math.max(1, ...linhas.flatMap(l => meses.map(m => Math.abs(valorMetrica(l.meses[m], met) || 0))));
-  const fundo = v => {
-    if (!comSinal || v === null || Math.abs(v) < 0.005) return '';
-    const a = (0.08 + 0.32 * Math.min(1, Math.abs(v) / maxAbs)).toFixed(2);
-    return v < 0 ? `background: rgba(220,38,38,${a})` : `background: rgba(5,150,105,${a})`;
-  };
-  const cor = v => !comSinal || v === null ? 'text-ink-700' : v < -0.005 ? 'text-red-700' : v > 0.005 ? 'text-emerald-700' : 'text-ink-500';
-  const totMes = m => { const c = { cobrado: 0, pagou: 0, ressarcido: 0 }; linhas.forEach(l => { const x = l.meses[m]; if (x) ['cobrado', 'pagou', 'ressarcido'].forEach(k => { c[k] += x[k]; }); }); ['cobrado', 'pagou', 'ressarcido'].forEach(k => { c[k] = clamp2(c[k]); }); c.faturado = clamp2(c.pagou - c.cobrado); c.faturadoAposRess = clamp2(c.faturado + c.ressarcido); return c; };
-  const totGeral = (() => { const c = { cobrado: 0, pagou: 0, ressarcido: 0 }; linhas.forEach(l => ['cobrado', 'pagou', 'ressarcido'].forEach(k => { c[k] += l.tot[k]; })); ['cobrado', 'pagou', 'ressarcido'].forEach(k => { c[k] = clamp2(c[k]); }); c.faturado = clamp2(c.pagou - c.cobrado); c.faturadoAposRess = clamp2(c.faturado + c.ressarcido); return c; })();
+  // intensidade do fundo pelo tamanho do valor cobrado
+  const maxV = Math.max(1, ...linhas.flatMap(l => meses.map(m => (l.meses[m] || {}).cobrado || 0)));
+  const fundo = v => v ? `background: rgba(100,116,139,${(0.06 + 0.3 * Math.min(1, v / maxV)).toFixed(2)})` : '';
+  const totMes = m => clamp2(linhas.reduce((a, l) => a + ((l.meses[m] || {}).cobrado || 0), 0));
+  const totGeral = clamp2(linhas.reduce((a, l) => a + l.tot.cobrado, 0));
   return `
     <div class="bg-white rounded-2xl shadow-panel border border-ink-100 p-6 mt-6">
-      <div class="flex items-center justify-between flex-wrap gap-3 mb-1">
-        <h2 class="font-semibold text-ink-900">Faturamento por transportadora, mês a mês</h2>
-        <label class="text-xs text-ink-500 flex items-center gap-2">Mostrar
-          <select data-filtro-dash="metricaTransp" class="border border-ink-200 rounded-lg px-2 py-1.5">${METRICAS_TRANSP.map(x => `<option value="${x.valor}" ${met === x.valor ? 'selected' : ''}>${x.label}</option>`).join('')}</select>
-        </label>
-      </div>
-      <p class="text-xs text-ink-400 mb-4">Ordenado do pior para o melhor faturado no período. Verde = cliente pagou mais do que a transportadora cobrou; vermelho = prejuízo no frete.</p>
+      <h2 class="font-semibold text-ink-900 mb-1">Cobrado por transportadora, mês a mês</h2>
+      <p class="text-xs text-ink-400 mb-4">Quanto cada transportadora cobrou em cada mês (valor total dos CT-es, pelo mês de emissão) — todas as transportadoras, no período escolhido acima. Ordenado de quem mais cobrou para quem menos cobrou.</p>
       <div class="overflow-x-auto">
         <table class="w-full text-sm">
           <thead><tr class="text-ink-500 text-[11px] uppercase tracking-wide border-b border-ink-100">
             <th class="text-left font-semibold px-3 py-2 sticky left-0 bg-white">Transportadora</th>
             ${meses.map(m => `<th class="text-right font-semibold px-3 py-2 whitespace-nowrap">${rotuloMes(m)}</th>`).join('')}
             <th class="text-right font-semibold px-3 py-2 bg-ink-50">Total</th>
+            <th class="text-right font-semibold px-3 py-2 bg-ink-50">% do total</th>
           </tr></thead>
           <tbody class="divide-y divide-ink-50">
             ${linhas.map(l => `<tr>
               <td class="px-3 py-2 text-ink-800 font-medium whitespace-nowrap sticky left-0 bg-white">${escapeHtml(l.parceiro)}<div class="text-[10px] text-ink-400 font-normal">${l.tot.qtd.toLocaleString('pt-BR')} CT-e(s)</div></td>
-              ${meses.map(m => { const c = l.meses[m]; const v = valorMetrica(c, met); return `<td class="px-3 py-2 text-right num whitespace-nowrap ${cor(v)}" style="${fundo(v)}" title="${c ? `${escapeHtml(l.parceiro)} · ${rotuloMes(m)}\nCT-es: ${c.qtd}\nCobrado: ${fmtBRL(c.cobrado)}\nCliente pagou: ${fmtBRL(c.pagou)}\nFaturado: ${fmtBRL(c.faturado)}${c.ressarcido ? `\nRessarcido: ${fmtBRL(c.ressarcido)}` : ''}${c.aprox ? '\n(lote antigo — mês de importação)' : ''}` : 'sem CT-e no mês'}">${fmtMetrica(v, met)}${c && c.aprox ? '<span class="text-amber-600">*</span>' : ''}</td>`; }).join('')}
-              <td class="px-3 py-2 text-right num font-semibold whitespace-nowrap bg-ink-50 ${cor(valorMetrica(l.tot, met))}">${fmtMetrica(valorMetrica(l.tot, met), met)}</td>
+              ${meses.map(m => { const c = l.meses[m]; const v = c ? c.cobrado : 0; return `<td class="px-3 py-2 text-right num whitespace-nowrap text-ink-800" style="${fundo(v)}" title="${c ? `${escapeHtml(l.parceiro)} · ${rotuloMes(m)}\\n${c.qtd} CT-e(s) · cobrado ${fmtBRL(c.cobrado)}${c.aprox ? '\\n(lote antigo — mês de importação)' : ''}` : 'sem CT-e no mês'}">${c ? fmtBRL(v) : '<span class="text-ink-300">—</span>'}${c && c.aprox ? '<span class="text-amber-600">*</span>' : ''}</td>`; }).join('')}
+              <td class="px-3 py-2 text-right num font-semibold whitespace-nowrap bg-ink-50 text-ink-900">${fmtBRL(l.tot.cobrado)}</td>
+              <td class="px-3 py-2 text-right num whitespace-nowrap bg-ink-50 text-ink-500">${totGeral ? (l.tot.cobrado / totGeral * 100).toLocaleString('pt-BR', { maximumFractionDigits: 1 }) + '%' : '—'}</td>
             </tr>`).join('')}
           </tbody>
           <tfoot><tr class="border-t-2 border-ink-200 font-semibold">
             <td class="px-3 py-2 text-ink-800 sticky left-0 bg-white">Total</td>
-            ${meses.map(m => { const v = valorMetrica(totMes(m), met); return `<td class="px-3 py-2 text-right num whitespace-nowrap ${cor(v)}">${fmtMetrica(v, met)}</td>`; }).join('')}
-            <td class="px-3 py-2 text-right num whitespace-nowrap bg-ink-50 ${cor(valorMetrica(totGeral, met))}">${fmtMetrica(valorMetrica(totGeral, met), met)}</td>
+            ${meses.map(m => `<td class="px-3 py-2 text-right num whitespace-nowrap text-ink-900">${fmtBRL(totMes(m))}</td>`).join('')}
+            <td class="px-3 py-2 text-right num whitespace-nowrap bg-ink-50 text-ink-900">${fmtBRL(totGeral)}</td>
+            <td class="px-3 py-2 text-right num whitespace-nowrap bg-ink-50 text-ink-500">100%</td>
           </tr></tfoot>
         </table>
       </div>
@@ -2932,14 +2913,12 @@ function exportarIndicadoresXlsx(meses, tot) {
   linhas.push([]); linhas.push([`Transportadora: ${f.transp || 'todas'} · Período: ${f.de || 'início'} a ${f.ate || 'hoje'} · mês de emissão do CT-e`]);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(linhas), 'Mês a mês');
-  // por transportadora: uma linha por transportadora × mês
+  // cobrado por transportadora × mês (igual à tabela da tela)
   const pt = dadosPorTransportadora();
-  const lt = [['Transportadora', 'Mês', 'CT-es', 'Cobrado (R$)', 'Cliente pagou (R$)', 'Faturado (R$)', '% sobre cobrado', 'Ressarcido (R$)', 'Faturado após ressarcimentos (R$)']];
-  pt.linhas.forEach(l => {
-    pt.meses.forEach(m => { const c = l.meses[m]; if (c) lt.push([l.parceiro, rotuloMes(m) + (c.aprox ? ' *' : ''), c.qtd, c.cobrado, c.pagou, c.faturado, c.cobrado ? clamp2(c.faturado / c.cobrado * 100) : '', c.ressarcido, c.faturadoAposRess]); });
-    lt.push([l.parceiro, 'Total', l.tot.qtd, l.tot.cobrado, l.tot.pagou, l.tot.faturado, l.tot.cobrado ? clamp2(l.tot.faturado / l.tot.cobrado * 100) : '', l.tot.ressarcido, l.tot.faturadoAposRess]);
-  });
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(lt), 'Por transportadora');
+  const lt = [['Transportadora', 'CT-es', ...pt.meses.map(m => rotuloMes(m) + ' (R$)'), 'Total cobrado (R$)']];
+  pt.linhas.forEach(l => lt.push([l.parceiro, l.tot.qtd, ...pt.meses.map(m => l.meses[m] ? l.meses[m].cobrado : 0), l.tot.cobrado]));
+  lt.push(['Total', pt.linhas.reduce((a, l) => a + l.tot.qtd, 0), ...pt.meses.map(m => clamp2(pt.linhas.reduce((a, l) => a + ((l.meses[m] || {}).cobrado || 0), 0))), clamp2(pt.linhas.reduce((a, l) => a + l.tot.cobrado, 0))]);
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(lt), 'Cobrado por transportadora');
   const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
   downloadBlob(new Blob([out], { type: 'application/octet-stream' }), `Dashboard_Fretes${f.transp ? '_' + f.transp.split(' ')[0] : ''}.xlsx`);
 }
