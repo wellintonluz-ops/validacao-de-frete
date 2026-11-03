@@ -210,7 +210,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-11-02-cobrado-transportadora';
+const APP_VERSION = '2026-11-03-dashboard-vencimento';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -2656,39 +2656,50 @@ async function renderIndicadores() {
   desenharIndicadores();
 }
 
+// Mês de referência dos indicadores = MÊS DE VENCIMENTO DA FATURA do lote. Lote sem vencimento
+// informado (anterior ao campo de fatura) entra no mês em que foi importado, marcado com "*".
+function mesVencimento(v) { return /^\d{4}-\d{2}/.test(v || '') ? String(v).slice(0, 7) : null; }
+function registrosFaturaDashboard() {
+  const regs = [];
+  (STATE._histDashboard || []).forEach(h => {
+    const r = h.resumo || {};
+    if (r.totalCobrado == null && !(r.porMes && Object.keys(r.porMes).length)) return;
+    const mv = mesVencimento(h.vencimentoFatura);
+    const mes = mv || (h.criadoEm || '').slice(0, 7) || 'sem-data';
+    const semVenc = !mv;
+    if (r.porMes && Object.keys(r.porMes).length) {
+      // soma a quebra por transportadora de todos os meses de emissão do lote e põe no mês do vencimento
+      const porP = {};
+      Object.values(r.porMes).forEach(ps => Object.entries(ps).forEach(([p, o]) => { const x = porP[p] = porP[p] || { qtd: 0, cobrado: 0, pagou: 0 }; x.qtd += o.qtd || 0; x.cobrado += o.cobrado || 0; x.pagou += o.pagou || 0; }));
+      Object.entries(porP).forEach(([p, o]) => regs.push({ mes, parceiro: p, ...o, semVenc, semQuebra: false }));
+    } else {
+      const umaSo = r.parceiros && r.parceiros.length === 1;
+      regs.push({ mes, parceiro: umaSo ? r.parceiros[0] : '(vários — lote antigo)', qtd: r.total || 0, cobrado: r.totalCobrado || 0, pagou: r.totalClientePagou || 0, semVenc, semQuebra: !umaSo, parceirosLote: r.parceiros || [] });
+    }
+  });
+  return regs;
+}
+function mesRessarcimento(e) { return mesVencimento(e.vencimentoFatura) || (/^\d{4}-\d{2}/.test(e.dhEmi || '') ? e.dhEmi.slice(0, 7) : 'sem-data'); }
+
 function dadosIndicadores() {
   const historico = STATE._histDashboard || [];
   const f = STATE._filtrosDash = STATE._filtrosDash || {};
   const porMes = {};
   const parceiros = new Set();
-  let lotesAprox = 0;
-  const soma = (m, p, o, aprox) => {
-    if (f.transp && p !== f.transp) return;
-    const x = porMes[m] = porMes[m] || { mes: m, qtd: 0, cobrado: 0, pagou: 0, ressarcido: 0, aRecuperar: 0, aprox: false };
-    x.qtd += o.qtd || 0; x.cobrado += o.cobrado || 0; x.pagou += o.pagou || 0;
-    if (aprox) x.aprox = true;
-  };
-  historico.forEach(h => {
-    const r = h.resumo || {};
-    if (r.porMes && Object.keys(r.porMes).length) {
-      Object.entries(r.porMes).forEach(([m, ps]) => Object.entries(ps).forEach(([p, o]) => { parceiros.add(p); soma(m, p, o, false); }));
-    } else if (r.totalCobrado != null) {
-      // lote antigo, sem a quebra por mês: entra inteiro no mês de importação (aproximado)
-      lotesAprox++;
-      const m = (h.criadoEm || '').slice(0, 7) || 'sem-data';
-      const ps = r.parceiros && r.parceiros.length === 1 ? r.parceiros[0] : null;
-      (r.parceiros || []).forEach(p => parceiros.add(p));
-      if (f.transp && ps !== f.transp) return;
-      soma(m, ps || '(vários)', { qtd: r.total || 0, cobrado: r.totalCobrado || 0, pagou: r.totalClientePagou || 0 }, true);
-    }
+  const novo = m => porMes[m] = porMes[m] || { mes: m, qtd: 0, cobrado: 0, pagou: 0, ressarcido: 0, aRecuperar: 0, aprox: false };
+  const regs = registrosFaturaDashboard();
+  regs.forEach(g => {
+    (g.parceirosLote && g.parceirosLote.length ? g.parceirosLote : [g.parceiro]).forEach(p => { if (!/^\(vários/.test(p)) parceiros.add(p); });
+    if (f.transp && g.parceiro !== f.transp) return;
+    const x = novo(g.mes);
+    x.qtd += g.qtd; x.cobrado += g.cobrado; x.pagou += g.pagou;
+    if (g.semVenc) x.aprox = true;
   });
-  // ressarcimentos e cobrança indevida em aberto (Análises), pelo mês de emissão do CT-e
+  // ressarcimentos e cobrança indevida em aberto (Análises), pelo vencimento da fatura do CT-e
   const ress = ressarcimentosTransportadora(null);
   const somaRess = (lista, campo) => lista.forEach(e => {
     if (f.transp && e.parceiroNome !== f.transp) return;
-    const m = /^\d{4}-\d{2}/.test(e.dhEmi || '') ? e.dhEmi.slice(0, 7) : 'sem-data';
-    const x = porMes[m] = porMes[m] || { mes: m, qtd: 0, cobrado: 0, pagou: 0, ressarcido: 0, aRecuperar: 0, aprox: false };
-    x[campo] += e.valor;
+    novo(mesRessarcimento(e))[campo] += e.valor;
   });
   somaRess(ress.pagos, 'ressarcido'); somaRess(ress.abertos, 'aRecuperar');
   let meses = Object.values(porMes).sort((a, b) => a.mes.localeCompare(b.mes));
@@ -2699,32 +2710,25 @@ function dadosIndicadores() {
     x.faturado = clamp2(x.pagou - x.cobrado);
     x.faturadoAposRess = clamp2(x.faturado + x.ressarcido);
   });
-  return { meses, parceiros: Array.from(parceiros).filter(p => p !== '(vários)').sort(), lotesAprox, qtdLotes: historico.length };
+  const lotesSemVenc = historico.filter(h => !mesVencimento(h.vencimentoFatura) && h.resumo && h.resumo.totalCobrado != null).length;
+  const lotesSemQuebra = historico.filter(h => h.resumo && !(h.resumo.porMes && Object.keys(h.resumo.porMes).length) && (h.resumo.parceiros || []).length > 1).length;
+  return { meses, parceiros: Array.from(parceiros).sort(), lotesSemVenc, lotesSemQuebra, qtdLotes: historico.length };
 }
 
-// Faturamento por transportadora, mês a mês (mesma base e filtros do Dashboard)
+// Cobrado por transportadora, mês a mês (mês de vencimento da fatura; sempre todas as transportadoras)
 function dadosPorTransportadora() {
-  const historico = STATE._histDashboard || [];
-  const f = { ...(STATE._filtrosDash || {}), transp: '' }; // sempre todas as transportadoras
+  const f = STATE._filtrosDash || {};
   const dentro = m => m === 'sem-data' || ((!f.de || m >= f.de) && (!f.ate || m <= f.ate));
   const mapa = {}; const mesesSet = new Set();
   const cel = (p, m) => { mesesSet.add(m); const t = mapa[p] = mapa[p] || {}; return t[m] = t[m] || { qtd: 0, cobrado: 0, pagou: 0, ressarcido: 0, aprox: false }; };
-  historico.forEach(h => {
-    const r = h.resumo || {};
-    if (r.porMes && Object.keys(r.porMes).length) {
-      Object.entries(r.porMes).forEach(([m, ps]) => { if (!dentro(m)) return; Object.entries(ps).forEach(([p, o]) => { if (f.transp && p !== f.transp) return; const c = cel(p, m); c.qtd += o.qtd || 0; c.cobrado += o.cobrado || 0; c.pagou += o.pagou || 0; }); });
-    } else if (r.totalCobrado != null) {
-      const m = (h.criadoEm || '').slice(0, 7) || 'sem-data';
-      if (!dentro(m)) return;
-      const p = r.parceiros && r.parceiros.length === 1 ? r.parceiros[0] : '(vários — lote antigo)';
-      if (f.transp && p !== f.transp) return;
-      const c = cel(p, m); c.qtd += r.total || 0; c.cobrado += r.totalCobrado || 0; c.pagou += r.totalClientePagou || 0; c.aprox = true;
-    }
+  registrosFaturaDashboard().forEach(g => {
+    if (!dentro(g.mes)) return;
+    const c = cel(g.parceiro, g.mes); c.qtd += g.qtd; c.cobrado += g.cobrado; c.pagou += g.pagou; if (g.semVenc) c.aprox = true;
   });
   ressarcimentosTransportadora(null).pagos.forEach(e => {
     const p = (e.parceiroNome || '(sem parceiro)').replace(/[.~*/\[\]]/g, ' ').trim();
-    const m = /^\d{4}-\d{2}/.test(e.dhEmi || '') ? e.dhEmi.slice(0, 7) : 'sem-data';
-    if (!dentro(m) || (f.transp && p !== f.transp)) return;
+    const m = mesRessarcimento(e);
+    if (!dentro(m)) return;
     cel(p, m).ressarcido += e.valor;
   });
   const meses = Array.from(mesesSet).sort();
@@ -2737,6 +2741,7 @@ function dadosPorTransportadora() {
   }).sort((a, b) => b.tot.cobrado - a.tot.cobrado); // quem mais cobrou primeiro
   return { meses, linhas };
 }
+
 function renderTabelaPorTransportadora() {
   const { meses, linhas } = dadosPorTransportadora();
   if (!linhas.length) return '';
@@ -2748,7 +2753,7 @@ function renderTabelaPorTransportadora() {
   return `
     <div class="bg-white rounded-2xl shadow-panel border border-ink-100 p-6 mt-6">
       <h2 class="font-semibold text-ink-900 mb-1">Cobrado por transportadora, mês a mês</h2>
-      <p class="text-xs text-ink-400 mb-4">Quanto cada transportadora cobrou em cada mês (valor total dos CT-es, pelo mês de emissão) — todas as transportadoras, no período escolhido acima. Ordenado de quem mais cobrou para quem menos cobrou.</p>
+      <p class="text-xs text-ink-400 mb-4">Quanto cada transportadora cobrou em cada mês (valor total dos CT-es, pelo mês de vencimento da fatura) — todas as transportadoras, no período escolhido acima. Ordenado de quem mais cobrou para quem menos cobrou.</p>
       <div class="overflow-x-auto">
         <table class="w-full text-sm">
           <thead><tr class="text-ink-500 text-[11px] uppercase tracking-wide border-b border-ink-100">
@@ -2760,7 +2765,7 @@ function renderTabelaPorTransportadora() {
           <tbody class="divide-y divide-ink-50">
             ${linhas.map(l => `<tr>
               <td class="px-3 py-2 text-ink-800 font-medium whitespace-nowrap sticky left-0 bg-white">${escapeHtml(l.parceiro)}<div class="text-[10px] text-ink-400 font-normal">${l.tot.qtd.toLocaleString('pt-BR')} CT-e(s)</div></td>
-              ${meses.map(m => { const c = l.meses[m]; const v = c ? c.cobrado : 0; return `<td class="px-3 py-2 text-right num whitespace-nowrap text-ink-800" style="${fundo(v)}" title="${c ? `${escapeHtml(l.parceiro)} · ${rotuloMes(m)}\\n${c.qtd} CT-e(s) · cobrado ${fmtBRL(c.cobrado)}${c.aprox ? '\\n(lote antigo — mês de importação)' : ''}` : 'sem CT-e no mês'}">${c ? fmtBRL(v) : '<span class="text-ink-300">—</span>'}${c && c.aprox ? '<span class="text-amber-600">*</span>' : ''}</td>`; }).join('')}
+              ${meses.map(m => { const c = l.meses[m] && l.meses[m].qtd ? l.meses[m] : null; const v = c ? c.cobrado : 0; return `<td class="px-3 py-2 text-right num whitespace-nowrap text-ink-800" style="${fundo(v)}" title="${c ? `${escapeHtml(l.parceiro)} · ${rotuloMes(m)}\n${c.qtd} CT-e(s) · cobrado ${fmtBRL(c.cobrado)}${c.aprox ? '\n(lote sem vencimento da fatura — mês de importação)' : ''}` : 'sem CT-e no mês'}">${c ? fmtBRL(v) : '<span class="text-ink-300">—</span>'}${c && c.aprox ? '<span class="text-amber-600">*</span>' : ''}</td>`; }).join('')}
               <td class="px-3 py-2 text-right num font-semibold whitespace-nowrap bg-ink-50 text-ink-900">${fmtBRL(l.tot.cobrado)}</td>
               <td class="px-3 py-2 text-right num whitespace-nowrap bg-ink-50 text-ink-500">${totGeral ? (l.tot.cobrado / totGeral * 100).toLocaleString('pt-BR', { maximumFractionDigits: 1 }) + '%' : '—'}</td>
             </tr>`).join('')}
@@ -2813,7 +2818,7 @@ function graficoMensalSvg(meses) {
 function desenharIndicadores() {
   const el = $('#indicadoresContent');
   const f = STATE._filtrosDash = STATE._filtrosDash || {};
-  const { meses, parceiros, lotesAprox, qtdLotes } = dadosIndicadores();
+  const { meses, parceiros, lotesSemVenc, lotesSemQuebra, qtdLotes } = dadosIndicadores();
   const tot = meses.reduce((a, x) => { ['qtd', 'cobrado', 'pagou', 'faturado', 'ressarcido', 'faturadoAposRess', 'aRecuperar'].forEach(k => { a[k] = clamp2((a[k] || 0) + (x[k] || 0)); }); return a; }, {});
   const cor = v => v < -0.005 ? 'text-red-600' : v > 0.005 ? 'text-emerald-600' : 'text-ink-600';
   const pct = (v, base) => base ? `${(v / base * 100).toLocaleString('pt-BR', { maximumFractionDigits: 1 })}%` : '—';
@@ -2827,7 +2832,7 @@ function desenharIndicadores() {
         <button id="btnAtualizarDash" class="text-sm font-medium text-ink-600 hover:text-ink-800">Atualizar</button>
       </div>
     </div>
-    <p class="text-sm text-ink-400 mb-6">Cobrado pela transportadora × pago pelo cliente × faturado, mês a mês — pelo <strong>mês de emissão do CT-e</strong>, somando todos os lotes do Histórico (${qtdLotes}).</p>
+    <p class="text-sm text-ink-400 mb-6">Cobrado pela transportadora × pago pelo cliente × faturado, mês a mês — pelo <strong>mês de vencimento da fatura</strong>, somando todos os lotes do Histórico (${qtdLotes}).</p>
 
     <div class="mb-6 bg-white rounded-2xl border border-ink-100 px-4 py-3 flex flex-wrap items-end gap-4 text-xs">
       <label class="text-ink-500">Transportadora
@@ -2867,7 +2872,7 @@ function desenharIndicadores() {
         </tr></thead>
         <tbody class="divide-y divide-ink-100">
           ${meses.slice().reverse().map(x => `<tr class="hover:bg-ink-50/60">
-            <td class="px-4 py-2.5 text-ink-700 font-medium">${rotuloMes(x.mes)}${x.aprox ? ' <span class="text-[10px] text-amber-600" title="Inclui lote antigo sem a quebra por mês — entrou inteiro no mês em que foi importado">*</span>' : ''}</td>
+            <td class="px-4 py-2.5 text-ink-700 font-medium">${rotuloMes(x.mes)}${x.aprox ? ' <span class="text-[10px] text-amber-600" title="Inclui lote sem data de vencimento da fatura — entrou no mês em que foi importado">*</span>' : ''}</td>
             <td class="px-4 py-2.5 text-right num text-ink-600">${x.qtd.toLocaleString('pt-BR')}</td>
             <td class="px-4 py-2.5 text-right num text-ink-700">${fmtBRL(x.cobrado)}</td>
             <td class="px-4 py-2.5 text-right num text-ink-700">${fmtBRL(x.pagou)}</td>
@@ -2892,11 +2897,12 @@ function desenharIndicadores() {
       </table>
     </div>
     ${renderTabelaPorTransportadora()}`}
-    ${lotesAprox ? `<div class="mt-4 text-xs px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200 flex items-center justify-between gap-3">
-      <span>* ${lotesAprox} lote(s) salvo(s) antes deste painel ainda não têm a quebra por mês de emissão — entraram inteiros no mês em que foram importados${f.transp ? ' (e só aparecem no filtro de transportadora quando o lote é de uma transportadora só)' : ''}.</span>
-      <button id="btnDetalharLotesAntigos" class="shrink-0 bg-white border border-amber-300 hover:bg-amber-100 font-medium rounded-lg px-3 py-1.5">Separar por mês agora</button>
+    ${lotesSemVenc ? `<div class="mt-4 text-xs px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200">* ${lotesSemVenc} lote(s) sem data de vencimento da fatura (salvos antes desse campo existir) — entraram no mês em que foram importados.</div>` : ''}
+    ${lotesSemQuebra ? `<div class="mt-2 text-xs px-3 py-2.5 rounded-lg bg-amber-50 text-amber-800 border border-amber-200 flex items-center justify-between gap-3">
+      <span>${lotesSemQuebra} lote(s) antigo(s) com mais de uma transportadora ainda não têm a separação por transportadora — aparecem como "(vários — lote antigo)".</span>
+      <button id="btnDetalharLotesAntigos" class="shrink-0 bg-white border border-amber-300 hover:bg-amber-100 font-medium rounded-lg px-3 py-1.5">Separar por transportadora agora</button>
     </div>` : ''}
-    <p class="text-xs text-ink-300 mt-3">Faturado = soma do que o cliente pagou − soma do que a transportadora cobrou (mesma regra do Histórico: devolução, reposição, redespacho, uso e consumo e complemento de taxa entram só no cobrado). Ressarcido / A recuperar vêm da aba Análises (Erro da transportadora, diferença sem ICMS).</p>
+    <p class="text-xs text-ink-300 mt-3">Faturado = soma do que o cliente pagou − soma do que a transportadora cobrou (mesma regra do Histórico: devolução, reposição, redespacho, uso e consumo e complemento de taxa entram só no cobrado). Ressarcido / A recuperar vêm da aba Análises (Erro da transportadora, diferença sem ICMS), pelo vencimento da fatura do CT-e.</p>
   `;
   $$('[data-filtro-dash]').forEach(i => i.addEventListener('change', () => { STATE._filtrosDash[i.dataset.filtroDash] = i.value; desenharIndicadores(); }));
   const lim = $('#btnLimparDash'); if (lim) lim.addEventListener('click', () => { STATE._filtrosDash = {}; desenharIndicadores(); });
@@ -2910,7 +2916,7 @@ function exportarIndicadoresXlsx(meses, tot) {
   const linhas = [['Mês', 'CT-es', 'Cobrado (R$)', 'Cliente pagou (R$)', 'Faturado (R$)', '% sobre cobrado', 'Ressarcido (R$)', 'Faturado após ressarcimentos (R$)', 'A recuperar (R$)']];
   meses.forEach(x => linhas.push([rotuloMes(x.mes) + (x.aprox ? ' *' : ''), x.qtd, x.cobrado, x.pagou, x.faturado, x.cobrado ? clamp2(x.faturado / x.cobrado * 100) : '', x.ressarcido, x.faturadoAposRess, x.aRecuperar]));
   linhas.push(['Total', tot.qtd || 0, tot.cobrado || 0, tot.pagou || 0, tot.faturado || 0, tot.cobrado ? clamp2(tot.faturado / tot.cobrado * 100) : '', tot.ressarcido || 0, tot.faturadoAposRess || 0, tot.aRecuperar || 0]);
-  linhas.push([]); linhas.push([`Transportadora: ${f.transp || 'todas'} · Período: ${f.de || 'início'} a ${f.ate || 'hoje'} · mês de emissão do CT-e`]);
+  linhas.push([]); linhas.push([`Transportadora: ${f.transp || 'todas'} · Período: ${f.de || 'início'} a ${f.ate || 'hoje'} · mês de vencimento da fatura`]);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(linhas), 'Mês a mês');
   // cobrado por transportadora × mês (igual à tabela da tela)
@@ -2926,7 +2932,7 @@ function exportarIndicadoresXlsx(meses, tot) {
 // lotes salvos antes do painel: lê o detalhe gravado e grava a quebra por mês (1 gravação por lote)
 async function detalharLotesAntigosPorMes() {
   const btn = $('#btnDetalharLotesAntigos');
-  const alvos = (STATE._histDashboard || []).filter(h => !(h.resumo && h.resumo.porMes && Object.keys(h.resumo.porMes).length) && h.detalheDisponivel);
+  const alvos = (STATE._histDashboard || []).filter(h => !(h.resumo && h.resumo.porMes && Object.keys(h.resumo.porMes).length) && (h.resumo?.parceiros || []).length > 1 && h.detalheDisponivel);
   if (!alvos.length) { toast('Os lotes antigos não têm o detalhe por CT-e gravado — dá pra separar por mês só reabrindo o lote com os XMLs.', 'warn'); return; }
   let ok = 0, falhas = 0;
   for (const h of alvos) {
@@ -2939,7 +2945,7 @@ async function detalharLotesAntigosPorMes() {
       ok++;
     } catch (e) { console.error('[Dashboard] lote', h.id, e); falhas++; }
   }
-  toast(`${ok} lote(s) separado(s) por mês de emissão${falhas ? ` · ${falhas} com falha (veja o console)` : ''}.`, falhas ? 'warn' : 'success');
+  toast(`${ok} lote(s) separado(s) por transportadora${falhas ? ` · ${falhas} com falha (veja o console)` : ''}.`, falhas ? 'warn' : 'success');
   desenharIndicadores();
 }
 
