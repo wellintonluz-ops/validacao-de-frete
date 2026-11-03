@@ -210,7 +210,7 @@ tailwind.config = {
 // ---------------------------------------------------------------------
 // Versão deste arquivo — muda a cada entrega. Confira na barra lateral (rodapé) se o
 // navegador está mesmo rodando essa versão antes de reportar um problema como bug.
-const APP_VERSION = '2026-11-03-dashboard-vencimento';
+const APP_VERSION = '2026-11-03-vencimento-ano';
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyBGctWGTrjLDwObmmSOzmE9Rec8CnHXXYg",
@@ -2658,7 +2658,13 @@ async function renderIndicadores() {
 
 // Mês de referência dos indicadores = MÊS DE VENCIMENTO DA FATURA do lote. Lote sem vencimento
 // informado (anterior ao campo de fatura) entra no mês em que foi importado, marcado com "*".
-function mesVencimento(v) { return /^\d{4}-\d{2}/.test(v || '') ? String(v).slice(0, 7) : null; }
+function mesVencimento(v) {
+  const m = /^(\d{4})-(\d{2})/.exec(v || '');
+  if (!m) return null;
+  let ano = parseInt(m[1], 10);
+  if (ano < 100) ano += 2000; // "0026-09-21" (ano digitado com 2 dígitos) = 2026
+  return ano >= 2000 && ano <= 2099 ? `${ano}-${m[2]}` : null;
+}
 function registrosFaturaDashboard() {
   const regs = [];
   (STATE._histDashboard || []).forEach(h => {
@@ -3451,7 +3457,7 @@ function renderBoxFatura() {
           <input id="faturaNumeroIni" value="${escapeHtml(r.numero || '')}" placeholder="ex: TRX 3819" class="block mt-1 border border-ink-200 rounded-lg px-3 py-2 text-sm w-48">
         </label>
         <label class="text-xs text-ink-500">Data de vencimento *
-          <input id="faturaVencIni" type="date" value="${escapeHtml(r.vencimento || '')}" class="block mt-1 border border-ink-200 rounded-lg px-3 py-2 text-sm">
+          <input id="faturaVencIni" type="date" min="2020-01-01" max="2099-12-31" value="${escapeHtml(r.vencimento || '')}" class="block mt-1 border border-ink-200 rounded-lg px-3 py-2 text-sm">
         </label>
         <button id="btnOkFatura" class="bg-ink-900 hover:bg-ink-800 text-white text-sm font-semibold rounded-lg px-5 py-2">OK</button>
       </div>
@@ -3462,6 +3468,7 @@ function renderBoxFatura() {
     $('#faturaNumeroIni').classList.toggle('ring-2', !numero); $('#faturaNumeroIni').classList.toggle('ring-red-300', !numero);
     $('#faturaVencIni').classList.toggle('ring-2', !vencimento); $('#faturaVencIni').classList.toggle('ring-red-300', !vencimento);
     if (!numero || !vencimento) { toast('Preencha o Nº da fatura e a data de vencimento.', 'error'); return; }
+    if (!vencimentoValido(vencimento)) { $('#faturaVencIni').classList.add('ring-2', 'ring-red-300'); avisarVencimentoInvalido(vencimento); return; }
     STATE._faturaAtual = { numero, vencimento };
     STATE._faturaRascunho = null;
     renderBoxFatura();
@@ -3469,6 +3476,18 @@ function renderBoxFatura() {
   };
   $('#btnOkFatura').addEventListener('click', confirmar);
   ['#faturaNumeroIni', '#faturaVencIni'].forEach(sel => $(sel).addEventListener('keydown', (e) => { if (e.key === 'Enter') confirmar(); }));
+}
+
+// vencimento com ano fora do razoável (ex.: "0026-09-21", ano digitado com 2 dígitos) é recusado
+function vencimentoValido(v) {
+  const m = /^(\d{4})-\d{2}-\d{2}$/.exec(v || '');
+  if (!m) return false;
+  const ano = parseInt(m[1], 10);
+  return ano >= 2020 && ano <= 2099;
+}
+function avisarVencimentoInvalido(v) {
+  const ano = (/^(\d{4})/.exec(v || '') || [])[1];
+  toast(`O ano do vencimento parece errado${ano ? ` (${ano})` : ''} — confira a data (ex.: 21/09/2026).`, 'error');
 }
 
 // Alterar a fatura de um lote já importado (antes de salvar, ou já salvo — atualiza o Histórico)
@@ -3480,7 +3499,7 @@ function perguntarFatura(atual) {
       <div class="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6">
         <div class="text-base font-semibold text-ink-900 mb-3">Dados da fatura</div>
         <label class="text-xs text-ink-500 block mb-3">Nº da fatura *<input id="pfNum" value="${escapeHtml(atual.numero || '')}" class="block mt-1 w-full border border-ink-200 rounded-lg px-3 py-2 text-sm"></label>
-        <label class="text-xs text-ink-500 block mb-5">Data de vencimento *<input id="pfVenc" type="date" value="${escapeHtml(atual.vencimento || '')}" class="block mt-1 w-full border border-ink-200 rounded-lg px-3 py-2 text-sm"></label>
+        <label class="text-xs text-ink-500 block mb-5">Data de vencimento *<input id="pfVenc" type="date" min="2020-01-01" max="2099-12-31" value="${escapeHtml(atual.vencimento || '')}" class="block mt-1 w-full border border-ink-200 rounded-lg px-3 py-2 text-sm"></label>
         <div class="flex justify-end gap-2">
           <button data-r="cancelar" class="px-3 py-2 rounded-lg text-sm text-ink-600 hover:bg-ink-50">Cancelar</button>
           <button data-r="ok" class="px-4 py-2 rounded-lg text-sm font-semibold text-white bg-ink-900 hover:bg-ink-800">OK</button>
@@ -3493,6 +3512,7 @@ function perguntarFatura(atual) {
       if (b.dataset.r === 'cancelar') { wrap.remove(); resolve(null); return; }
       const numero = wrap.querySelector('#pfNum').value.trim(), vencimento = wrap.querySelector('#pfVenc').value;
       if (!numero || !vencimento) { toast('Preencha o Nº da fatura e a data de vencimento.', 'error'); return; }
+      if (!vencimentoValido(vencimento)) { avisarVencimentoInvalido(vencimento); return; }
       wrap.remove(); resolve({ numero, vencimento });
     });
   });
@@ -3508,7 +3528,12 @@ async function alterarFaturaDoLote() {
   if (v.historicoId) {
     try {
       await comTimeout(db.collection('validacoes').doc(v.historicoId).update({ numeroFatura: nova.numero, vencimentoFatura: nova.vencimento }), 20000, 'atualizar a fatura');
-      toast('Fatura atualizada no Histórico.', 'success');
+      const hist = (STATE._histDashboard || []).find(h => h.id === v.historicoId); if (hist) { hist.numeroFatura = nova.numero; hist.vencimentoFatura = nova.vencimento; }
+      const revs = (v.resultados || []).map(r => STATE.revisoes[r.cte.chave]).filter(Boolean)
+        .filter(rv => rv.numeroFatura !== nova.numero || rv.vencimentoFatura !== nova.vencimento)
+        .map(rv => ({ ...rv, numeroFatura: nova.numero, vencimentoFatura: nova.vencimento }));
+      if (revs.length) { await DataLayer.saveRevisoesEmLote(revs, { manterCarimbo: true }); revs.forEach(rv => { STATE.revisoes[rv.chave] = rv; }); }
+      toast(`Fatura atualizada no Histórico${revs.length ? ` e em ${revs.length} análise(s)` : ''}.`, 'success');
     } catch (e) { console.error(e); toast(mensagemErroFirebase(e, 'atualizar a fatura no Histórico'), 'error'); }
   }
 }
